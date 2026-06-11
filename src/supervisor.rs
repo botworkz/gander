@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#![allow(dead_code)]
 
 use std::{
     collections::HashMap,
@@ -115,25 +116,21 @@ where
         let mut snapshot_rx = {
             let mut entries = self.inner.entries.lock().expect("entries mutex poisoned");
             if let Some(entry) = entries.get(profile) {
-                match &entry.snapshot_rx.borrow().state {
+                let snapshot = entry.snapshot_rx.borrow().clone();
+                match snapshot.state {
                     ChildState::Ready => {
-                        return Ok(entry
-                            .snapshot_rx
-                            .borrow()
-                            .handle
-                            .clone()
-                            .expect("ready child missing handle"));
+                        return Ok(snapshot.handle.expect("ready child missing handle"));
                     }
                     ChildState::Starting => entry.snapshot_rx.clone(),
                     ChildState::Failed(_) | ChildState::Exited(_) => {
-                        let entry = spawn_child(
+                        let new_entry = spawn_child(
                             profile,
                             Arc::clone(&self.inner.spawn),
                             self.inner.grace_period,
                             self.inner.events.clone(),
                         );
-                        let snapshot_rx = entry.snapshot_rx.clone();
-                        entries.insert(profile.to_owned(), entry);
+                        let snapshot_rx = new_entry.snapshot_rx.clone();
+                        entries.insert(profile.to_owned(), new_entry);
                         snapshot_rx
                     }
                 }
@@ -359,21 +356,34 @@ async fn run_child<F>(
         }
     };
 
-    let Ok(Some(port_line)) = port_line else {
-        let message = match port_line {
-            Ok(None) => "child closed stdout before reporting a port".to_owned(),
-            Err(error) => format!("failed reading child stdout: {error}"),
-        };
-        update_snapshot(
-            &snapshot_tx,
-            &events,
-            &profile,
-            ChildSnapshot {
-                handle: None,
-                state: ChildState::Failed(message),
-            },
-        );
-        return;
+    let port_line = match port_line {
+        Ok(Some(port_line)) => port_line,
+        Ok(None) => {
+            update_snapshot(
+                &snapshot_tx,
+                &events,
+                &profile,
+                ChildSnapshot {
+                    handle: None,
+                    state: ChildState::Failed(
+                        "child closed stdout before reporting a port".to_owned(),
+                    ),
+                },
+            );
+            return;
+        }
+        Err(error) => {
+            update_snapshot(
+                &snapshot_tx,
+                &events,
+                &profile,
+                ChildSnapshot {
+                    handle: None,
+                    state: ChildState::Failed(format!("failed reading child stdout: {error}")),
+                },
+            );
+            return;
+        }
     };
 
     let port = match port_line.trim().parse::<u16>() {
@@ -530,7 +540,14 @@ fn exit_code(status: ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, time::Instant};
+    use std::{
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Instant,
+    };
 
     use super::*;
     use tokio_stream::StreamExt;
@@ -573,7 +590,10 @@ mod tests {
     }
 
     fn process_exists(pid: u32) -> bool {
-        matches!(kill(Pid::from_raw(pid as i32), None), Ok(()) | Err(Errno::EPERM))
+        matches!(
+            kill(Pid::from_raw(pid as i32), None),
+            Ok(()) | Err(Errno::EPERM)
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -622,7 +642,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn forced_kill_when_grace_period_expires() {
         let supervisor = Supervisor::new(
-            shell_command(r#"trap '' TERM; printf '%s\n' "$SUPERVISOR_PORT"; while :; do sleep 1; done"#),
+            shell_command(
+                r#"trap '' TERM; printf '%s\n' "$SUPERVISOR_PORT"; while :; do sleep 1; done"#,
+            ),
             Duration::from_millis(100),
         );
 
@@ -644,8 +666,54 @@ mod tests {
         let handle = supervisor.ensure_running("alpha").await.unwrap();
         assert!(process_exists(handle.pid));
 
-        let snapshot = wait_for_state(&supervisor, "alpha", |state| matches!(state, ChildState::Failed(_))).await;
-        assert!(matches!(snapshot.state, ChildState::Failed(message) if message.contains("unexpectedly")));
+        let snapshot = wait_for_state(&supervisor, "alpha", |state| {
+            matches!(state, ChildState::Failed(_))
+        })
+        .await;
+        assert!(
+            matches!(snapshot.state, ChildState::Failed(message) if message.contains("unexpectedly"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_resets_a_failed_child() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let supervisor = Supervisor::new(
+            {
+                let starts = Arc::clone(&starts);
+                move |profile| {
+                    let mut command = Command::new("sh");
+                    command.env("PROFILE_NAME", profile);
+                    command.env("SUPERVISOR_PORT", reserve_port().to_string());
+                    if starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        command
+                            .arg("-c")
+                            .arg(r#"printf '%s\n' "$SUPERVISOR_PORT"; sleep 0.2; exit 17"#);
+                    } else {
+                        command
+                            .arg("-c")
+                            .arg(r#"printf '%s\n' "$SUPERVISOR_PORT"; exec sleep 30"#);
+                    }
+                    Ok(command)
+                }
+            },
+            Duration::from_millis(100),
+        );
+
+        let first = supervisor.ensure_running("alpha").await.unwrap();
+        wait_for_state(&supervisor, "alpha", |state| {
+            matches!(state, ChildState::Failed(_))
+        })
+        .await;
+
+        let restarted = supervisor.restart("alpha").await.unwrap();
+        assert_ne!(first.pid, restarted.pid);
+        assert_eq!(
+            supervisor.snapshot("alpha").unwrap().state,
+            ChildState::Ready
+        );
+
+        supervisor.stop("alpha").await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -660,7 +728,10 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while process_exists(pid) {
-            assert!(Instant::now() < deadline, "child was not cleaned up on drop");
+            assert!(
+                Instant::now() < deadline,
+                "child was not cleaned up on drop"
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
@@ -681,7 +752,10 @@ mod tests {
             supervisor.snapshot("alpha").unwrap().state,
             ChildState::Exited(_)
         ));
-        assert_eq!(supervisor.snapshot("beta").unwrap().state, ChildState::Ready);
+        assert_eq!(
+            supervisor.snapshot("beta").unwrap().state,
+            ChildState::Ready
+        );
         assert!(process_exists(beta.pid));
         assert!(!process_exists(alpha.pid));
 
