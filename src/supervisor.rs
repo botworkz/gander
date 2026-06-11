@@ -22,6 +22,9 @@ use tokio::{
 };
 use tokio_stream::wrappers::BroadcastStream;
 
+const EVENT_CHANNEL_CAPACITY: usize = 64;
+const INVARIANT_ERROR: &str = "supervisor state corrupted; restart required";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChildHandle {
     pub pid: u32,
@@ -101,7 +104,7 @@ where
     F: Fn(&str) -> io::Result<Command> + Send + Sync + 'static,
 {
     pub fn new(spawn: F, grace_period: Duration) -> Self {
-        let (events, _) = broadcast::channel(64);
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(Inner {
                 grace_period,
@@ -114,12 +117,12 @@ where
 
     pub async fn ensure_running(&self, profile: &str) -> Result<ChildHandle> {
         let mut snapshot_rx = {
-            let mut entries = self.inner.entries.lock().expect("entries mutex poisoned");
+            let mut entries = self.inner.entries.lock().expect(INVARIANT_ERROR);
             if let Some(entry) = entries.get(profile) {
                 let snapshot = entry.snapshot_rx.borrow().clone();
                 match snapshot.state {
                     ChildState::Ready => {
-                        return Ok(snapshot.handle.expect("ready child missing handle"));
+                        return Ok(ready_handle(snapshot));
                     }
                     ChildState::Starting => entry.snapshot_rx.clone(),
                     ChildState::Failed(_) | ChildState::Exited(_) => {
@@ -151,9 +154,7 @@ where
             let snapshot = snapshot_rx.borrow().clone();
             match snapshot.state {
                 ChildState::Ready => {
-                    return Ok(snapshot
-                        .handle
-                        .expect("ready child missing handle in snapshot"));
+                    return Ok(ready_handle(snapshot));
                 }
                 ChildState::Failed(message) => {
                     return Err(Error::Failed(profile.to_owned(), message));
@@ -172,7 +173,7 @@ where
 
     pub async fn stop(&self, profile: &str) -> Result<()> {
         let mut snapshot_rx = {
-            let entries = self.inner.entries.lock().expect("entries mutex poisoned");
+            let entries = self.inner.entries.lock().expect(INVARIANT_ERROR);
             let Some(entry) = entries.get(profile) else {
                 return Ok(());
             };
@@ -204,7 +205,7 @@ where
         self.inner
             .entries
             .lock()
-            .expect("entries mutex poisoned")
+            .expect(INVARIANT_ERROR)
             .get(profile)
             .map(|entry| entry.snapshot_rx.borrow().clone())
     }
@@ -230,12 +231,7 @@ where
     F: Fn(&str) -> io::Result<Command> + Send + Sync + 'static,
 {
     fn drop(&mut self) {
-        for entry in self
-            .entries
-            .lock()
-            .expect("entries mutex poisoned")
-            .values()
-        {
+        for entry in self.entries.lock().expect(INVARIANT_ERROR).values() {
             if let Some(control_tx) = &entry.control_tx {
                 let _ = control_tx.send(Control::Stop);
             }
@@ -316,7 +312,23 @@ async fn run_child<F>(
         }
     };
 
-    let pid = child.id().unwrap_or_default();
+    let pid = match child.id() {
+        Some(pid) => pid,
+        None => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            update_snapshot(
+                &snapshot_tx,
+                &events,
+                &profile,
+                ChildSnapshot {
+                    handle: None,
+                    state: ChildState::Failed("child pid unavailable after spawn".to_owned()),
+                },
+            );
+            return;
+        }
+    };
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -489,6 +501,10 @@ fn update_snapshot(
 ) {
     let _ = snapshot_tx.send(snapshot.clone());
     publish(events, profile, &snapshot);
+}
+
+fn ready_handle(snapshot: ChildSnapshot) -> ChildHandle {
+    snapshot.handle.expect(INVARIANT_ERROR)
 }
 
 fn publish(events: &broadcast::Sender<LifecycleEvent>, profile: &str, snapshot: &ChildSnapshot) {
