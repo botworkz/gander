@@ -9,6 +9,7 @@ rust-version = "1.85"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 dirs = "6.0"
 geese = { git = "https://github.com/phlax/geese", branch = "init2" }
 i18n-embed = { version = "0.16", features = [
@@ -43,6 +44,19 @@ features = [
 
 [dev-dependencies]
 tempfile = "3.10"
+
+# wry + WebKitGTK for the per-tab embedded webview (Linux only).
+# On Linux this brings in webkit2gtk (WebKitGTK 4.1), gtk, gdkx11, and soup3.
+# System packages required: libwebkit2gtk-4.1-dev (which pulls in libgtk-3-dev
+# and libsoup-3.0-dev as transitive deps on Debian/Ubuntu).
+[target.'cfg(target_os = "linux")'.dependencies]
+wry = "0.55"
+# gtk is a transitive dep of wry but must be listed explicitly so we can
+# call gtk::init / gtk::events_pending / gtk::main_iteration directly.
+gtk = { version = "0.18", default-features = false }
+# raw-window-handle is a transitive dep via wry/winit; listed explicitly so
+# webview.rs can use HasWindowHandle in its function signature.
+raw-window-handle = "0.6"
 
 # Uncomment to test a locally-cloned libcosmic
 # [patch.'https://github.com/pop-os/libcosmic']

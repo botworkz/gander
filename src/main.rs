@@ -6,6 +6,8 @@ mod i18n;
 mod state;
 mod supervisor;
 mod tab;
+#[cfg(target_os = "linux")]
+mod webview;
 
 use std::process;
 
@@ -17,6 +19,16 @@ fn main() -> cosmic::iced::Result {
         )
         .with_target(false)
         .init();
+
+    // GTK must be initialised on the main thread before any wry/WebKitGTK
+    // operations.  cosmic/winit does not use GTK, so this has no side-effects
+    // on the iced window stack; it just opens the X11/Wayland display
+    // connection that GTK and WebKitGTK need internally.
+    #[cfg(target_os = "linux")]
+    if gtk::init().is_err() {
+        eprintln!("gander: failed to initialise GTK (required for the wry webview backend)");
+        process::exit(1);
+    }
 
     let requested_languages = i18n_embed::DesktopLanguageRequester::requested_languages();
     i18n::init(&requested_languages);
