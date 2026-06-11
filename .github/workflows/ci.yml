@@ -1,0 +1,143 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel in-progress runs of the same ref when a new commit lands. PRs and
+# pushes to main get their own group so a push doesn't kill a PR run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # clippy / test / doc all need libcosmic's system deps to even get past
+  # `cargo check`, so they share the install step. Kept inline (rather than a
+  # composite action) so the workflow is self-contained in one file.
+  #
+  # The matrix builds against the declared MSRV from Cargo.toml *and* stable,
+  # so we catch both "we accidentally used something newer than 1.85" and
+  # "stable broke us".
+  check:
+    name: check (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.93", "stable"]
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install libcosmic system dependencies
+      # Lifted verbatim from pop-os/cosmic-term's CI; libcosmic needs the
+      # full Wayland/X11/font/audio stack to link, even for `cargo check`.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          pkg-config \
+          libxkbcommon-dev \
+          libfontconfig1-dev \
+          libfreetype6-dev \
+          libglvnd-dev \
+          libinput-dev \
+          libvulkan-dev \
+          libwayland-dev \
+          libx11-dev \
+          libxcursor-dev \
+          libxi-dev \
+          libxrandr-dev \
+          libasound2-dev \
+          libdbus-1-dev
+
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.toolchain }}
+        components: clippy
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        # Keyed on toolchain so the 1.85 and stable jobs don't fight over
+        # the same target dir.
+        key: ${{ matrix.toolchain }}
+
+    - name: cargo clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: cargo test
+      run: cargo test --all-targets --all-features
+
+    - name: cargo doc
+      # Doc warnings count as failures so doc comments don't rot silently.
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+      run: cargo doc --no-deps --all-features
+
+  build:
+    name: build (release)
+    runs-on: ubuntu-latest
+    # Don't bother building a release binary if the cheap checks already
+    # failed — saves ~15min of libcosmic compile on broken PRs.
+    needs: [fmt, check]
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install libcosmic system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          pkg-config \
+          libxkbcommon-dev \
+          libfontconfig1-dev \
+          libfreetype6-dev \
+          libglvnd-dev \
+          libinput-dev \
+          libvulkan-dev \
+          libwayland-dev \
+          libx11-dev \
+          libxcursor-dev \
+          libxi-dev \
+          libxrandr-dev \
+          libasound2-dev \
+          libdbus-1-dev
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: release
+
+    - name: cargo build --release
+      run: cargo build --release
+
+    - name: Stage artifact
+      # actions/upload-artifact zips on upload, so we pre-stage the bin into
+      # a clean directory with a sensible name rather than uploading the
+      # entire target/release tree.
+      run: |
+        mkdir -p artifact
+        cp target/release/gander artifact/gander
+        sha256sum artifact/gander > artifact/gander.sha256
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: gander-${{ github.sha }}-linux-x86_64
+        path: artifact/
+        # 14 days is enough for PR review + a buffer; default is 90 which
+        # is more than we need.
+        retention-days: 14
+        if-no-files-found: error

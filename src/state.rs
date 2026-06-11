@@ -134,7 +134,9 @@ mod tests {
             version: VERSION,
             active: Some("work".into()),
             tabs: vec![
-                TabState { name: "work".into() },
+                TabState {
+                    name: "work".into(),
+                },
                 TabState {
                     name: "scratch".into(),
                 },
