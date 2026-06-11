@@ -76,16 +76,18 @@ jobs:
         key: ${{ matrix.toolchain }}
 
     - name: cargo clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      # Scope to the native gander package; gander-chat targets wasm32 and
+      # cannot be checked against the host toolchain.
+      run: cargo clippy -p gander --all-targets --all-features -- -D warnings
 
     - name: cargo test
-      run: cargo test --all-targets --all-features
+      run: cargo test -p gander --all-targets --all-features
 
     - name: cargo doc
       # Doc warnings count as failures so doc comments don't rot silently.
       env:
         RUSTDOCFLAGS: "-D warnings"
-      run: cargo doc --no-deps --all-features
+      run: cargo doc -p gander --no-deps --all-features
 
   build:
     name: build (release)

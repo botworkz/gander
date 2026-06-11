@@ -2,3 +2,5 @@
 .cargo/
 vendor/
 vendor.tar
+# Trunk (WASM bundler) build output
+crates/gander-chat/dist/
