@@ -87,6 +87,9 @@ impl Storage {
         Self { path }
     }
 
+    /// Path of the backing state file. Currently only used by tests; kept on
+    /// the public API so callers can surface it in diagnostics later.
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -134,7 +137,9 @@ mod tests {
             version: VERSION,
             active: Some("work".into()),
             tabs: vec![
-                TabState { name: "work".into() },
+                TabState {
+                    name: "work".into(),
+                },
                 TabState {
                     name: "scratch".into(),
                 },

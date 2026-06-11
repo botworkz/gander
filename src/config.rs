@@ -6,7 +6,7 @@
 //! invoke when launching a profile. Defaults to the literal string `"goose"`
 //! (resolved against `$PATH`).
 
-use cosmic::cosmic_config::{self, cosmic_config_derive::CosmicConfigEntry, CosmicConfigEntry};
+use cosmic::cosmic_config::{self, CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry};
 
 #[derive(Clone, Debug, CosmicConfigEntry, Eq, PartialEq)]
 #[version = 1]

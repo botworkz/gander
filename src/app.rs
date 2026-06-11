@@ -523,11 +523,8 @@ impl AppModel {
         // Snapshot the known names into owned strings so we don't hold an
         // immutable borrow of `self.known_profiles` across the subsequent
         // mutable calls to `insert_tab` / `tabs.activate`.
-        let known: std::collections::HashSet<String> = self
-            .known_profiles
-            .iter()
-            .map(|p| p.name.clone())
-            .collect();
+        let known: std::collections::HashSet<String> =
+            self.known_profiles.iter().map(|p| p.name.clone()).collect();
 
         let mut active_entity = None;
         for tab in &state.tabs {
@@ -600,8 +597,7 @@ impl AppModel {
         self.page = self.default_page();
         // If the profile-config drawer was open for the now-gone active tab,
         // close it. About is profile-agnostic and stays open.
-        if self.drawer == Some(ContextDrawer::ProfileConfig)
-            && self.active_profile_name().is_none()
+        if self.drawer == Some(ContextDrawer::ProfileConfig) && self.active_profile_name().is_none()
         {
             self.drawer = None;
             self.core.window.show_context = false;
@@ -710,9 +706,11 @@ impl AppModel {
             }
         }
 
-        let create_input =
-            widget::text_input(fl!("new-tab-page-create-placeholder"), &self.new_profile_name)
-                .on_input(Message::NewProfileNameChanged);
+        let create_input = widget::text_input(
+            fl!("new-tab-page-create-placeholder"),
+            &self.new_profile_name,
+        )
+        .on_input(Message::NewProfileNameChanged);
 
         let create_button = widget::button::standard(fl!("new-tab-page-create-submit"))
             .on_press(Message::CreateProfile);
