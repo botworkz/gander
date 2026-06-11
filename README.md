@@ -10,18 +10,43 @@ Scoped for v0:
 
 - Tab strip with one tab per open profile (open / close / reorder)
 - "Open profile" picker listing `geese` profiles, with inline "create new" affordance
-- Per-tab placeholder page showing profile metadata + a `Launch goose` button (shells out to `geese launch`)
+- Per-tab chat UI (Leptos WASM) loaded in a wry/WebKitGTK webview
 - Tab state persisted across restarts at `$XDG_DATA_HOME/gander/state.toml` (override with `GANDER_STATE`)
 
 Deferred (see [`DESIGN.md`](./DESIGN.md)):
 
-- Embedding goose's UI inside a tab
+- ACP wiring (real `send` / `subscribe` backed by goosed)
 
 ## Build
 
 Requires Rust 2024 edition (stable Rust 1.85+) and the COSMIC dev deps.
 
+### Dev loop
+
+**Step 1** — build the Leptos chat UI (needs [`trunk`](https://trunkrs.dev)):
+
 ```bash
+cargo install trunk                   # first time only
+rustup target add wasm32-unknown-unknown  # first time only
+cargo xtask build-chat
+```
+
+**Step 2** — build and run gander:
+
+```bash
+cargo run
+```
+
+To enable WebKit devtools (right-click → Inspect Element inside the webview):
+
+```bash
+GANDER_DEVTOOLS=1 cargo run
+```
+
+### Release build
+
+```bash
+cargo xtask build-chat --release
 cargo build --release
 ```
 
