@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod i18n;
 mod state;
+mod supervisor;
 mod tab;
 
 use std::process;
