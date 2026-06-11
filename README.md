@@ -2,8 +2,6 @@
 
 A tabbed [COSMIC](https://github.com/pop-os/cosmic-epoch) viewer for [`geese`](https://github.com/phlax/geese) profiles.
 
-> *gander, n. — a post-modern goose; prefers the company of the flock to the headship of it.*
-
 ## Status
 
 Pre-alpha. Initial scaffold; not yet built against a real COSMIC desktop.
