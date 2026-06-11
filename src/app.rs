@@ -38,14 +38,19 @@
 //! surfaced in the tab body rather than as a dialog. When embedded goose
 //! lands this whole spawn path is replaced.
 
-use std::{collections::HashMap, process::Stdio};
+use std::{
+    collections::{HashMap, VecDeque},
+    process::Stdio,
+};
 
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
-use cosmic::iced::{Alignment, Length, Subscription, Task as IcedTask, time};
+use cosmic::iced::{time, Alignment, Length, Subscription, Task as IcedTask};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, menu, nav_bar, segmented_button};
 use geese::{ProfileMeta, Storage};
+use iced_webview::advanced::{Action as WebViewAction, WebView};
+use iced_webview::{PageType, ViewId};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -94,6 +99,9 @@ pub struct AppModel {
     /// slot, but a side `HashMap` keeps the borrow-checker happy when we want
     /// to mutate tab state while still rendering the tab strip.
     tab_data: HashMap<segmented_button::Entity, Tab>,
+    webview: WebView<iced_webview::Cef, Message>,
+    pending_view_entities: VecDeque<segmented_button::Entity>,
+    view_to_entity: HashMap<ViewId, segmented_button::Entity>,
 
     /// What page is currently shown in the content area.
     page: Page,
@@ -163,10 +171,14 @@ pub enum Message {
     /// libcosmic-side drawer close (the drawer's own × button). Closes
     /// whichever drawer is currently open.
     CloseContextDrawer,
-    /// Route a webview action to a specific tab.
-    TabWebView(segmented_button::Entity, iced_webview::Action),
-    /// One tab's webview finished creating its first view.
-    TabWebViewCreated(segmented_button::Entity),
+    /// Route a webview action to the shared webview host.
+    WebView(WebViewAction),
+    /// A new webview was created and assigned an id.
+    WebViewCreated(ViewId),
+    /// URL-change hook from the active webview.
+    WebViewUrlChanged(ViewId, String),
+    /// Title-change hook from the active webview.
+    WebViewTitleChanged(ViewId, String),
     /// Periodic render tick for embedded tab webviews.
     TickWebviews,
 }
@@ -235,6 +247,13 @@ impl cosmic::Application for AppModel {
             config_handler,
             tabs: segmented_button::ModelBuilder::default().build(),
             tab_data: HashMap::new(),
+            webview: WebView::new()
+                .on_create_view(Message::WebViewCreated)
+                .on_url_change(Message::WebViewUrlChanged)
+                .on_title_change(Message::WebViewTitleChanged)
+                .on_action(Message::WebView),
+            pending_view_entities: VecDeque::new(),
+            view_to_entity: HashMap::new(),
             page: Page::Empty,
             drawer: None,
             known_profiles: Vec::new(),
@@ -329,7 +348,12 @@ impl cosmic::Application for AppModel {
             Page::Tab => {
                 let entity = self.tabs.active();
                 match self.tab_data.get(&entity) {
-                    Some(tab) => tab.view(entity, &self.geese_storage),
+                    Some(tab) => {
+                        let webview = tab
+                            .view_id
+                            .map(|view_id| self.webview.view(view_id).map(Message::WebView));
+                        tab.view(&self.geese_storage, webview)
+                    }
                     None => self.view_empty(),
                 }
             }
@@ -362,12 +386,13 @@ impl cosmic::Application for AppModel {
                 self.tabs.activate(entity);
                 self.page = Page::Tab;
                 self.persist_state();
-                return self.update_title();
+                let task = self.active_tab_tick_task();
+                return Task::batch([task, self.update_title()]);
             }
             Message::CloseTab(entity) => {
-                self.close_tab(entity);
+                let close_task = self.close_tab(entity);
                 self.persist_state();
-                return self.update_title();
+                return Task::batch([close_task, self.update_title()]);
             }
             Message::NewProfileNameChanged(value) => {
                 self.new_profile_name = value;
@@ -467,25 +492,41 @@ impl cosmic::Application for AppModel {
                 self.drawer = None;
                 self.core.window.show_context = false;
             }
-            Message::TabWebView(entity, action) => {
-                return self.update_tab_webview(entity, action);
+            Message::WebView(action) => {
+                return self.update_webview(action);
             }
-            Message::TabWebViewCreated(entity) => {
-                if let Some(tab) = self.tab_data.get_mut(&entity) {
-                    return Self::into_app_task(tab.finish_webview_creation());
+            Message::WebViewCreated(view_id) => {
+                if let Some(entity) = self.pending_view_entities.pop_front() {
+                    if let Some(tab) = self.tab_data.get_mut(&entity) {
+                        tab.view_id = Some(view_id);
+                        self.view_to_entity.insert(view_id, entity);
+                        if self.tabs.is_active(entity) {
+                            return self.active_tab_tick_task();
+                        }
+                    } else {
+                        tracing::warn!(
+                            ?entity,
+                            ?view_id,
+                            "received webview-created event for unknown tab"
+                        );
+                    }
                 } else {
-                    tracing::warn!(?entity, "received webview-created event for unknown tab");
+                    tracing::warn!(
+                        ?view_id,
+                        "received webview-created event with no pending tab"
+                    );
                 }
             }
+            Message::WebViewUrlChanged(view_id, url) => {
+                let tab = self.view_to_entity.get(&view_id).copied();
+                tracing::debug!(?view_id, ?tab, %url, "webview url changed");
+            }
+            Message::WebViewTitleChanged(view_id, title) => {
+                let tab = self.view_to_entity.get(&view_id).copied();
+                tracing::debug!(?view_id, ?tab, %title, "webview title changed");
+            }
             Message::TickWebviews => {
-                // Drive embedded webviews at roughly 60fps so their internal
-                // event loops continue rendering while tabs are open.
-                return Task::batch(
-                    self.tab_data
-                        .values_mut()
-                        .map(|tab| Self::into_app_task(tab.tick_webview()))
-                        .collect::<Vec<_>>(),
-                );
+                return self.active_tab_tick_task();
             }
         }
         Task::none()
@@ -555,11 +596,8 @@ impl AppModel {
         // Snapshot the known names into owned strings so we don't hold an
         // immutable borrow of `self.known_profiles` across the subsequent
         // mutable calls to `insert_tab` / `tabs.activate`.
-        let known: std::collections::HashSet<String> = self
-            .known_profiles
-            .iter()
-            .map(|p| p.name.clone())
-            .collect();
+        let known: std::collections::HashSet<String> =
+            self.known_profiles.iter().map(|p| p.name.clone()).collect();
 
         let mut active_entity = None;
         let mut tasks = Vec::new();
@@ -600,7 +638,7 @@ impl AppModel {
         {
             self.tabs.activate(entity);
             self.page = Page::Tab;
-            Task::none()
+            self.active_tab_tick_task()
         } else {
             let (entity, task) = self.insert_tab(name);
             self.tabs.activate(entity);
@@ -609,15 +647,22 @@ impl AppModel {
         }
     }
 
-    fn insert_tab(&mut self, name: &str) -> (segmented_button::Entity, Task<cosmic::Action<Message>>) {
+    fn insert_tab(
+        &mut self,
+        name: &str,
+    ) -> (segmented_button::Entity, Task<cosmic::Action<Message>>) {
         let entity = self.tabs.insert().text(name.to_owned()).closable().id();
-        let mut tab = Tab::new(name.to_owned(), entity);
-        let task = Self::into_app_task(tab.create_webview());
+        let tab = Tab::new(name.to_owned());
+        let task = Self::into_app_task(
+            self.webview
+                .update(WebViewAction::CreateView(PageType::Url(tab.data_url()))),
+        );
+        self.pending_view_entities.push_back(entity);
         self.tab_data.insert(entity, tab);
         (entity, task)
     }
 
-    fn close_tab(&mut self, entity: segmented_button::Entity) {
+    fn close_tab(&mut self, entity: segmented_button::Entity) -> Task<cosmic::Action<Message>> {
         // If we're closing the active tab, activate its neighbour first to
         // avoid a flash of "empty" mid-frame.
         if self.tabs.is_active(entity) {
@@ -635,19 +680,29 @@ impl AppModel {
                 }
             }
         }
-        if let Some(mut tab) = self.tab_data.remove(&entity) {
-            tab.destroy();
+        let close_task = if let Some(tab) = self.tab_data.remove(&entity) {
+            if let Some(view_id) = tab.view_id {
+                self.view_to_entity.remove(&view_id);
+                Self::into_app_task(self.webview.update(WebViewAction::CloseView(view_id)))
+            } else {
+                Task::none()
+            }
+        } else {
+            Task::none()
+        };
+        if let Some(position) = self.pending_view_entities.iter().position(|e| *e == entity) {
+            self.pending_view_entities.remove(position);
         }
         self.tabs.remove(entity);
         self.page = self.default_page();
         // If the profile-config drawer was open for the now-gone active tab,
         // close it. About is profile-agnostic and stays open.
-        if self.drawer == Some(ContextDrawer::ProfileConfig)
-            && self.active_profile_name().is_none()
+        if self.drawer == Some(ContextDrawer::ProfileConfig) && self.active_profile_name().is_none()
         {
             self.drawer = None;
             self.core.window.show_context = false;
         }
+        close_task
     }
 
     fn persist_state(&self) {
@@ -695,15 +750,22 @@ impl AppModel {
         task.map(cosmic::Action::App)
     }
 
-    fn update_tab_webview(
-        &mut self,
-        entity: segmented_button::Entity,
-        action: iced_webview::Action,
-    ) -> Task<cosmic::Action<Message>> {
-        match self.tab_data.get_mut(&entity) {
-            Some(tab) => Self::into_app_task(tab.update_webview(action)),
-            None => Task::none(),
+    fn update_webview(&mut self, action: WebViewAction) -> Task<cosmic::Action<Message>> {
+        Self::into_app_task(self.webview.update(action))
+    }
+
+    fn active_tab_tick_task(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.tab_data.is_empty() {
+            return Task::none();
         }
+
+        let action = self
+            .tab_data
+            .get(&self.tabs.active())
+            .and_then(|tab| tab.view_id)
+            .map(WebViewAction::Update)
+            .unwrap_or(WebViewAction::UpdateAll);
+        Self::into_app_task(self.webview.update(action))
     }
 
     fn view_empty(&self) -> Element<'_, Message> {
@@ -767,9 +829,11 @@ impl AppModel {
             }
         }
 
-        let create_input =
-            widget::text_input(fl!("new-tab-page-create-placeholder"), &self.new_profile_name)
-                .on_input(Message::NewProfileNameChanged);
+        let create_input = widget::text_input(
+            fl!("new-tab-page-create-placeholder"),
+            &self.new_profile_name,
+        )
+        .on_input(Message::NewProfileNameChanged);
 
         let create_button = widget::button::standard(fl!("new-tab-page-create-submit"))
             .on_press(Message::CreateProfile);

@@ -33,6 +33,12 @@ cargo run --release
 
 By default `gander` reads profiles from the same `$GEESE_ROOT` your `geese` CLI uses (`$XDG_DATA_HOME/geese` by default).
 
+## Embedded webview runtime (CEF)
+
+`gander` embeds Chromium through CEF via `iced_webview`. You must provide a Linux CEF binary distribution where the `cef`/`cef-sys` crates expect it at runtime; see the crate docs for setup details: <https://docs.rs/cef/latest/cef/>.
+
+On Wayland, `WAYLAND_DISPLAY` is honored automatically by the CEF engine path (`--ozone-platform=wayland`). GPU compositing is intentionally disabled (`--disable-gpu` and `--in-process-gpu`) so `gander` works in Flatpak/containerized environments without extra driver passthrough.
+
 ## Why "gander"?
 
 You have a *gander* at the *geese*. It chimes.

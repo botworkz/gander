@@ -9,6 +9,10 @@ mod tab;
 use std::process;
 
 fn main() -> cosmic::iced::Result {
+    if iced_webview::cef_subprocess_check() {
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

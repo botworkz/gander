@@ -16,12 +16,10 @@
 //! The view returned here is intentionally a single `Element` so swapping the
 //! placeholder for an embedded webview later is a localized change.
 
-use cosmic::iced::{Alignment, Length, Task as IcedTask};
+use cosmic::iced::{Alignment, Length};
 use cosmic::prelude::*;
 use cosmic::widget;
-use cosmic::widget::segmented_button;
 use geese::Storage;
-use iced_webview::{Action as WebViewAction, PageType, WebView};
 
 use crate::app::Message;
 use crate::fl;
@@ -35,51 +33,15 @@ use crate::fl;
 pub struct Tab {
     pub profile: String,
     pub last_launch_error: Option<String>,
-    webview: WebView<iced_webview::Servo, Message>,
-    webview_live: bool,
+    pub view_id: Option<iced_webview::ViewId>,
 }
 
 impl Tab {
-    pub fn new(
-        profile: impl Into<String>,
-        entity: segmented_button::Entity,
-    ) -> Self {
+    pub fn new(profile: impl Into<String>) -> Self {
         Self {
             profile: profile.into(),
             last_launch_error: None,
-            webview: WebView::new()
-                .on_create_view(Message::TabWebViewCreated(entity))
-                .on_action(move |action| Message::TabWebView(entity, action)),
-            webview_live: false,
-        }
-    }
-
-    pub fn create_webview(&mut self) -> IcedTask<Message> {
-        self.webview
-            .update(WebViewAction::CreateView(PageType::Url(self.data_url())))
-    }
-
-    pub fn finish_webview_creation(&mut self) -> IcedTask<Message> {
-        self.webview_live = true;
-        self.webview.update(WebViewAction::ChangeView(0))
-    }
-
-    pub fn update_webview(&mut self, action: WebViewAction) -> IcedTask<Message> {
-        self.webview.update(action)
-    }
-
-    pub fn tick_webview(&mut self) -> IcedTask<Message> {
-        if self.webview_live {
-            self.webview.update(WebViewAction::Update)
-        } else {
-            IcedTask::none()
-        }
-    }
-
-    pub fn destroy(&mut self) {
-        if self.webview_live {
-            let _ = self.webview.update(WebViewAction::CloseView(0));
-            self.webview_live = false;
+            view_id: None,
         }
     }
 
@@ -88,8 +50,8 @@ impl Tab {
     /// panicking.
     pub fn view<'a>(
         &'a self,
-        entity: segmented_button::Entity,
         storage: &Storage,
+        webview: Option<Element<'a, Message>>,
     ) -> Element<'a, Message> {
         let space = cosmic::theme::spacing();
 
@@ -110,16 +72,14 @@ impl Tab {
             .into();
         }
 
-        let webview: Element<'_, Message> = if self.webview_live {
-            self.webview.view().map(move |action| Message::TabWebView(entity, action))
-        } else {
+        let webview = webview.unwrap_or_else(|| {
             widget::container(widget::text::body(format!("goose: {}", self.profile)))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
                 .into()
-        };
+        });
 
         let mut column = widget::column::with_capacity(2);
         if let Some(error) = &self.last_launch_error {
@@ -135,14 +95,8 @@ impl Tab {
             .into()
     }
 
-    fn data_url(&self) -> String {
+    pub fn data_url(&self) -> String {
         data_url_for_profile(&self.profile)
-    }
-}
-
-impl Drop for Tab {
-    fn drop(&mut self) {
-        self.destroy();
     }
 }
 
@@ -173,13 +127,9 @@ fn percent_encode(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len());
     for byte in bytes {
         match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'.'
-            | b'_'
-            | b'~' => encoded.push(char::from(*byte)),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(*byte))
+            }
             _ => encoded.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -192,10 +142,7 @@ mod tests {
 
     #[test]
     fn escapes_profile_name_for_html() {
-        assert_eq!(
-            html_escape("<work>&\"'"),
-            "&lt;work&gt;&amp;&quot;&#39;"
-        );
+        assert_eq!(html_escape("<work>&\"'"), "&lt;work&gt;&amp;&quot;&#39;");
     }
 
     #[test]
