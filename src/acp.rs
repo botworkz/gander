@@ -25,6 +25,8 @@ use tokio_stream::{Stream, wrappers::UnboundedReceiverStream};
 
 use crate::supervisor::{self, ChildState, Supervisor};
 
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 pub enum Event {
     TextChunk(String),
@@ -47,6 +49,8 @@ pub enum Error {
     Rpc { code: i64, message: String },
     #[error("failed to decode acp payload: {0}")]
     Decode(String),
+    #[error("failed to resolve current working directory: {0}")]
+    CurrentDirectory(String),
     #[error("child for profile `{profile}` failed: {message}")]
     ChildFailed { profile: String, message: String },
     #[error("timed out waiting for acp response for profile `{profile}`")]
@@ -93,7 +97,9 @@ where
             &mut rx,
             session_id,
             "session/new",
-            NewSessionRequest::new(std::env::current_dir().map_err(|error| Error::Decode(error.to_string()))?),
+            NewSessionRequest::new(
+                std::env::current_dir().map_err(|error| Error::CurrentDirectory(error.to_string()))?,
+            ),
             &profile,
         )
         .await?;
@@ -107,7 +113,11 @@ where
         })
     }
 
-    pub fn send_prompt(&self, text: &str) -> impl Stream<Item = Event> + use<F> {
+    /// Sends a single prompt to the ACP child and returns an async stream of events.
+    ///
+    /// The stream yields typed response events (`TextChunk`, `ToolCall`, `Complete`, or `Error`)
+    /// for this prompt and then terminates.
+    pub fn send_prompt(&self, text: &str) -> impl Stream<Item = Event> {
         let profile = self.profile.clone();
         let supervisor = self.supervisor.clone();
         let session_id = self.session_id.clone();
@@ -144,7 +154,7 @@ where
             }
 
             loop {
-                let line = match timeout(Duration::from_secs(5), lines.recv()).await {
+                let line = match timeout(RESPONSE_TIMEOUT, lines.recv()).await {
                     Ok(Ok(line)) => line,
                     Ok(Err(_)) => {
                         let message = snapshot_message(&supervisor, &profile);
@@ -234,6 +244,9 @@ where
         UnboundedReceiverStream::new(rx)
     }
 
+    /// Returns the latest supervisor snapshot for this client's profile.
+    ///
+    /// Returns `None` when no child entry exists for the profile.
     pub fn snapshot(&self) -> Option<supervisor::ChildSnapshot> {
         self.supervisor.snapshot(&self.profile)
     }
@@ -282,7 +295,7 @@ async fn send_request<T: Serialize, R: for<'de> Deserialize<'de>>(
     })?;
 
     loop {
-        let line = timeout(Duration::from_secs(5), lines.recv())
+        let line = timeout(RESPONSE_TIMEOUT, lines.recv())
             .await
             .map_err(|_| Error::Timeout {
                 profile: profile.to_owned(),
