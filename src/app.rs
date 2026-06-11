@@ -42,10 +42,11 @@ use std::{collections::HashMap, process::Stdio};
 
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
-use cosmic::iced::{Alignment, Length, Subscription};
+use cosmic::iced::{Alignment, Length, Subscription, Task as IcedTask, time};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, menu, nav_bar, segmented_button};
 use geese::{ProfileMeta, Storage};
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::fl;
@@ -162,6 +163,12 @@ pub enum Message {
     /// libcosmic-side drawer close (the drawer's own × button). Closes
     /// whichever drawer is currently open.
     CloseContextDrawer,
+    /// Route a webview action to a specific tab.
+    TabWebView(segmented_button::Entity, iced_webview::Action),
+    /// One tab's webview finished creating its first view.
+    TabWebViewCreated(segmented_button::Entity),
+    /// Periodic render tick for embedded tab webviews.
+    TickWebviews,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,10 +248,10 @@ impl cosmic::Application for AppModel {
         // entries whose profiles have vanished since last run are silently
         // dropped, matching the contract in DESIGN.md.
         app.refresh_known_profiles_inline();
-        app.restore_state(&initial_state);
+        let restore_task = app.restore_state(&initial_state);
 
         let title_task = app.update_title();
-        (app, title_task)
+        (app, Task::batch([restore_task, title_task]))
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
@@ -322,7 +329,7 @@ impl cosmic::Application for AppModel {
             Page::Tab => {
                 let entity = self.tabs.active();
                 match self.tab_data.get(&entity) {
-                    Some(tab) => tab.view(&self.geese_storage),
+                    Some(tab) => tab.view(entity, &self.geese_storage),
                     None => self.view_empty(),
                 }
             }
@@ -347,9 +354,9 @@ impl cosmic::Application for AppModel {
                 self.page = self.default_page();
             }
             Message::OpenTab(name) => {
-                self.open_tab(&name);
+                let open_task = self.open_tab(&name);
                 self.persist_state();
-                return self.update_title();
+                return Task::batch([open_task, self.update_title()]);
             }
             Message::ActivateTab(entity) => {
                 self.tabs.activate(entity);
@@ -375,10 +382,10 @@ impl cosmic::Application for AppModel {
                     Ok(profile) => {
                         let profile_name = profile.name().to_owned();
                         self.refresh_known_profiles_inline();
-                        self.open_tab(&profile_name);
+                        let open_task = self.open_tab(&profile_name);
                         self.picker_error = None;
                         self.persist_state();
-                        return self.update_title();
+                        return Task::batch([open_task, self.update_title()]);
                     }
                     Err(error) => {
                         self.new_profile_name = trimmed.to_owned();
@@ -460,6 +467,22 @@ impl cosmic::Application for AppModel {
                 self.drawer = None;
                 self.core.window.show_context = false;
             }
+            Message::TabWebView(entity, action) => {
+                return self.update_tab_webview(entity, action);
+            }
+            Message::TabWebViewCreated(entity) => {
+                if let Some(tab) = self.tab_data.get_mut(&entity) {
+                    return Self::into_app_task(tab.finish_webview_creation());
+                }
+            }
+            Message::TickWebviews => {
+                return Task::batch(
+                    self.tab_data
+                        .values_mut()
+                        .map(|tab| Self::into_app_task(tab.tick_webview()))
+                        .collect::<Vec<_>>(),
+                );
+            }
         }
         Task::none()
     }
@@ -469,7 +492,12 @@ impl cosmic::Application for AppModel {
             .core
             .watch_config::<Config>(Self::APP_ID)
             .map(|update| Message::UpdateConfig(update.config));
-        Subscription::batch([config_sub])
+        let webview_sub = if self.tab_data.is_empty() {
+            Subscription::none()
+        } else {
+            time::every(Duration::from_millis(16)).map(|_| Message::TickWebviews)
+        };
+        Subscription::batch([config_sub, webview_sub])
     }
 
     fn on_nav_select(&mut self, _id: nav_bar::Id) -> Task<cosmic::Action<Self::Message>> {
@@ -519,7 +547,7 @@ impl AppModel {
 
     /// Replay `state` onto an empty tab model. Profiles that have disappeared
     /// since last run are dropped.
-    fn restore_state(&mut self, state: &State) {
+    fn restore_state(&mut self, state: &State) -> Task<cosmic::Action<Message>> {
         // Snapshot the known names into owned strings so we don't hold an
         // immutable borrow of `self.known_profiles` across the subsequent
         // mutable calls to `insert_tab` / `tabs.activate`.
@@ -530,12 +558,14 @@ impl AppModel {
             .collect();
 
         let mut active_entity = None;
+        let mut tasks = Vec::new();
         for tab in &state.tabs {
             if !known.contains(&tab.name) {
                 tracing::info!(name = %tab.name, "dropping stale tab on restore");
                 continue;
             }
-            let entity = self.insert_tab(&tab.name);
+            let (entity, task) = self.insert_tab(&tab.name);
+            tasks.push(task);
             if state.active.as_deref() == Some(tab.name.as_str()) {
                 active_entity = Some(entity);
             }
@@ -552,11 +582,12 @@ impl AppModel {
                 self.page = Page::Tab;
             }
         }
+        Task::batch(tasks)
     }
 
     /// Open `name` as a tab, activating an existing tab if one already shows
     /// that profile. Does not persist — callers do that.
-    fn open_tab(&mut self, name: &str) {
+    fn open_tab(&mut self, name: &str) -> Task<cosmic::Action<Message>> {
         if let Some(entity) = self
             .tab_data
             .iter()
@@ -564,17 +595,22 @@ impl AppModel {
             .map(|(entity, _)| *entity)
         {
             self.tabs.activate(entity);
+            self.page = Page::Tab;
+            Task::none()
         } else {
-            let entity = self.insert_tab(name);
+            let (entity, task) = self.insert_tab(name);
             self.tabs.activate(entity);
+            self.page = Page::Tab;
+            task
         }
-        self.page = Page::Tab;
     }
 
-    fn insert_tab(&mut self, name: &str) -> segmented_button::Entity {
+    fn insert_tab(&mut self, name: &str) -> (segmented_button::Entity, Task<cosmic::Action<Message>>) {
         let entity = self.tabs.insert().text(name.to_owned()).closable().id();
-        self.tab_data.insert(entity, Tab::new(name.to_owned()));
-        entity
+        let mut tab = Tab::new(name.to_owned(), entity);
+        let task = Self::into_app_task(tab.create_webview());
+        self.tab_data.insert(entity, tab);
+        (entity, task)
     }
 
     fn close_tab(&mut self, entity: segmented_button::Entity) {
@@ -595,7 +631,9 @@ impl AppModel {
                 }
             }
         }
-        self.tab_data.remove(&entity);
+        if let Some(mut tab) = self.tab_data.remove(&entity) {
+            tab.destroy();
+        }
         self.tabs.remove(entity);
         self.page = self.default_page();
         // If the profile-config drawer was open for the now-gone active tab,
@@ -646,6 +684,21 @@ impl AppModel {
             self.set_window_title(title)
         } else {
             Task::none()
+        }
+    }
+
+    fn into_app_task(task: IcedTask<Message>) -> Task<cosmic::Action<Message>> {
+        task.map(cosmic::Action::App)
+    }
+
+    fn update_tab_webview(
+        &mut self,
+        entity: segmented_button::Entity,
+        action: iced_webview::Action,
+    ) -> Task<cosmic::Action<Message>> {
+        match self.tab_data.get_mut(&entity) {
+            Some(tab) => Self::into_app_task(tab.update_webview(action)),
+            None => Task::none(),
         }
     }
 

@@ -72,12 +72,12 @@ The tab content area is deliberately a single `Element` produced by the active t
 Stop running goose as a separate top-level Electron window. Instead, per tab:
 
 - spawn one `goosed` (goose's backend) with the tab's `GOOSE_PATH_ROOT`
-- load goose's React UI bundle in a [`wry`](https://github.com/tauri-apps/wry) webview hosted inside the iced tab content area, pointed at that `goosed`
+- load goose's React UI bundle in an [`iced_webview`](https://github.com/LegitCamper/iced_webview)-backed webview hosted inside the iced tab content area, pointed at that `goosed`
 - one Chromium per gander (not per profile), real tabbed UX, no compositor games
 
 Required from goose: a way to load its UI standalone (no Electron `ipcRenderer`, no Electron-specific main process). That's its own piece of work and almost certainly means upstream changes to goose, or a long-lived fork. Tracking issue / PR for that lives in the `goose` repo, not here.
 
-Required from gander: a wry-in-iced integration. Non-trivial but well-trodden territory.
+Required from gander: an iced-native webview integration. Non-trivial but well-trodden territory; drop to raw [`wry`](https://github.com/tauri-apps/wry) only if the wrapper proves to be a real blocker on COSMIC/Wayland.
 
 ### Option (2) — Compositor-grouped Electron goose *(current scaffold)*
 

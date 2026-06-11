@@ -11,6 +11,7 @@ rust-version = "1.85"
 anyhow = "1.0"
 dirs = "6.0"
 geese = { git = "https://github.com/phlax/geese", branch = "init2" }
+iced_webview = { package = "iced_webview_v2", version = "0.1.11", default-features = false, features = ["servo"] }
 i18n-embed = { version = "0.16", features = [
     "fluent-system",
     "desktop-requester",
@@ -47,3 +48,6 @@ tempfile = "3.10"
 # libcosmic = { path = "../libcosmic" }
 # cosmic-config = { path = "../libcosmic/cosmic-config" }
 # cosmic-theme = { path = "../libcosmic/cosmic-theme" }
+
+[patch.crates-io]
+iced = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc", package = "iced" }
