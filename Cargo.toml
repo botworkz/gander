@@ -1,0 +1,49 @@
+[package]
+name = "gander"
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "A post-modern goose: a tabbed COSMIC viewer for geese profiles"
+repository = "https://github.com/phlax/gander"
+rust-version = "1.85"
+
+[dependencies]
+anyhow = "1.0"
+dirs = "6.0"
+geese = { git = "https://github.com/phlax/geese", branch = "init2" }
+i18n-embed = { version = "0.16", features = [
+    "fluent-system",
+    "desktop-requester",
+] }
+i18n-embed-fl = "0.10"
+open = "5.3"
+rust-embed = "8.8"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["rt", "rt-multi-thread", "macros"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dependencies.libcosmic]
+# Tracking libcosmic master. Pin to a specific rev if a bump breaks us.
+git = "https://github.com/pop-os/libcosmic.git"
+default-features = false
+features = [
+    "about",
+    "single-instance",
+    "tokio",
+    "wgpu",
+    "winit",
+    "wayland",
+    "xdg-portal",
+]
+
+[dev-dependencies]
+tempfile = "3.10"
+
+# Uncomment to test a locally-cloned libcosmic
+# [patch.'https://github.com/pop-os/libcosmic']
+# libcosmic = { path = "../libcosmic" }
+# cosmic-config = { path = "../libcosmic/cosmic-config" }
+# cosmic-theme = { path = "../libcosmic/cosmic-theme" }
