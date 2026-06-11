@@ -1,0 +1,90 @@
+[package]
+name = "iced_webview_v2"
+version = "0.1.11"
+edition = "2021"
+rust-version = "1.90.0"
+description = "An easily embedded webview library for iced"
+authors = ["LegitCamper", "Franz Geffke <mail@gofranz.com>"]
+repository = "https://github.com/franzos/iced_webview_v2/"
+license = "Apache-2.0"
+readme = "README.md"
+
+[lib]
+name = "iced_webview"
+
+[package.metadata.docs.rs]
+features = ["docs_only"]
+all-features = false
+no-default-features = true
+
+[profile.dev]
+incremental = true
+opt-level = "s"
+lto = "thin"
+
+[features]
+default = ["litehtml"]
+blitz = [
+    "dep:blitz-dom",
+    "dep:blitz-html",
+    "dep:blitz-paint",
+    "dep:blitz-traits",
+    "dep:blitz-net",
+    "dep:anyrender",
+    "dep:anyrender_vello",
+    "dep:peniko",
+    "dep:cursor-icon",
+    "dep:keyboard-types",
+    "dep:smol_str",
+    "dep:reqwest",
+    "dep:tokio",
+]
+litehtml = ["dep:litehtml", "dep:reqwest"]
+servo = ["dep:servo", "dep:urlencoding", "dep:rustls", "dep:euclid", "dep:keyboard-types-servo", "dep:dpi", "dep:tokio"]
+cef = ["dep:cef", "dep:urlencoding"]
+docs_only = []
+
+[dependencies]
+iced = { version = "0.14", features = ["advanced", "image", "tokio", "lazy"] }
+rand = "0.8.5"
+litehtml = { version = "0.2.5", features = ["pixbuf", "html"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+url = "2.5.2"
+
+# Blitz engine deps (git: stylo 0.15, matching Servo 0.1.0). Bumping blitz
+# to a Stylo 0.16 pin is blocked by Cargo's `links = "servo_style_crate"`
+# rule — only one Stylo crate may exist in the dep graph, even with the
+# `servo` feature inactive. Realign once Servo publishes a Stylo 0.16
+# release.
+blitz-dom = { git = "https://github.com/DioxusLabs/blitz", rev = "f6509a30ae2108712ceaf347a390db0090eedb7b", optional = true }
+blitz-html = { git = "https://github.com/DioxusLabs/blitz", rev = "f6509a30ae2108712ceaf347a390db0090eedb7b", optional = true }
+blitz-paint = { git = "https://github.com/DioxusLabs/blitz", rev = "f6509a30ae2108712ceaf347a390db0090eedb7b", optional = true }
+blitz-traits = { git = "https://github.com/DioxusLabs/blitz", rev = "f6509a30ae2108712ceaf347a390db0090eedb7b", optional = true }
+blitz-net = { git = "https://github.com/DioxusLabs/blitz", rev = "f6509a30ae2108712ceaf347a390db0090eedb7b", optional = true }
+anyrender = { version = "0.8", optional = true }
+anyrender_vello = { version = "0.8", optional = true }
+peniko = { version = "0.6", optional = true }
+cursor-icon = { version = "1", optional = true }
+keyboard-types = { version = "0.7", optional = true }
+smol_str = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
+
+# Servo engine deps
+servo = { version = "0.1", optional = true }
+urlencoding = { version = "2", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "aws_lc_rs"], optional = true }
+euclid = { version = "0.22", optional = true }
+keyboard-types-servo = { package = "keyboard-types", version = "0.8", optional = true }
+dpi = { version = "0.1", optional = true }
+
+# CEF engine deps
+cef = { version = "145", default-features = false, optional = true }
+
+[[example]]
+name = "webview"
+
+[[example]]
+name = "email"
+
+[[example]]
+name = "embedded_webview"

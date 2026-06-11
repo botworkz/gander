@@ -11,7 +11,8 @@ rust-version = "1.85"
 anyhow = "1.0"
 dirs = "6.0"
 geese = { git = "https://github.com/phlax/geese", branch = "init2" }
-iced_webview = { package = "iced_webview_v2", git = "https://github.com/franzos/iced_webview_v2", default-features = false, features = ["servo"] }
+iced_renderer = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc", package = "iced_renderer", default-features = false, features = ["geometry"] }
+iced_webview = { package = "iced_webview_v2", path = "vendor/iced_webview_v2", default-features = false, features = ["servo"] }
 i18n-embed = { version = "0.16", features = [
     "fluent-system",
     "desktop-requester",
@@ -29,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dependencies.libcosmic]
 # Tracking libcosmic master. Pin to a specific rev if a bump breaks us.
 git = "https://github.com/pop-os/libcosmic.git"
+rev = "cca48bc"
 default-features = false
 features = [
     "about",

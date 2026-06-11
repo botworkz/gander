@@ -1,4 +1,6 @@
 /target
 .cargo/
-vendor/
+vendor/*
+!vendor/iced_webview_v2/
+!vendor/iced_webview_v2/**
 vendor.tar
