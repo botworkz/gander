@@ -38,7 +38,7 @@
 //! surfaced in the tab body rather than as a dialog. When embedded goose
 //! lands this whole spawn path is replaced.
 
-use std::{collections::HashMap, process::Stdio};
+use std::{collections::HashMap, process::Stdio, time::Duration};
 
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
@@ -51,6 +51,12 @@ use crate::config::Config;
 use crate::fl;
 use crate::state::{self, State, TabState};
 use crate::tab::Tab;
+#[cfg(target_os = "linux")]
+use crate::webview;
+#[cfg(target_os = "linux")]
+use wry::Rect as WryRect;
+#[cfg(target_os = "linux")]
+use wry::dpi::{LogicalPosition, LogicalSize};
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
@@ -110,6 +116,20 @@ pub struct AppModel {
 
     about: About,
     key_binds: HashMap<menu::KeyBind, MenuAction>,
+
+    /// The iced window ID of the main application window. Set on first
+    /// `Message::GotMainWindowId`; used by webview creation tasks.
+    main_window_id: Option<cosmic::iced::window::Id>,
+
+    /// Last-known logical size of the main window (width, height in logical
+    /// pixels). Initialised to the declared minimum size; updated on every
+    /// `Message::WindowResized`. Used to position and size WebViews.
+    window_size: (f32, f32),
+
+    /// Per-tab WebView store (Linux only). On other platforms this field does
+    /// not exist; all `#[cfg(target_os = "linux")]` guards below reference it.
+    #[cfg(target_os = "linux")]
+    webview_store: webview::WebviewStore,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -162,6 +182,30 @@ pub enum Message {
     /// libcosmic-side drawer close (the drawer's own × button). Closes
     /// whichever drawer is currently open.
     CloseContextDrawer,
+
+    // -----------------------------------------------------------------------
+    // Webview / window messages
+    // -----------------------------------------------------------------------
+    /// Delivered once, shortly after `init()`, with the main window's iced
+    /// `Id`. Used by webview creation tasks that need `run_with_handle`.
+    GotMainWindowId(cosmic::iced::window::Id),
+
+    /// Signals that a wry `WebView` has been stored in the thread-local
+    /// `webview::PENDING` map for `entity` and is ready to be claimed.
+    ///
+    /// Sent as the return value of `iced::window::run_with_handle` closures.
+    /// The value is emitted regardless of whether the webview was actually
+    /// created (e.g. it is also emitted on Wayland where `build_as_child`
+    /// fails, in which case `claim_pending` finds nothing and is a no-op).
+    WebviewReady(segmented_button::Entity),
+
+    /// 60 fps timer tick — pumps the GTK event loop so WebKitGTK can paint
+    /// and handle input. Linux-only; on other platforms this message is never
+    /// sent.
+    PumpGtk,
+
+    /// Window resize event forwarded from the iced subscription.
+    WindowResized(cosmic::iced::window::Id, cosmic::iced::Size),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,6 +279,12 @@ impl cosmic::Application for AppModel {
             picker_error: None,
             about,
             key_binds: HashMap::new(),
+            main_window_id: None,
+            // Default to the declared minimum size; updated when the first
+            // WindowResized event arrives.
+            window_size: (640.0, 400.0),
+            #[cfg(target_os = "linux")]
+            webview_store: webview::WebviewStore::new(),
         };
 
         // Replay persisted tabs against the *current* set of profiles —
@@ -244,7 +294,26 @@ impl cosmic::Application for AppModel {
         app.restore_state(&initial_state);
 
         let title_task = app.update_title();
-        (app, title_task)
+
+        // Fire a one-shot task to learn the main window's iced Id. We chain
+        // it so that any error (no window yet) is swallowed gracefully; the
+        // webview creation path below handles `None`.
+        let get_window_id = cosmic::iced::window::oldest().map(|opt_id| {
+            cosmic::Action::App(match opt_id {
+                Some(id) => Message::GotMainWindowId(id),
+                None => {
+                    // Should not happen in practice: cosmic creates the main
+                    // window before init() returns. Log if it ever does.
+                    tracing::warn!(
+                        "oldest() returned None during init; \
+                         falling back to Id::RESERVED for webview creation"
+                    );
+                    Message::GotMainWindowId(cosmic::iced::window::Id::RESERVED)
+                }
+            })
+        });
+
+        (app, Task::batch([title_task, get_window_id]))
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
@@ -342,24 +411,115 @@ impl cosmic::Application for AppModel {
                 self.refresh_known_profiles_inline();
                 self.picker_error = None;
                 self.page = Page::Picker;
+                // Hide any visible webview so it doesn't float over the picker.
+                #[cfg(target_os = "linux")]
+                self.webview_store.hide_all();
             }
             Message::HideNewTabPicker => {
                 self.page = self.default_page();
+                // Re-show the active tab's webview when returning to Tab page.
+                #[cfg(target_os = "linux")]
+                if self.page == Page::Tab {
+                    let entity = self.tabs.active();
+                    let (w, h) = self.window_size;
+                    let y = webview::TAB_STRIP_HEIGHT;
+                    self.webview_store.show_only(entity);
+                    self.webview_store.set_bounds(
+                        entity,
+                        0.0,
+                        y,
+                        f64::from(w),
+                        (f64::from(h) - y).max(1.0),
+                    );
+                }
             }
             Message::OpenTab(name) => {
+                // Track whether this is a brand-new tab (needs a webview) or
+                // an existing one being re-activated (webview already exists).
+                let already_open = self.tab_data.values().any(|tab| tab.profile == name);
+
                 self.open_tab(&name);
                 self.persist_state();
-                return self.update_title();
+
+                let title_task = self.update_title();
+
+                #[cfg(target_os = "linux")]
+                {
+                    let entity = self.tabs.active();
+                    let (w, h) = self.window_size;
+                    let y = webview::TAB_STRIP_HEIGHT;
+
+                    if already_open {
+                        // Switch to the existing webview.
+                        self.webview_store.show_only(entity);
+                        self.webview_store.set_bounds(
+                            entity,
+                            0.0,
+                            y,
+                            f64::from(w),
+                            (f64::from(h) - y).max(1.0),
+                        );
+                        return title_task;
+                    }
+
+                    // New tab — spawn a webview if the window ID is known.
+                    if let Some(window_id) = self.main_window_id {
+                        let wv_task = build_webview_task(entity, name, window_id, w, h);
+                        return Task::batch([title_task, wv_task]);
+                    }
+                    // Window ID not yet known (shouldn't happen in practice since
+                    // GotMainWindowId fires during init, but be safe).
+                    tracing::warn!("OpenTab: main_window_id not yet set; webview skipped");
+                }
+
+                return title_task;
             }
             Message::ActivateTab(entity) => {
                 self.tabs.activate(entity);
                 self.page = Page::Tab;
                 self.persist_state();
+
+                #[cfg(target_os = "linux")]
+                {
+                    let (w, h) = self.window_size;
+                    let y = webview::TAB_STRIP_HEIGHT;
+                    self.webview_store.show_only(entity);
+                    self.webview_store.set_bounds(
+                        entity,
+                        0.0,
+                        y,
+                        f64::from(w),
+                        (f64::from(h) - y).max(1.0),
+                    );
+                }
+
                 return self.update_title();
             }
             Message::CloseTab(entity) => {
+                // Destroy the WebView before removing the tab so the X11
+                // child window is torn down in an orderly fashion.
+                #[cfg(target_os = "linux")]
+                self.webview_store.destroy(entity);
+
                 self.close_tab(entity);
                 self.persist_state();
+
+                // Show the newly-active tab's webview (if any).
+                #[cfg(target_os = "linux")]
+                if self.page == Page::Tab {
+                    let active = self.tabs.active();
+                    let (w, h) = self.window_size;
+                    let y = webview::TAB_STRIP_HEIGHT;
+                    self.webview_store.show_only(active);
+                    self.webview_store.set_bounds(
+                        active,
+                        0.0,
+                        y,
+                        f64::from(w),
+                        (f64::from(h) - y).max(1.0),
+                    );
+                }
+
                 return self.update_title();
             }
             Message::NewProfileNameChanged(value) => {
@@ -378,7 +538,18 @@ impl cosmic::Application for AppModel {
                         self.open_tab(&profile_name);
                         self.picker_error = None;
                         self.persist_state();
-                        return self.update_title();
+
+                        let title_task = self.update_title();
+
+                        #[cfg(target_os = "linux")]
+                        if let Some(window_id) = self.main_window_id {
+                            let entity = self.tabs.active();
+                            let (w, h) = self.window_size;
+                            let wv_task = build_webview_task(entity, profile_name, window_id, w, h);
+                            return Task::batch([title_task, wv_task]);
+                        }
+
+                        return title_task;
                     }
                     Err(error) => {
                         self.new_profile_name = trimmed.to_owned();
@@ -460,6 +631,92 @@ impl cosmic::Application for AppModel {
                 self.drawer = None;
                 self.core.window.show_context = false;
             }
+
+            // -------------------------------------------------------------------
+            // Webview / window messages
+            // -------------------------------------------------------------------
+            Message::GotMainWindowId(id) => {
+                self.main_window_id = Some(id);
+
+                // Create webviews for any tabs that were restored from
+                // persisted state before the window ID was known.
+                #[cfg(target_os = "linux")]
+                {
+                    let (w, h) = self.window_size;
+
+                    let tab_snapshots: Vec<(segmented_button::Entity, String)> = self
+                        .tab_data
+                        .iter()
+                        .map(|(&e, tab)| (e, tab.profile.clone()))
+                        .collect();
+
+                    if tab_snapshots.is_empty() {
+                        return Task::none();
+                    }
+
+                    let tasks: Vec<Task<cosmic::Action<Message>>> = tab_snapshots
+                        .into_iter()
+                        .map(|(entity, profile)| build_webview_task(entity, profile, id, w, h))
+                        .collect();
+
+                    // Each webview starts hidden; the active tab's webview is
+                    // shown when its WebviewReady message arrives.
+                    return Task::batch(tasks);
+                }
+            }
+
+            Message::WebviewReady(entity) => {
+                // Claim the WebView stored in the thread-local PENDING map by
+                // the run_with_handle closure. No-op if build_as_child failed
+                // (e.g., on Wayland).
+                #[cfg(target_os = "linux")]
+                {
+                    self.webview_store.claim_pending(entity);
+
+                    // If this is the currently active tab, show its webview
+                    // and set initial bounds.
+                    if self.tabs.active() == entity && self.page == Page::Tab {
+                        let (w, h) = self.window_size;
+                        let y = webview::TAB_STRIP_HEIGHT;
+                        self.webview_store.show_only(entity);
+                        self.webview_store.set_bounds(
+                            entity,
+                            0.0,
+                            y,
+                            f64::from(w),
+                            (f64::from(h) - y).max(1.0),
+                        );
+                    }
+                }
+            }
+
+            Message::PumpGtk => {
+                // Drive the GTK event loop on the main thread so the
+                // WebKitGTK surface repaints and processes input. Called from
+                // the 60 fps `time::every` subscription. Linux-only — on
+                // other platforms this message is never sent.
+                #[cfg(target_os = "linux")]
+                while gtk::events_pending() {
+                    gtk::main_iteration();
+                }
+            }
+
+            Message::WindowResized(_id, size) => {
+                self.window_size = (size.width, size.height);
+
+                // Update bounds for all webviews so they're correctly sized
+                // even for tabs that are currently hidden.
+                #[cfg(target_os = "linux")]
+                {
+                    let y = webview::TAB_STRIP_HEIGHT;
+                    self.webview_store.set_bounds_all(
+                        0.0,
+                        y,
+                        f64::from(size.width),
+                        (f64::from(size.height) - y).max(1.0),
+                    );
+                }
+            }
         }
         Task::none()
     }
@@ -469,13 +726,66 @@ impl cosmic::Application for AppModel {
             .core
             .watch_config::<Config>(Self::APP_ID)
             .map(|update| Message::UpdateConfig(update.config));
-        Subscription::batch([config_sub])
+
+        // Window resize — keep `window_size` in sync so webview bounds stay
+        // correct after the user drags the window edge.
+        let resize_sub = cosmic::iced::window::resize_events()
+            .map(|(id, size)| Message::WindowResized(id, size));
+
+        // Pump the GTK event loop at ~60 fps so the WebKitGTK surface can
+        // paint, process input, and run animations. Without this the webview
+        // renders once on creation and then freezes. Linux-only.
+        #[cfg(target_os = "linux")]
+        let gtk_pump =
+            cosmic::iced::time::every(Duration::from_millis(16)).map(|_| Message::PumpGtk);
+
+        #[cfg(target_os = "linux")]
+        return Subscription::batch([config_sub, resize_sub, gtk_pump]);
+
+        #[cfg(not(target_os = "linux"))]
+        Subscription::batch([config_sub, resize_sub])
     }
 
     fn on_nav_select(&mut self, _id: nav_bar::Id) -> Task<cosmic::Action<Self::Message>> {
         Task::none()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Webview task helper (Linux only)
+// ---------------------------------------------------------------------------
+
+/// Build a `Task` that calls `iced::window::run_with_handle` to create a wry
+/// `WebView` for `profile` as a child of the iced window identified by
+/// `window_id`.
+///
+/// The WebView is stored in the thread-local [`webview::PENDING`] map (since
+/// `WebView` is `!Send` and cannot be returned from the Task directly).  The
+/// task returns `Message::WebviewReady(entity)` which triggers
+/// `webview_store.claim_pending(entity)` in `update()`.
+#[cfg(target_os = "linux")]
+fn build_webview_task(
+    entity: segmented_button::Entity,
+    profile: String,
+    window_id: cosmic::iced::window::Id,
+    window_width: f32,
+    window_height: f32,
+) -> Task<cosmic::Action<Message>> {
+    let initial_bounds = WryRect {
+        position: LogicalPosition::new(0.0_f64, webview::TAB_STRIP_HEIGHT).into(),
+        size: LogicalSize::new(
+            f64::from(window_width),
+            (f64::from(window_height) - webview::TAB_STRIP_HEIGHT).max(1.0),
+        )
+        .into(),
+    };
+    cosmic::iced::window::run_with_handle(window_id, move |handle| {
+        webview::create_child_webview(entity, &profile, &handle, initial_bounds);
+        cosmic::Action::App(Message::WebviewReady(entity))
+    })
+}
+
+// ---------------------------------------------------------------------------
 
 impl AppModel {
     /// What page to land on when no tab is being actively shown.
