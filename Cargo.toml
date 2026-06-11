@@ -1,3 +1,13 @@
+[workspace]
+members = [
+    ".",
+    "crates/gander-chat",
+]
+# Only build the native gander binary by default; gander-chat requires the
+# wasm32-unknown-unknown target and must be built via `trunk`.
+default-members = ["."]
+resolver = "2"
+
 [package]
 name = "gander"
 version = "0.0.1"
