@@ -160,7 +160,9 @@ impl WebviewStore {
     /// The WebView is initially hidden; call [`show_only`] to make it visible.
     pub fn claim_pending(&mut self, entity: segmented_button::Entity) {
         if let Some(view) = claim_pending(entity) {
-            let _ = view.set_visible(false);
+            if let Err(err) = view.set_visible(false) {
+                tracing::warn!(?entity, %err, "set_visible(false) on claim failed");
+            }
             self.views.insert(entity, view);
         }
     }

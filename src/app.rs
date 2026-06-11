@@ -302,9 +302,15 @@ impl cosmic::Application for AppModel {
         let get_window_id = cosmic::iced::window::oldest().map(|opt_id| {
             cosmic::Action::App(match opt_id {
                 Some(id) => Message::GotMainWindowId(id),
-                // Window not yet available — GotMainWindowId will arrive
-                // via the Opened subscription instead.
-                None => Message::GotMainWindowId(cosmic::iced::window::Id::RESERVED),
+                None => {
+                    // Should not happen in practice: cosmic creates the main
+                    // window before init() returns. Log if it ever does.
+                    tracing::warn!(
+                        "oldest() returned None during init; \
+                         falling back to Id::RESERVED for webview creation"
+                    );
+                    Message::GotMainWindowId(cosmic::iced::window::Id::RESERVED)
+                }
             })
         });
 
@@ -642,7 +648,6 @@ impl cosmic::Application for AppModel {
                 // persisted state before the window ID was known.
                 #[cfg(target_os = "linux")]
                 {
-                    let active = self.tabs.active();
                     let (w, h) = self.window_size;
 
                     let tab_snapshots: Vec<(segmented_button::Entity, String)> = self
@@ -660,10 +665,8 @@ impl cosmic::Application for AppModel {
                         .map(|(entity, profile)| build_webview_task(entity, profile, id, w, h))
                         .collect();
 
-                    // The active tab's webview will be shown once its
-                    // WebviewReady message arrives; all others start hidden
-                    // (handled in WebviewReady).
-                    let _ = active; // suppress unused warning
+                    // Each webview starts hidden; the active tab's webview is
+                    // shown when its WebviewReady message arrives.
                     return Task::batch(tasks);
                 }
             }
