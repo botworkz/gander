@@ -6,20 +6,37 @@
 //! to a `segmented_button` model, and persists tab state to disk via
 //! [`state::Storage`].
 //!
-//! The flow for a typical user gesture:
+//! ## Pages and drawers
 //!
-//! 1. user clicks "+ tab" → [`Message::ShowNewTabPicker`] → `view()` swaps to
-//!    the picker page
+//! The main content area shows one of three things at any given time:
+//!
+//! - [`Page::Empty`] — no tab open, nudge the user to open one
+//! - [`Page::Picker`] — in-window picker for opening/creating a profile tab
+//! - [`Page::Tab`] — the active tab's body (currently a placeholder; will
+//!   eventually host the embedded goose UI, see DESIGN.md)
+//!
+//! Two context drawers (mutually exclusive — libcosmic only renders one at a
+//! time) overlay the right edge:
+//!
+//! - [`ContextDrawer::About`] — about-the-app card
+//! - [`ContextDrawer::ProfileConfig`] — per-active-tab profile metadata,
+//!   "Launch goose" lives here rather than in the tab body
+//!
+//! ## Flow for a typical user gesture
+//!
+//! 1. user clicks "+ New tab" → [`Message::ShowNewTabPicker`] → `view()`
+//!    swaps to the picker page
 //! 2. user picks a profile → [`Message::OpenTab`] → tab is appended and
-//!    activated, state is persisted
-//! 3. user closes a tab → [`Message::CloseTab`] → tab is removed, neighbour
-//!    activated, state is persisted
+//!    activated, state is persisted, page returns to [`Page::Tab`]
+//! 3. user clicks the gear in the header → [`Message::ToggleProfileConfig`]
+//!    → profile-config drawer slides in for the active tab
+//! 4. user clicks "Launch goose" in the drawer → [`Message::LaunchGoose`]
+//!    → goose is spawned via `geese::Profile::command` with `GOOSE_PATH_ROOT`
 //!
-//! Launching goose for a tab builds a `Command` via `geese::Profile::command`
-//! (which sets `GOOSE_PATH_ROOT` for us) and spawns it detached. The tab
-//! page reports a per-tab error on failure rather than popping a dialog.
-//! See [`DESIGN.md`](../DESIGN.md) for the embedding plan that supersedes
-//! this.
+//! Launching goose builds a `Command` via `geese::Profile::command` (which
+//! sets `GOOSE_PATH_ROOT`) and spawns it detached. Per-tab errors are
+//! surfaced in the tab body rather than as a dialog. When embedded goose
+//! lands this whole spawn path is replaced.
 
 use std::{collections::HashMap, process::Stdio};
 
@@ -79,6 +96,9 @@ pub struct AppModel {
 
     /// What page is currently shown in the content area.
     page: Page,
+    /// Which context drawer (if any) is currently open. libcosmic only allows
+    /// one drawer at a time, so this is a sum type, not a set.
+    drawer: Option<ContextDrawer>,
 
     /// Latest snapshot of profile metadata, refreshed on demand. Used by the
     /// new-tab picker.
@@ -103,6 +123,14 @@ pub enum Page {
     Picker,
 }
 
+/// Which overlay drawer is open. Mutually exclusive — libcosmic only renders
+/// one drawer at a time, so opening one closes the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextDrawer {
+    About,
+    ProfileConfig,
+}
+
 #[derive(Clone, Debug)]
 pub enum Message {
     /// User opened the new-tab picker.
@@ -121,14 +149,19 @@ pub enum Message {
     CreateProfile,
     /// Picker → refresh button or implicit refresh after mutation.
     RefreshProfiles,
-    /// User pressed "Launch goose" on a profile tab.
+    /// User pressed "Launch goose" on the profile-config drawer.
     LaunchGoose(String),
     /// `Config` watcher tick.
     UpdateConfig(Config),
     /// About-page link click.
     LaunchUrl(String),
-    /// About context-drawer toggle.
+    /// About drawer toggle (menu/keybind).
     ToggleAbout,
+    /// Profile-config drawer toggle (gear button in header).
+    ToggleProfileConfig,
+    /// libcosmic-side drawer close (the drawer's own × button). Closes
+    /// whichever drawer is currently open.
+    CloseContextDrawer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,6 +229,7 @@ impl cosmic::Application for AppModel {
             tabs: segmented_button::ModelBuilder::default().build(),
             tab_data: HashMap::new(),
             page: Page::Empty,
+            drawer: None,
             known_profiles: Vec::new(),
             new_profile_name: String::new(),
             picker_error: None,
@@ -225,7 +259,22 @@ impl cosmic::Application for AppModel {
     }
 
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
+        // Gear is enabled only when there's an active tab whose profile
+        // exists. Disabled-state buttons are rendered via the absence of
+        // `on_press` — same pattern as the picker.
+        let mut config_button =
+            widget::button::icon(widget::icon::from_name("preferences-system-symbolic"));
+        if self.active_profile_name().is_some() {
+            config_button = config_button.on_press(Message::ToggleProfileConfig);
+        }
+        let config_tooltip = widget::tooltip(
+            config_button,
+            widget::text::body(fl!("profile-config-tooltip")),
+            widget::tooltip::Position::Bottom,
+        );
+
         vec![
+            config_tooltip.into(),
             widget::button::standard(fl!("new-tab"))
                 .on_press(Message::ShowNewTabPicker)
                 .into(),
@@ -240,11 +289,17 @@ impl cosmic::Application for AppModel {
         if !self.core.window.show_context {
             return None;
         }
-        Some(context_drawer::about(
-            &self.about,
-            |url| Message::LaunchUrl(url.to_string()),
-            Message::ToggleAbout,
-        ))
+        match self.drawer {
+            None => None,
+            Some(ContextDrawer::About) => Some(context_drawer::about(
+                &self.about,
+                |url| Message::LaunchUrl(url.to_string()),
+                Message::CloseContextDrawer,
+            )),
+            Some(ContextDrawer::ProfileConfig) => self
+                .active_profile_name()
+                .map(|name| self.view_profile_config(name)),
+        }
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -391,7 +446,19 @@ impl cosmic::Application for AppModel {
                 }
             }
             Message::ToggleAbout => {
-                self.core.window.show_context = !self.core.window.show_context;
+                self.toggle_drawer(ContextDrawer::About);
+            }
+            Message::ToggleProfileConfig => {
+                // Opening profile-config only makes sense when there's an
+                // active profile tab — the header button is disabled in that
+                // case, but guard here too in case a future keybind fires it.
+                if self.active_profile_name().is_some() {
+                    self.toggle_drawer(ContextDrawer::ProfileConfig);
+                }
+            }
+            Message::CloseContextDrawer => {
+                self.drawer = None;
+                self.core.window.show_context = false;
             }
         }
         Task::none()
@@ -417,6 +484,25 @@ impl AppModel {
             Page::Tab
         } else {
             Page::Empty
+        }
+    }
+
+    /// Name of the profile bound to the currently-active tab, if any.
+    fn active_profile_name(&self) -> Option<&str> {
+        self.tab_data
+            .get(&self.tabs.active())
+            .map(|tab| tab.profile.as_str())
+    }
+
+    /// Open `kind`, or close it if it's already open. Closing any drawer also
+    /// hides the cosmic context-drawer surface; opening one shows it.
+    fn toggle_drawer(&mut self, kind: ContextDrawer) {
+        if self.drawer == Some(kind) {
+            self.drawer = None;
+            self.core.window.show_context = false;
+        } else {
+            self.drawer = Some(kind);
+            self.core.window.show_context = true;
         }
     }
 
@@ -512,6 +598,14 @@ impl AppModel {
         self.tab_data.remove(&entity);
         self.tabs.remove(entity);
         self.page = self.default_page();
+        // If the profile-config drawer was open for the now-gone active tab,
+        // close it. About is profile-agnostic and stays open.
+        if self.drawer == Some(ContextDrawer::ProfileConfig)
+            && self.active_profile_name().is_none()
+        {
+            self.drawer = None;
+            self.core.window.show_context = false;
+        }
     }
 
     fn persist_state(&self) {
@@ -544,9 +638,9 @@ impl AppModel {
 
     fn update_title(&mut self) -> Task<cosmic::Action<Message>> {
         let mut title = fl!("app-title");
-        if let Some(tab) = self.tab_data.get(&self.tabs.active()) {
+        if let Some(name) = self.active_profile_name() {
             title.push_str(" — ");
-            title.push_str(&tab.profile);
+            title.push_str(name);
         }
         if self.core.main_window_id().is_some() {
             self.set_window_title(title)
@@ -660,5 +754,71 @@ impl AppModel {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// Build the profile-config context drawer for `profile_name`.
+    ///
+    /// Reads the profile from `geese_storage` on every render — we don't
+    /// cache, so the drawer reflects current disk state. If the profile has
+    /// vanished while the drawer was open, render a "no longer exists" note
+    /// (the surrounding tab will also be showing its missing-placeholder).
+    fn view_profile_config<'a>(
+        &'a self,
+        profile_name: &'a str,
+    ) -> context_drawer::ContextDrawer<'a, Message> {
+        let space = cosmic::theme::spacing();
+
+        let body: Element<'_, Message> = match self.geese_storage.get(profile_name) {
+            Err(_) => widget::text::body(fl!("tab-placeholder-missing")).into(),
+            Ok(profile) => {
+                let meta = profile.meta();
+
+                let mut section = widget::settings::section();
+                section = section.add(
+                    widget::settings::item::builder(fl!("profile-config-path"))
+                        .control(widget::text::body(profile.path().display().to_string())),
+                );
+                let status = if meta.locked {
+                    fl!("profile-config-status-locked")
+                } else {
+                    fl!("profile-config-status-unlocked")
+                };
+                section = section.add(
+                    widget::settings::item::builder(fl!("profile-config-status"))
+                        .control(widget::text::body(status)),
+                );
+                if let Some(parent) = &meta.parent {
+                    section = section.add(
+                        widget::settings::item::builder(fl!("profile-config-parent"))
+                            .control(widget::text::body(parent.clone())),
+                    );
+                }
+
+                let launch = widget::button::suggested(fl!("profile-config-launch"))
+                    .on_press(Message::LaunchGoose(profile_name.to_owned()));
+
+                let mut column = widget::column::with_capacity(2)
+                    .spacing(space.space_m)
+                    .push(section)
+                    .push(launch);
+
+                if let Some(error) = self
+                    .tab_data
+                    .values()
+                    .find(|tab| tab.profile == profile_name)
+                    .and_then(|tab| tab.last_launch_error.as_ref())
+                {
+                    column = column.push(widget::text::body(fl!(
+                        "profile-config-launch-failed",
+                        error = error.as_str()
+                    )));
+                }
+
+                column.into()
+            }
+        };
+
+        context_drawer::context_drawer(body, Message::CloseContextDrawer)
+            .title(profile_name.to_owned())
     }
 }
