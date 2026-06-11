@@ -12,7 +12,7 @@ anyhow = "1.0"
 dirs = "6.0"
 geese = { git = "https://github.com/phlax/geese", branch = "init2" }
 iced_renderer = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc", package = "iced_renderer", default-features = false, features = ["geometry"] }
-iced_webview = { package = "iced_webview_v2", path = "vendor/iced_webview_v2", default-features = false, features = ["servo"] }
+iced_webview = { package = "iced_webview_v2", path = "vendor/iced_webview_v2", default-features = false, features = ["cef"] }
 i18n-embed = { version = "0.16", features = [
     "fluent-system",
     "desktop-requester",

@@ -2,26 +2,20 @@
 
 //! Tab content rendering.
 //!
-//! Each open tab is bound to a `geese` profile by name. The body is currently
-//! a minimal placeholder — once embedded goose UI lands (see
-//! [`DESIGN.md`](../DESIGN.md)), the body becomes a webview hosting the React
-//! UI for `goosed` running with this tab's `GOOSE_PATH_ROOT`.
+//! Each open tab is bound to a `geese` profile by name. The body is a webview
+//! hosted by the single process-wide [`iced_webview::Cef`] engine owned by
+//! `AppModel`. Each tab holds only an opaque [`iced_webview::ViewId`] for its
+//! view inside that engine.
 //!
 //! Per-profile *configuration* (path, status, parent, launch) lives in the
 //! app's context drawer, not in the tab body — see
-//! `AppModel::view_profile_config`. The tab body deliberately does not show
-//! that information so the space reads as "this is where goose goes" rather
-//! than "this is a settings page".
-//!
-//! The view returned here is intentionally a single `Element` so swapping the
-//! placeholder for an embedded webview later is a localized change.
+//! `AppModel::view_profile_config`.
 
-use cosmic::iced::{Alignment, Length, Task as IcedTask};
+use cosmic::iced::{Alignment, Length};
 use cosmic::prelude::*;
 use cosmic::widget;
-use cosmic::widget::segmented_button;
 use geese::Storage;
-use iced_webview::{Action as WebViewAction, PageType, WebView};
+use iced_webview::ViewId;
 
 use crate::app::Message;
 use crate::fl;
@@ -30,66 +24,34 @@ use crate::fl;
 ///
 /// Holds only what's needed for the *body* — the profile name (so we know
 /// which profile to bind to) and the most recent launch error (so we can
-/// surface failures inline without a separate dialog). Profile metadata is
-/// resolved against `Storage` at render time; nothing is cached here.
+/// surface failures inline without a separate dialog). The actual webview
+/// view is owned by the single `WebView<Cef, _>` in `AppModel`; this struct
+/// stores only the opaque `ViewId` assigned to this tab.
 pub struct Tab {
     pub profile: String,
     pub last_launch_error: Option<String>,
-    webview: WebView<iced_webview::Servo, Message>,
-    webview_live: bool,
+    /// The ViewId inside `AppModel::webview` for this tab's browser view.
+    /// `None` until the async `CreateView` task completes.
+    pub view_id: Option<ViewId>,
 }
 
 impl Tab {
-    pub fn new(
-        profile: impl Into<String>,
-        entity: segmented_button::Entity,
-    ) -> Self {
+    pub fn new(profile: impl Into<String>) -> Self {
         Self {
             profile: profile.into(),
             last_launch_error: None,
-            webview: WebView::new()
-                .on_create_view(Message::TabWebViewCreated(entity))
-                .on_action(move |action| Message::TabWebView(entity, action)),
-            webview_live: false,
+            view_id: None,
         }
     }
 
-    pub fn create_webview(&mut self) -> IcedTask<Message> {
-        self.webview
-            .update(WebViewAction::CreateView(PageType::Url(self.data_url())))
-    }
-
-    pub fn finish_webview_creation(&mut self) -> IcedTask<Message> {
-        self.webview_live = true;
-        self.webview.update(WebViewAction::ChangeView(0))
-    }
-
-    pub fn update_webview(&mut self, action: WebViewAction) -> IcedTask<Message> {
-        self.webview.update(action)
-    }
-
-    pub fn tick_webview(&mut self) -> IcedTask<Message> {
-        if self.webview_live {
-            self.webview.update(WebViewAction::Update)
-        } else {
-            IcedTask::none()
-        }
-    }
-
-    pub fn destroy(&mut self) {
-        if self.webview_live {
-            let _ = self.webview.update(WebViewAction::CloseView(0));
-            self.webview_live = false;
-        }
-    }
-
-    /// Render the tab body. Checks that the profile still exists on disk; if
-    /// it doesn't, surfaces a friendly "no longer exists" message rather than
-    /// panicking.
+    /// Render the tab body.
+    ///
+    /// `webview_body` is the element produced by `AppModel::webview.view(id)`
+    /// for this tab's `view_id`, or `None` if the view is not yet live.
     pub fn view<'a>(
         &'a self,
-        entity: segmented_button::Entity,
         storage: &Storage,
+        webview_body: Option<Element<'a, Message>>,
     ) -> Element<'a, Message> {
         let space = cosmic::theme::spacing();
 
@@ -110,16 +72,14 @@ impl Tab {
             .into();
         }
 
-        let webview: Element<'_, Message> = if self.webview_live {
-            self.webview.view().map(move |action| Message::TabWebView(entity, action))
-        } else {
+        let body: Element<'_, Message> = webview_body.unwrap_or_else(|| {
             widget::container(widget::text::body(format!("goose: {}", self.profile)))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
                 .into()
-        };
+        });
 
         let mut column = widget::column::with_capacity(2);
         if let Some(error) = &self.last_launch_error {
@@ -129,24 +89,15 @@ impl Tab {
             )));
         }
 
-        widget::container(column.push(webview))
+        widget::container(column.push(body))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
     }
-
-    fn data_url(&self) -> String {
-        data_url_for_profile(&self.profile)
-    }
 }
 
-impl Drop for Tab {
-    fn drop(&mut self) {
-        self.destroy();
-    }
-}
-
-fn data_url_for_profile(profile: &str) -> String {
+/// Build a `data:` URL that renders a minimal HTML page for `profile`.
+pub fn data_url_for_profile(profile: &str) -> String {
     let html = format!("<h1>goose: {}</h1>", html_escape(profile));
     format!(
         "data:text/html;charset=utf-8,{}",
@@ -207,3 +158,4 @@ mod tests {
         );
     }
 }
+

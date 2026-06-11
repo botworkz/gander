@@ -772,7 +772,6 @@ fn iced_key_to_cef(key: &keyboard::Key) -> Option<(i32, u16)> {
             let (vk, ch) = match named {
                 Named::Enter => (0x0D, 0x0D),
                 Named::Tab => (0x09, 0x09),
-                Named::Space => (0x20, 0x20),
                 Named::Backspace => (0x08, 0x08),
                 Named::Delete => (0x2E, 0),
                 Named::Escape => (0x1B, 0x1B),

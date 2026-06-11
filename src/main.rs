@@ -9,6 +9,12 @@ mod tab;
 use std::process;
 
 fn main() -> cosmic::iced::Result {
+    // CEF spawns helper subprocesses from the same binary. If this is one of
+    // them, hand off immediately so the subprocess can do its job and exit.
+    if iced_webview::cef_subprocess_check() {
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
