@@ -492,11 +492,32 @@ impl cosmic::Application for AppModel {
                 self.drawer = None;
                 self.core.window.show_context = false;
             }
-            Message::WebView(action) => {
-                return self.update_webview(action);
+            Message::WebView(webview_action) => {
+                return self.update_webview(webview_action);
             }
             Message::WebViewCreated(view_id) => {
-                if let Some(entity) = self.pending_view_entities.pop_front() {
+                let entity_from_url = self.webview.url_for(view_id).and_then(|url| {
+                    self.tab_data.iter().find_map(|(entity, tab)| {
+                        (tab.view_id.is_none() && tab.data_url() == url).then_some(*entity)
+                    })
+                });
+
+                let entity = entity_from_url.or_else(|| {
+                    while let Some(entity) = self.pending_view_entities.pop_front() {
+                        if self
+                            .tab_data
+                            .get(&entity)
+                            .is_some_and(|tab| tab.view_id.is_none())
+                        {
+                            return Some(entity);
+                        }
+                    }
+                    None
+                });
+
+                if let Some(entity) = entity {
+                    self.pending_view_entities
+                        .retain(|queued| *queued != entity);
                     if let Some(tab) = self.tab_data.get_mut(&entity) {
                         tab.view_id = Some(view_id);
                         self.view_to_entity.insert(view_id, entity);
@@ -690,9 +711,7 @@ impl AppModel {
         } else {
             Task::none()
         };
-        if let Some(position) = self.pending_view_entities.iter().position(|e| *e == entity) {
-            self.pending_view_entities.remove(position);
-        }
+        self.pending_view_entities.retain(|e| *e != entity);
         self.tabs.remove(entity);
         self.page = self.default_page();
         // If the profile-config drawer was open for the now-gone active tab,
