@@ -52,6 +52,7 @@ features = [
 ]
 
 [dev-dependencies]
+agent-client-protocol = "0.14.0"
 tempfile = "3.10"
 
 # Uncomment to test a locally-cloned libcosmic
