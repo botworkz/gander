@@ -15,7 +15,7 @@ use nix::{
     unistd::Pid,
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::{broadcast, mpsc, watch},
     time::timeout,
@@ -61,6 +61,24 @@ pub struct LifecycleEvent {
     pub snapshot: ChildSnapshot,
 }
 
+#[derive(Clone)]
+pub struct ChildStdio {
+    stdin_tx: mpsc::UnboundedSender<String>,
+    stdout_tx: broadcast::Sender<String>,
+}
+
+impl ChildStdio {
+    pub fn send_line(&self, line: impl Into<String>) -> io::Result<()> {
+        self.stdin_tx
+            .send(line.into())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "child stdin is closed"))
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+        self.stdout_tx.subscribe()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("child for profile `{0}` failed to start: {1}")]
@@ -93,6 +111,7 @@ where
 struct ChildEntry {
     control_tx: Option<mpsc::UnboundedSender<Control>>,
     snapshot_rx: watch::Receiver<ChildSnapshot>,
+    stdio_rx: watch::Receiver<Option<ChildStdio>>,
 }
 
 enum Control {
@@ -213,6 +232,15 @@ where
     pub fn subscribe(&self) -> BroadcastStream<LifecycleEvent> {
         BroadcastStream::new(self.inner.events.subscribe())
     }
+
+    pub fn stdio(&self, profile: &str) -> Option<ChildStdio> {
+        self.inner
+            .entries
+            .lock()
+            .expect(INVARIANT_ERROR)
+            .get(profile)
+            .and_then(|entry| entry.stdio_rx.borrow().clone())
+    }
 }
 
 impl<F> Clone for Supervisor<F>
@@ -250,6 +278,7 @@ where
 {
     let profile = profile.to_owned();
     let (snapshot_tx, snapshot_rx) = watch::channel(ChildSnapshot::starting());
+    let (stdio_tx, stdio_rx) = watch::channel(None);
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     publish(&events, &profile, &ChildSnapshot::starting());
 
@@ -259,12 +288,14 @@ where
         grace_period,
         events,
         snapshot_tx,
+        stdio_tx,
         control_rx,
     ));
 
     ChildEntry {
         control_tx: Some(control_tx),
         snapshot_rx,
+        stdio_rx,
     }
 }
 
@@ -274,6 +305,7 @@ async fn run_child<F>(
     grace_period: Duration,
     events: broadcast::Sender<LifecycleEvent>,
     snapshot_tx: watch::Sender<ChildSnapshot>,
+    stdio_tx: watch::Sender<Option<ChildStdio>>,
     mut control_rx: mpsc::UnboundedReceiver<Control>,
 ) where
     F: Fn(&str) -> io::Result<Command> + Send + Sync + 'static,
@@ -293,7 +325,7 @@ async fn run_child<F>(
             return;
         }
     };
-    command.stdin(Stdio::null());
+    command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
 
     let mut child = match command.spawn() {
@@ -344,6 +376,37 @@ async fn run_child<F>(
             return;
         }
     };
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            update_snapshot(
+                &snapshot_tx,
+                &events,
+                &profile,
+                ChildSnapshot {
+                    handle: None,
+                    state: ChildState::Failed("child stdin was not piped".to_owned()),
+                },
+            );
+            return;
+        }
+    };
+    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut stdin = stdin;
+        while let Some(line) = stdin_rx.recv().await {
+            if stdin.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+            if stdin.write_all(b"\n").await.is_err() {
+                break;
+            }
+            if stdin.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+    let (stdout_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
     let mut lines = BufReader::new(stdout).lines();
 
     let port_line = tokio::select! {
@@ -427,6 +490,20 @@ async fn run_child<F>(
             state: ChildState::Ready,
         },
     );
+    let _ = stdio_tx.send(Some(ChildStdio {
+        stdin_tx,
+        stdout_tx: stdout_tx.clone(),
+    }));
+    tokio::spawn(async move {
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let _ = stdout_tx.send(line);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    });
 
     tokio::select! {
         control = control_rx.recv() => {
@@ -453,6 +530,7 @@ async fn run_child<F>(
             );
         }
     }
+    let _ = stdio_tx.send(None);
 }
 
 async fn finish_stop(
