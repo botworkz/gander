@@ -473,9 +473,13 @@ impl cosmic::Application for AppModel {
             Message::TabWebViewCreated(entity) => {
                 if let Some(tab) = self.tab_data.get_mut(&entity) {
                     return Self::into_app_task(tab.finish_webview_creation());
+                } else {
+                    tracing::warn!(?entity, "received webview-created event for unknown tab");
                 }
             }
             Message::TickWebviews => {
+                // Drive embedded webviews at roughly 60fps so their internal
+                // event loops continue rendering while tabs are open.
                 return Task::batch(
                     self.tab_data
                         .values_mut()
