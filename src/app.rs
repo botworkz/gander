@@ -443,42 +443,32 @@ impl cosmic::Application for AppModel {
             widget::space::vertical().height(0).into()
         };
 
-        let body: Element<_> = match self.page {
+        let body_inner: Element<_> = match self.page {
             Page::Empty => self.view_empty(),
             Page::Picker => self.view_picker(),
             Page::Tab => {
                 let entity = self.tabs.active();
-                let inner: Element<_> = match self.tab_data.get(&entity) {
+                match self.tab_data.get(&entity) {
                     Some(tab) => tab.view(&self.geese_storage),
                     None => self.view_empty(),
-                };
-                // On Linux, wrap the active tab body in libcosmic's
-                // rectangle-tracking container so its on-screen bounds get
-                // reported back to `update` via `Message::TabBodyRect`.
-                // That's how the wry WebView learns where to draw without
-                // any hard-coded "tab strip is N pixels tall" guesswork.
-                #[cfg(target_os = "linux")]
-                {
-                    if let Some(tracker) = self.rect_tracker.as_ref() {
-                        tracker
-                            .container(TAB_BODY_TRACKER_ID, inner)
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .into()
-                    } else {
-                        // Tracker subscription hasn't sent its init message
-                        // yet; render plain so the user sees content
-                        // immediately. The webview falls back to
-                        // `TAB_STRIP_HEIGHT` for this first frame.
-                        inner
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    inner
                 }
             }
         };
+        #[cfg(target_os = "linux")]
+        let body: Element<_> = if let Some(tracker) = self.rect_tracker.as_ref() {
+            tracker
+                .container(TAB_BODY_TRACKER_ID, body_inner)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            // Tracker subscription hasn't sent its init message yet; render
+            // plain so the user sees content immediately. The webview falls
+            // back to `TAB_STRIP_HEIGHT` for this first frame.
+            body_inner
+        };
+        #[cfg(not(target_os = "linux"))]
+        let body = body_inner;
 
         widget::column::with_capacity(2)
             .push(tab_strip)
