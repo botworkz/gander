@@ -15,8 +15,8 @@ fn main() {
 
     let dist_index = Path::new("crates/gander-chat/dist/index.html");
     if !dist_index.exists() {
-        println!(
-            "cargo:warning=gander-chat dist not found. \
+        eprintln!(
+            "error[gander build.rs]: gander-chat dist not found.\n\
              Run `cargo xtask build-chat` to build the Leptos WASM bundle first."
         );
         std::process::exit(1);

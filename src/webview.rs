@@ -268,7 +268,7 @@ fn make_protocol_handler(
 
 /// Return a `Content-Type` string for a file path based on its extension.
 fn mime_for(path: &str) -> &'static str {
-    let ext = path.rsplit('.').next().unwrap_or("");
+    let ext = path.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
     match ext {
         "html" => "text/html",
         "js" | "mjs" => "application/javascript",
