@@ -2,10 +2,11 @@
 members = [
     ".",
     "crates/gander-chat",
+    "xtask",
 ]
 # Only build the native gander binary by default; gander-chat requires the
 # wasm32-unknown-unknown target and must be built via `trunk`.
-default-members = ["."]
+default-members = [".", "xtask"]
 resolver = "2"
 
 [package]
@@ -20,7 +21,6 @@ rust-version = "1.85"
 [dependencies]
 agent-client-protocol = "0.14.0"
 anyhow = "1.0"
-base64 = "0.22"
 dirs = "6.0"
 geese = { git = "https://github.com/phlax/geese", branch = "init2" }
 i18n-embed = { version = "0.16", features = [

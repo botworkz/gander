@@ -528,8 +528,7 @@ impl cosmic::Application for AppModel {
                     // Rectangle event drains it. See `pending_webviews`.
                     match (self.main_window_id, self.tab_body_bounds) {
                         (Some(window_id), Some(_)) => {
-                            let wv_task =
-                                build_webview_task(entity, name, window_id, x, y, w, h);
+                            let wv_task = build_webview_task(entity, name, window_id, x, y, w, h);
                             return Task::batch([title_task, wv_task]);
                         }
                         _ => {
@@ -604,7 +603,13 @@ impl cosmic::Application for AppModel {
                                 (Some(window_id), Some(_)) => {
                                     let (x, y, w, h) = self.webview_bounds();
                                     let wv_task = build_webview_task(
-                                        entity, profile_name, window_id, x, y, w, h,
+                                        entity,
+                                        profile_name,
+                                        window_id,
+                                        x,
+                                        y,
+                                        w,
+                                        h,
                                     );
                                     return Task::batch([title_task, wv_task]);
                                 }
@@ -824,15 +829,16 @@ impl cosmic::Application for AppModel {
                             let (x, y, w, h) = self.webview_bounds();
                             tracing::info!(
                                 count = pending.len(),
-                                x, y, w, h,
+                                x,
+                                y,
+                                w,
+                                h,
                                 "draining pending webviews"
                             );
                             let tasks: Vec<Task<cosmic::Action<Message>>> = pending
                                 .into_iter()
                                 .map(|(entity, profile)| {
-                                    build_webview_task(
-                                        entity, profile, window_id, x, y, w, h,
-                                    )
+                                    build_webview_task(entity, profile, window_id, x, y, w, h)
                                 })
                                 .collect();
                             return Task::batch(tasks);
@@ -908,8 +914,7 @@ fn build_webview_task(
     let s = webview::display_scale();
     let initial_bounds = WryRect {
         position: LogicalPosition::new(x * s, y * s).into(),
-        size: LogicalSize::new((width * s).max(1.0), (height * s).max(1.0))
-            .into(),
+        size: LogicalSize::new((width * s).max(1.0), (height * s).max(1.0)).into(),
     };
     cosmic::iced::window::run_with_handle(window_id, move |handle| {
         webview::create_child_webview(entity, &profile, &handle, initial_bounds);
@@ -975,12 +980,7 @@ impl AppModel {
         } else {
             let (w, h) = self.window_size;
             let y = webview::TAB_STRIP_HEIGHT;
-            (
-                x_off,
-                y + y_off,
-                f64::from(w),
-                (f64::from(h) - y).max(1.0),
-            )
+            (x_off, y + y_off, f64::from(w), (f64::from(h) - y).max(1.0))
         }
     }
 

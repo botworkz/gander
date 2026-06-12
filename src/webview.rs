@@ -76,14 +76,46 @@
 //!
 //! [wry]: https://github.com/tauri-apps/wry
 
-use std::{cell::RefCell, collections::HashMap};
+use std::{borrow::Cow, cell::RefCell, collections::HashMap};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use cosmic::widget::segmented_button;
 use wry::{
     Rect, WebView, WebViewBuilder,
     dpi::{LogicalPosition, LogicalSize},
 };
+
+/// Embedded assets from `crates/gander-chat/dist/`.
+///
+/// Built by `cargo xtask build-chat [--release]` and embedded at compile time
+/// via `rust-embed`. The `gander://chat/<path>` custom protocol handler serves
+/// these bytes to the per-tab WebView.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../crates/gander-chat/dist/"]
+struct ChatAssets;
+
+/// Initialization script injected into every tab WebView before the WASM
+/// module instantiates.
+///
+/// Satisfies the bridge contract documented in `crates/gander-chat/README.md`.
+/// `send` is a stub that logs to the devtools console; `subscribe` wires up the
+/// subscriber list. Real ACP plumbing replaces these stubs in a later PR.
+const STUB_BRIDGE: &str = r#"
+window.gander = (function () {
+    const subscribers = [];
+    return {
+        send: function (text) {
+            console.log('[gander stub] send:', text);
+        },
+        subscribe: function (cb) {
+            subscribers.push(cb);
+            return function () {
+                const i = subscribers.indexOf(cb);
+                if (i >= 0) subscribers.splice(i, 1);
+            };
+        },
+    };
+})();
+"#;
 
 /// Coarse pixel height of the COSMIC header + tab strip stack, used **only**
 /// as a first-frame fallback before the rectangle tracker has populated
@@ -176,32 +208,76 @@ pub fn claim_pending(entity: segmented_button::Entity) -> Option<WebView> {
 }
 
 // ---------------------------------------------------------------------------
-// HTML / data-URL helper
+// Chat URL helper
 // ---------------------------------------------------------------------------
 
-/// Build the `data:text/html;base64,…` URL that each tab's WebView loads.
+/// Build the `gander://chat/index.html?profile=…` URL loaded by each tab's
+/// WebView.
 ///
-/// Placeholder content for the spike — a styled `<h1>goose: {profile}</h1>`.
-/// Replaced when chat-leptos is wired in as the real per-tab page.
-pub fn build_data_url(profile: &str) -> String {
-    let html = format!(
-        "<!DOCTYPE html>\n\
-         <html>\n\
-         <head><meta charset=\"utf-8\"><style>\n\
-         html, body {{ margin: 0; padding: 0; height: 100%;\n\
-                       background: #f0f7ff; font-family: sans-serif; }}\n\
-         h1 {{ margin: 0; padding: 8px 16px;\n\
-               background: #4a90d9; color: white; }}\n\
-         p  {{ color: #666; margin: 8px 16px; }}\n\
-         </style></head>\n\
-         <body>\n\
-           <h1>goose: {profile}</h1>\n\
-           <p>WebKitGTK webview — placeholder</p>\n\
-         </body>\n\
-         </html>"
-    );
-    let encoded = BASE64.encode(html.as_bytes());
-    format!("data:text/html;base64,{encoded}")
+/// The `gander://chat/` custom protocol serves embedded assets from
+/// `crates/gander-chat/dist/` (built by `cargo xtask build-chat`).
+pub fn build_chat_url(profile: &str) -> String {
+    format!("gander://chat/index.html?profile={profile}")
+}
+
+// ---------------------------------------------------------------------------
+// Custom-protocol handler
+// ---------------------------------------------------------------------------
+
+/// Build the `gander://chat/<path>` custom-protocol handler.
+///
+/// Looks up `path` in the embedded `ChatAssets` (`crates/gander-chat/dist/`)
+/// and returns the bytes with an appropriate `Content-Type` header.  Returns
+/// 404 if the asset is not found.
+fn make_protocol_handler(
+    _id: &str,
+    request: wry::http::Request<Vec<u8>>,
+) -> wry::http::Response<Cow<'static, [u8]>> {
+    // Strip the scheme + host prefix to get the bare path.
+    // Request URLs look like "gander://chat/index.html?profile=default".
+    let uri = request.uri().to_string();
+    let path = uri
+        .strip_prefix("gander://chat/")
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("");
+
+    // Map empty / root to the entry point.
+    let asset_path = if path.is_empty() || path == "/" {
+        "index.html"
+    } else {
+        path
+    };
+
+    match ChatAssets::get(asset_path) {
+        Some(asset) => {
+            let mime = mime_for(asset_path);
+            wry::http::Response::builder()
+                .status(200)
+                .header("Content-Type", mime)
+                .body(Cow::Owned(asset.data.into_owned()))
+                .expect("response builder failed")
+        }
+        None => wry::http::Response::builder()
+            .status(404)
+            .body(Cow::Borrowed(b"" as &[u8]))
+            .expect("response builder failed"),
+    }
+}
+
+/// Return a `Content-Type` string for a file path based on its extension.
+fn mime_for(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    match ext {
+        "html" => "text/html",
+        "js" | "mjs" => "application/javascript",
+        "wasm" => "application/wasm",
+        "css" => "text/css",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        _ => "application/octet-stream",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -302,8 +378,7 @@ impl WebviewStore {
         let s = display_scale();
         if let Err(err) = view.set_bounds(Rect {
             position: LogicalPosition::new(x * s, y * s).into(),
-            size: LogicalSize::new((width * s).max(1.0), (height * s).max(1.0))
-                .into(),
+            size: LogicalSize::new((width * s).max(1.0), (height * s).max(1.0)).into(),
         }) {
             tracing::warn!(%err, "set_bounds failed");
         }
@@ -336,10 +411,13 @@ pub fn create_child_webview(
     handle: &impl raw_window_handle::HasWindowHandle,
     initial_bounds: Rect,
 ) -> bool {
-    let url = build_data_url(profile);
+    let url = build_chat_url(profile);
     match WebViewBuilder::new()
+        .with_initialization_script(STUB_BRIDGE)
+        .with_custom_protocol("gander".into(), make_protocol_handler)
         .with_url(&url)
         .with_bounds(initial_bounds)
+        .with_devtools(std::env::var("GANDER_DEVTOOLS").is_ok())
         .build_as_child(handle)
     {
         Ok(view) => {
