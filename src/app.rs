@@ -54,9 +54,22 @@ use crate::tab::Tab;
 #[cfg(target_os = "linux")]
 use crate::webview;
 #[cfg(target_os = "linux")]
+use cosmic::iced::Rectangle as IcedRectangle;
+#[cfg(target_os = "linux")]
+use cosmic::widget::rectangle_tracker::{
+    RectangleTracker, RectangleUpdate, rectangle_tracker_subscription,
+};
+#[cfg(target_os = "linux")]
 use wry::Rect as WryRect;
 #[cfg(target_os = "linux")]
 use wry::dpi::{LogicalPosition, LogicalSize};
+
+/// Stable id we hand to libcosmic's [`rectangle_tracker_subscription`] so the
+/// app and the widget tree end up talking through the same channel.
+///
+/// Only one slot is tracked (the active tab's body), so a constant is fine.
+#[cfg(target_os = "linux")]
+const TAB_BODY_TRACKER_ID: u8 = 0;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
@@ -130,6 +143,40 @@ pub struct AppModel {
     /// not exist; all `#[cfg(target_os = "linux")]` guards below reference it.
     #[cfg(target_os = "linux")]
     webview_store: webview::WebviewStore,
+
+    /// Tracker handle from libcosmic's `rectangle_tracker` subscription. Set
+    /// once on the first `RectangleUpdate::Init` event, then used to wrap the
+    /// active tab body so iced's draw pass reports its real on-screen bounds.
+    /// `None` until the subscription has produced its init message; in that
+    /// window we fall back to the rough `TAB_STRIP_HEIGHT` constant.
+    #[cfg(target_os = "linux")]
+    rect_tracker: Option<RectangleTracker<u8>>,
+
+    /// Last reported on-screen bounds of the tab body, in logical pixels.
+    /// Updated by `RectangleUpdate::Rectangle` events. The webview is
+    /// reparented to this rectangle on every change. `None` until the first
+    /// draw lands.
+    #[cfg(target_os = "linux")]
+    tab_body_bounds: Option<IcedRectangle>,
+    /// Per-tab WebView store (Linux only). On other platforms this field does
+    /// not exist; all `#[cfg(target_os = "linux")]` guards below reference it.
+    #[cfg(target_os = "linux")]
+    webview_store: webview::WebviewStore,
+
+    /// Tracker handle from libcosmic's `rectangle_tracker` subscription. Set
+    /// once on the first `RectangleUpdate::Init` event, then used to wrap the
+    /// active tab body so iced's draw pass reports its real on-screen bounds.
+    /// `None` until the subscription has produced its init message; in that
+    /// window we fall back to the rough `TAB_STRIP_HEIGHT` constant.
+    #[cfg(target_os = "linux")]
+    rect_tracker: Option<RectangleTracker<u8>>,
+
+    /// Last reported on-screen bounds of the tab body, in logical pixels.
+    /// Updated by `RectangleUpdate::Rectangle` events. The webview is
+    /// reparented to this rectangle on every change. `None` until the first
+    /// draw lands.
+    #[cfg(target_os = "linux")]
+    tab_body_bounds: Option<IcedRectangle>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -206,6 +253,13 @@ pub enum Message {
 
     /// Window resize event forwarded from the iced subscription.
     WindowResized(cosmic::iced::window::Id, cosmic::iced::Size),
+
+    /// Update from libcosmic's `rectangle_tracker` subscription. We use it to
+    /// observe the on-screen bounds of the active tab body widget so the
+    /// child wry WebView can be positioned to exactly match — without
+    /// hard-coding offsets for the COSMIC header and tab strip.
+    #[cfg(target_os = "linux")]
+    TabBodyRect(RectangleUpdate<u8>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -285,6 +339,10 @@ impl cosmic::Application for AppModel {
             window_size: (640.0, 400.0),
             #[cfg(target_os = "linux")]
             webview_store: webview::WebviewStore::new(),
+            #[cfg(target_os = "linux")]
+            rect_tracker: None,
+            #[cfg(target_os = "linux")]
+            tab_body_bounds: None,
         };
 
         // Replay persisted tabs against the *current* set of profiles —
@@ -390,9 +448,34 @@ impl cosmic::Application for AppModel {
             Page::Picker => self.view_picker(),
             Page::Tab => {
                 let entity = self.tabs.active();
-                match self.tab_data.get(&entity) {
+                let inner: Element<_> = match self.tab_data.get(&entity) {
                     Some(tab) => tab.view(&self.geese_storage),
                     None => self.view_empty(),
+                };
+                // On Linux, wrap the active tab body in libcosmic's
+                // rectangle-tracking container so its on-screen bounds get
+                // reported back to `update` via `Message::TabBodyRect`.
+                // That's how the wry WebView learns where to draw without
+                // any hard-coded "tab strip is N pixels tall" guesswork.
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(tracker) = self.rect_tracker.as_ref() {
+                        tracker
+                            .container(TAB_BODY_TRACKER_ID, inner)
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .into()
+                    } else {
+                        // Tracker subscription hasn't sent its init message
+                        // yet; render plain so the user sees content
+                        // immediately. The webview falls back to
+                        // `TAB_STRIP_HEIGHT` for this first frame.
+                        inner
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    inner
                 }
             }
         };
@@ -421,16 +504,9 @@ impl cosmic::Application for AppModel {
                 #[cfg(target_os = "linux")]
                 if self.page == Page::Tab {
                     let entity = self.tabs.active();
-                    let (w, h) = self.window_size;
-                    let y = webview::TAB_STRIP_HEIGHT;
+                    let (x, y, w, h) = self.webview_bounds();
                     self.webview_store.show_only(entity);
-                    self.webview_store.set_bounds(
-                        entity,
-                        0.0,
-                        y,
-                        f64::from(w),
-                        (f64::from(h) - y).max(1.0),
-                    );
+                    self.webview_store.set_bounds(entity, x, y, w, h);
                 }
             }
             Message::OpenTab(name) => {
@@ -446,25 +522,18 @@ impl cosmic::Application for AppModel {
                 #[cfg(target_os = "linux")]
                 {
                     let entity = self.tabs.active();
-                    let (w, h) = self.window_size;
-                    let y = webview::TAB_STRIP_HEIGHT;
+                    let (x, y, w, h) = self.webview_bounds();
 
                     if already_open {
                         // Switch to the existing webview.
                         self.webview_store.show_only(entity);
-                        self.webview_store.set_bounds(
-                            entity,
-                            0.0,
-                            y,
-                            f64::from(w),
-                            (f64::from(h) - y).max(1.0),
-                        );
+                        self.webview_store.set_bounds(entity, x, y, w, h);
                         return title_task;
                     }
 
                     // New tab — spawn a webview if the window ID is known.
                     if let Some(window_id) = self.main_window_id {
-                        let wv_task = build_webview_task(entity, name, window_id, w, h);
+                        let wv_task = build_webview_task(entity, name, window_id, x, y, w, h);
                         return Task::batch([title_task, wv_task]);
                     }
                     // Window ID not yet known (shouldn't happen in practice since
@@ -481,16 +550,9 @@ impl cosmic::Application for AppModel {
 
                 #[cfg(target_os = "linux")]
                 {
-                    let (w, h) = self.window_size;
-                    let y = webview::TAB_STRIP_HEIGHT;
+                    let (x, y, w, h) = self.webview_bounds();
                     self.webview_store.show_only(entity);
-                    self.webview_store.set_bounds(
-                        entity,
-                        0.0,
-                        y,
-                        f64::from(w),
-                        (f64::from(h) - y).max(1.0),
-                    );
+                    self.webview_store.set_bounds(entity, x, y, w, h);
                 }
 
                 return self.update_title();
@@ -508,16 +570,9 @@ impl cosmic::Application for AppModel {
                 #[cfg(target_os = "linux")]
                 if self.page == Page::Tab {
                     let active = self.tabs.active();
-                    let (w, h) = self.window_size;
-                    let y = webview::TAB_STRIP_HEIGHT;
+                    let (x, y, w, h) = self.webview_bounds();
                     self.webview_store.show_only(active);
-                    self.webview_store.set_bounds(
-                        active,
-                        0.0,
-                        y,
-                        f64::from(w),
-                        (f64::from(h) - y).max(1.0),
-                    );
+                    self.webview_store.set_bounds(active, x, y, w, h);
                 }
 
                 return self.update_title();
@@ -544,8 +599,9 @@ impl cosmic::Application for AppModel {
                         #[cfg(target_os = "linux")]
                         if let Some(window_id) = self.main_window_id {
                             let entity = self.tabs.active();
-                            let (w, h) = self.window_size;
-                            let wv_task = build_webview_task(entity, profile_name, window_id, w, h);
+                            let (x, y, w, h) = self.webview_bounds();
+                            let wv_task =
+                                build_webview_task(entity, profile_name, window_id, x, y, w, h);
                             return Task::batch([title_task, wv_task]);
                         }
 
@@ -642,7 +698,7 @@ impl cosmic::Application for AppModel {
                 // persisted state before the window ID was known.
                 #[cfg(target_os = "linux")]
                 {
-                    let (w, h) = self.window_size;
+                    let (x, y, w, h) = self.webview_bounds();
 
                     let tab_snapshots: Vec<(segmented_button::Entity, String)> = self
                         .tab_data
@@ -656,7 +712,9 @@ impl cosmic::Application for AppModel {
 
                     let tasks: Vec<Task<cosmic::Action<Message>>> = tab_snapshots
                         .into_iter()
-                        .map(|(entity, profile)| build_webview_task(entity, profile, id, w, h))
+                        .map(|(entity, profile)| {
+                            build_webview_task(entity, profile, id, x, y, w, h)
+                        })
                         .collect();
 
                     // Each webview starts hidden; the active tab's webview is
@@ -676,16 +734,9 @@ impl cosmic::Application for AppModel {
                     // If this is the currently active tab, show its webview
                     // and set initial bounds.
                     if self.tabs.active() == entity && self.page == Page::Tab {
-                        let (w, h) = self.window_size;
-                        let y = webview::TAB_STRIP_HEIGHT;
+                        let (x, y, w, h) = self.webview_bounds();
                         self.webview_store.show_only(entity);
-                        self.webview_store.set_bounds(
-                            entity,
-                            0.0,
-                            y,
-                            f64::from(w),
-                            (f64::from(h) - y).max(1.0),
-                        );
+                        self.webview_store.set_bounds(entity, x, y, w, h);
                     }
                 }
             }
@@ -704,19 +755,41 @@ impl cosmic::Application for AppModel {
             Message::WindowResized(_id, size) => {
                 self.window_size = (size.width, size.height);
 
-                // Update bounds for all webviews so they're correctly sized
-                // even for tabs that are currently hidden.
+                // Pre-position hidden tabs' webviews so they're roughly in
+                // the right place if/when the user switches to them. The
+                // active tab will be refined to pixel-perfect bounds by the
+                // next rectangle_tracker draw event.
                 #[cfg(target_os = "linux")]
                 {
-                    let y = webview::TAB_STRIP_HEIGHT;
-                    self.webview_store.set_bounds_all(
-                        0.0,
-                        y,
-                        f64::from(size.width),
-                        (f64::from(size.height) - y).max(1.0),
-                    );
+                    let (x, y, w, h) = self.webview_bounds();
+                    self.webview_store.set_bounds_all(x, y, w, h);
                 }
             }
+
+            // libcosmic's rectangle_tracker subscription has two payload
+            // shapes: `Init(tracker)` once (we keep the handle so view()
+            // can wrap the active tab body in it), and `Rectangle((id, r))`
+            // on every draw of the tracked widget (we forward `r` to the
+            // active tab's WebView). Linux-only.
+            #[cfg(target_os = "linux")]
+            Message::TabBodyRect(update) => match update {
+                RectangleUpdate::Init(tracker) => {
+                    self.rect_tracker = Some(tracker);
+                }
+                RectangleUpdate::Rectangle((_, rect)) => {
+                    self.tab_body_bounds = Some(rect);
+                    if self.page == Page::Tab {
+                        let entity = self.tabs.active();
+                        self.webview_store.set_bounds(
+                            entity,
+                            f64::from(rect.x),
+                            f64::from(rect.y),
+                            f64::from(rect.width).max(1.0),
+                            f64::from(rect.height).max(1.0),
+                        );
+                    }
+                }
+            },
         }
         Task::none()
     }
@@ -739,8 +812,16 @@ impl cosmic::Application for AppModel {
         let gtk_pump =
             cosmic::iced::time::every(Duration::from_millis(16)).map(|_| Message::PumpGtk);
 
+        // rectangle_tracker_subscription only sends on changes (debounced
+        // internally by libcosmic), so this is cheap to leave running for
+        // the life of the application — it's how `update` learns about the
+        // active tab body's bounds.
         #[cfg(target_os = "linux")]
-        return Subscription::batch([config_sub, resize_sub, gtk_pump]);
+        let rect_sub = rectangle_tracker_subscription(TAB_BODY_TRACKER_ID)
+            .map(|(_, u)| Message::TabBodyRect(u));
+
+        #[cfg(target_os = "linux")]
+        return Subscription::batch([config_sub, resize_sub, gtk_pump, rect_sub]);
 
         #[cfg(not(target_os = "linux"))]
         Subscription::batch([config_sub, resize_sub])
@@ -764,20 +845,19 @@ impl cosmic::Application for AppModel {
 /// task returns `Message::WebviewReady(entity)` which triggers
 /// `webview_store.claim_pending(entity)` in `update()`.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn build_webview_task(
     entity: segmented_button::Entity,
     profile: String,
     window_id: cosmic::iced::window::Id,
-    window_width: f32,
-    window_height: f32,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 ) -> Task<cosmic::Action<Message>> {
     let initial_bounds = WryRect {
-        position: LogicalPosition::new(0.0_f64, webview::TAB_STRIP_HEIGHT).into(),
-        size: LogicalSize::new(
-            f64::from(window_width),
-            (f64::from(window_height) - webview::TAB_STRIP_HEIGHT).max(1.0),
-        )
-        .into(),
+        position: LogicalPosition::new(x, y).into(),
+        size: LogicalSize::new(width.max(1.0), height.max(1.0)).into(),
     };
     cosmic::iced::window::run_with_handle(window_id, move |handle| {
         webview::create_child_webview(entity, &profile, &handle, initial_bounds);
@@ -788,13 +868,30 @@ fn build_webview_task(
 // ---------------------------------------------------------------------------
 
 impl AppModel {
-    /// What page to land on when no tab is being actively shown.
-    fn default_page(&self) -> Page {
-        if self.tabs.iter().next().is_some() {
-            Page::Tab
-        } else {
-            Page::Empty
+    /// Best current estimate of the active tab body's on-screen bounds, in
+    /// logical pixels, as `(x, y, width, height)`.
+    ///
+    /// Prefers the rectangle reported by libcosmic's rectangle_tracker
+    /// (pixel-perfect, drawer/header/theme-aware); falls back to a coarse
+    /// constant-offset rectangle derived from the window size when no
+    /// tracker update has fired yet.
+    ///
+    /// The fallback only matters for the very first frame between a tab's
+    /// creation and the next iced draw; once the tracker fires, the webview
+    /// snaps to the true bounds.
+    #[cfg(target_os = "linux")]
+    fn webview_bounds(&self) -> (f64, f64, f64, f64) {
+        if let Some(rect) = self.tab_body_bounds {
+            return (
+                f64::from(rect.x),
+                f64::from(rect.y),
+                f64::from(rect.width).max(1.0),
+                f64::from(rect.height).max(1.0),
+            );
         }
+        let (w, h) = self.window_size;
+        let y = webview::TAB_STRIP_HEIGHT;
+        (0.0, y, f64::from(w), (f64::from(h) - y).max(1.0))
     }
 
     /// Name of the profile bound to the currently-active tab, if any.
