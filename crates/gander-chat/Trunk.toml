@@ -1,0 +1,11 @@
+# Trunk configuration for gander-chat.
+#
+# Build:  trunk build --release
+# Dev:    trunk serve          (live-reloads in the browser)
+#
+# Output is written to `dist/` (gitignored).  The gander binary will embed
+# this directory via `include_dir!` in a future integration step.
+
+[build]
+target = "index.html"
+dist = "dist"

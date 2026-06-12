@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gander chat</title>
+
+  <!--
+    Trunk replaces this tag with the compiled WASM + JS loader.
+    data-wasm-opt="z" enables wasm-opt level z (smallest size) on release builds.
+  -->
+  <link data-trunk rel="rust" data-wasm-opt="z">
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 15px;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── layout ─────────────────────────────────────────────── */
+
+    .gander-chat {
+      display: flex;
+      flex-direction: column;
+      height: 100dvh;
+      max-width: 860px;
+      width: 100%;
+      margin: 0 auto;
+    }
+
+    /* ── message list ────────────────────────────────────────── */
+
+    .message-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .message {
+      padding: 10px 14px;
+      border-radius: 12px;
+      max-width: 80%;
+      line-height: 1.55;
+      word-break: break-word;
+    }
+
+    .message--user {
+      background: #2d5be3;
+      align-self: flex-end;
+    }
+
+    .message--assistant {
+      background: #2a2a3e;
+      align-self: flex-start;
+    }
+
+    /* pulldown-cmark wraps everything in <p>; strip the outer margin */
+    .message-content p:first-child { margin-top: 0; }
+    .message-content p:last-child  { margin-bottom: 0; }
+
+    .message-content code {
+      background: rgba(255, 255, 255, 0.1);
+      padding: 2px 5px;
+      border-radius: 4px;
+      font-family: ui-monospace, monospace;
+      font-size: 0.9em;
+    }
+
+    .message-content pre {
+      background: rgba(0, 0, 0, 0.35);
+      padding: 12px;
+      border-radius: 8px;
+      overflow-x: auto;
+      margin: 8px 0;
+    }
+
+    .message-content pre code {
+      background: none;
+      padding: 0;
+    }
+
+    /* blinking cursor shown while the assistant is still streaming */
+    .streaming-cursor {
+      display: inline-block;
+      animation: blink 1s step-end infinite;
+      margin-left: 2px;
+      opacity: 0.8;
+    }
+
+    @keyframes blink {
+      50% { opacity: 0; }
+    }
+
+    .error-notice {
+      color: #ff6b6b;
+      font-size: 0.85rem;
+      margin-top: 6px;
+    }
+
+    /* ── input row ───────────────────────────────────────────── */
+
+    .input-row {
+      display: flex;
+      gap: 8px;
+      padding: 12px 16px;
+      border-top: 1px solid #333;
+    }
+
+    .input-box {
+      flex: 1;
+      background: #2a2a3e;
+      color: #e0e0e0;
+      border: 1px solid #444;
+      border-radius: 8px;
+      padding: 9px 13px;
+      font-family: inherit;
+      font-size: inherit;
+      resize: none;
+      line-height: 1.5;
+    }
+
+    .input-box:focus {
+      outline: none;
+      border-color: #2d5be3;
+    }
+
+    .send-btn {
+      background: #2d5be3;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 9px 20px;
+      font-family: inherit;
+      font-size: inherit;
+      cursor: pointer;
+      align-self: flex-end;
+      white-space: nowrap;
+    }
+
+    .send-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .send-btn:hover:not(:disabled) {
+      background: #3d6bf3;
+    }
+  </style>
+
+  <script>
+    // -----------------------------------------------------------------------
+    // Development mock for window.gander
+    //
+    // This script is present in the *source* index.html and is therefore
+    // included by `trunk serve` for local development.  It simulates the
+    // host bridge so the chat UI can be exercised in a browser without a
+    // live gander instance.
+    //
+    // The production gander binary injects its own implementation of
+    // window.gander before the WASM module is instantiated, so this block
+    // is only ever active during development.
+    //
+    // See README.md for the full bridge API contract.
+    // -----------------------------------------------------------------------
+    (function () {
+      "use strict";
+
+      var _subscriber = null;
+
+      function fireEvent(event) {
+        if (_subscriber) {
+          _subscriber(event);
+        }
+      }
+
+      function mockStream(userText) {
+        var reply =
+          "You said: **" + userText + "**\n\n" +
+          "This is a _mock_ streaming response.\n\n" +
+          "```rust\n" +
+          "fn hello() -> &'static str {\n" +
+          "    \"world\"\n" +
+          "}\n" +
+          "```";
+
+        // Split into word-like tokens and drip them out 50 ms apart.
+        var tokens = reply.split(/(?<=\s)|(?=\s)/);
+        var i = 0;
+        var interval = setInterval(function () {
+          if (i < tokens.length) {
+            fireEvent({ type: "token", content: tokens[i] });
+            i++;
+          } else {
+            fireEvent({ type: "done" });
+            clearInterval(interval);
+          }
+        }, 50);
+      }
+
+      window.gander = {
+        /**
+         * Queue a user message and start streaming the assistant reply.
+         * @param {string} text  The user's message text.
+         */
+        send: function (text) {
+          console.log("[mock gander] send:", text);
+          // Simulate a short network round-trip before the first token.
+          setTimeout(function () { mockStream(text); }, 300);
+        },
+
+        /**
+         * Register a callback that receives streaming events.
+         * Replaces any previously registered callback.
+         * @param {function(object): void} callback
+         */
+        subscribe: function (callback) {
+          console.log("[mock gander] subscribe registered");
+          _subscriber = callback;
+        },
+      };
+    })();
+  </script>
+</head>
+<body>
+  <!--
+    Trunk injects the WASM loader at the end of <body>.
+    The mock window.gander above is already set by the time the WASM
+    module initialises and calls bridge::subscribe().
+  -->
+</body>
+</html>
