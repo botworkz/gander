@@ -293,6 +293,8 @@ async fn run_child<F>(
             return;
         }
     };
+    // Supervisor only manages child lifecycle. ACP transport ownership lives in
+    // the SDK client wrapper, so we intentionally do not keep stdin here.
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
 

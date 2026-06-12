@@ -18,6 +18,7 @@ repository = "https://github.com/phlax/gander"
 rust-version = "1.85"
 
 [dependencies]
+agent-client-protocol = "0.14.0"
 anyhow = "1.0"
 dirs = "6.0"
 geese = { git = "https://github.com/phlax/geese", branch = "init2" }
