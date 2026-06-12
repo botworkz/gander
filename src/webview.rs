@@ -24,6 +24,33 @@
 //! sentinel. The subsequent `update(WebviewReady)` call retrieves the WebView
 //! via [`claim_pending`] and moves it into `WebviewStore`.
 //!
+//! ## Bounds tracking
+//!
+//! The WebView is positioned by giving wry an X11 child window position +
+//! size at creation time, and then updating that position+size via
+//! `WebView::set_bounds` whenever the tab body's on-screen rectangle
+//! changes. The active tab body widget is wrapped in libcosmic's
+//! [`widget::rectangle_tracker`], which reports `(x, y, w, h)` on every
+//! draw. See `app.rs::Message::TabBodyRect`.
+//!
+//! ## wry 0.55 X11 `set_bounds` move-is-a-no-op bug
+//!
+//! On X11, `wry::WebView::set_bounds` calls `gtk::Window::move_` on a
+//! foreign-window-wrapping `gtk::Window`. That `move_` is a silent no-op
+//! because there is no window manager managing the child window — the only
+//! authoritative position is the one passed to `XCreateSimpleWindow` at
+//! construction time. The resize half of `set_bounds` works (it goes through
+//! `XResizeWindow`); only the move is broken.
+//!
+//! Net effect: the WebView ends up wherever it was first placed and stays
+//! there. To work around this we wrap *all* pages (not just `Page::Tab`) in
+//! the rectangle tracker, so the very first iced draw — which happens before
+//! the user has had a chance to open a tab — already populates
+//! `tab_body_bounds`. By the time `create_child_webview` runs we have the
+//! true rectangle to give to wry up front.
+//!
+//! See: <https://github.com/tauri-apps/wry/blob/wry-v0.55.1/src/webkitgtk/mod.rs#L853>
+//!
 //! ## Known limitations
 //!
 //! - **X11 only**: `wry::WebViewBuilder::build_as_child` on Linux (the
@@ -42,10 +69,10 @@
 //!   synchronously on the GUI thread. Without this the webview surface renders
 //!   once and then freezes.
 //!
-//! - **Bounds tracking**: The tab-content area position is approximated as
-//!   `y = TAB_STRIP_HEIGHT`. Accurate per-widget bounds would require hooking
-//!   into iced's layout phase, which is not exposed by the current `Element`
-//!   API. Improving this is left as a follow-up.
+//! - **Repositioning after creation**: thanks to the wry bug above, `y`
+//!   changes (e.g. opening the profile-config context drawer if/when that
+//!   ever resizes the tab body vertically) will *resize* but not *move* the
+//!   webview. Width changes work. Tracked as a follow-up.
 //!
 //! [wry]: https://github.com/tauri-apps/wry
 
@@ -58,12 +85,22 @@ use wry::{
     dpi::{LogicalPosition, LogicalSize},
 };
 
-/// Approximate pixel height of the COSMIC tab strip.
+/// Coarse pixel height of the COSMIC header + tab strip stack, used **only**
+/// as a first-frame fallback before the rectangle tracker has populated
+/// `tab_body_bounds`.
 ///
-/// This is used to offset the webview so it doesn't paint under the tab bar.
-/// A button height of 32 plus top/bottom spacing rounds to this value; exact
-/// bounds require iced layout integration (tracked as a follow-up).
-pub const TAB_STRIP_HEIGHT: f64 = 40.0;
+/// On the COSMIC build we target this is ~80px (header ≈ 48 + tab strip ≈
+/// 32). The value is deliberately approximate: any time the rectangle
+/// tracker has fired at least once, that value supersedes this constant.
+///
+/// The reason this matters more than it sounds: see the
+/// "wry 0.55 X11 `set_bounds` move-is-a-no-op" bug documented at the top of
+/// this file. The webview's initial position is the *only* position it will
+/// ever have. If we create the WebView using this fallback and then the
+/// tracker reports the real value, the webview will still be sitting where
+/// the fallback put it. So this constant needs to be close to the real
+/// header height, not just "good enough for a frame".
+pub const TAB_STRIP_HEIGHT: f64 = 80.0;
 
 // ---------------------------------------------------------------------------
 // Pending-webview thread-local
@@ -201,6 +238,10 @@ impl WebviewStore {
     /// Update the bounds of the WebView for `entity`.
     ///
     /// `x`, `y`, `width`, `height` are logical (pre-DPI-scale) pixels.
+    ///
+    /// Note: due to the wry 0.55 X11 bug described at the top of this file,
+    /// only the *size* half of this call is honoured after creation. The
+    /// position is whatever `create_child_webview` passed in originally.
     pub fn set_bounds(
         &self,
         entity: segmented_button::Entity,
@@ -216,8 +257,8 @@ impl WebviewStore {
 
     /// Update the bounds of **all** WebViews to the same rectangle.
     ///
-    /// Called on window resize so that any tab's webview is correctly sized
-    /// when it becomes active again.
+    /// Called on window resize so the resize half of `set_bounds` keeps the
+    /// (currently hidden) webviews sized to match the visible content area.
     pub fn set_bounds_all(&self, x: f64, y: f64, width: f64, height: f64) {
         for view in self.views.values() {
             Self::apply_bounds(view, x, y, width, height);
@@ -244,6 +285,11 @@ impl WebviewStore {
 /// On success the WebView is stored in [`PENDING`] under `entity` and `true`
 /// is returned. On failure (typically `UnsupportedWindowHandle` on a Wayland
 /// session) a warning is logged and `false` is returned.
+///
+/// Note on bounds: because of the wry 0.55 X11 move-is-a-no-op bug, the
+/// position passed in here is the *final* position of the webview for its
+/// entire lifetime. Callers should make sure `initial_bounds` matches the
+/// real on-screen tab body rectangle.
 ///
 /// # Panics
 ///
