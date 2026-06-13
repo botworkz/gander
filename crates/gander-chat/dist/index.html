@@ -11,8 +11,8 @@
   -->
   
 <script type="module">
-import init, * as bindings from '/gander-chat-8f849303bb6e87fe.js';
-const wasm = await init({ module_or_path: '/gander-chat-8f849303bb6e87fe_bg.wasm' });
+import init, * as bindings from '/gander-chat-77a34c4a228b27d8.js';
+const wasm = await init({ module_or_path: '/gander-chat-77a34c4a228b27d8_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -76,8 +76,9 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     }
 
     .session-list {
-      flex: 1;
+      height: 50%;
       overflow-y: auto;
+      flex-shrink: 0;
       display: flex;
       flex-direction: column;
     }
@@ -122,6 +123,82 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     .session-ago {
       font-size: 0.78rem;
       opacity: 0.65;
+    }
+
+    /* ── concertina menu ─────────────────────────────────────── */
+
+    .concertina {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      border-top: 1px solid #2a2a3e;
+    }
+
+    .concertina-section {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .concertina-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      background: none;
+      border: none;
+      border-bottom: 1px solid #1e1e32;
+      color: #b0b0c8;
+      padding: 10px 14px;
+      font-family: inherit;
+      font-size: 0.85rem;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .concertina-row:hover {
+      background: #1e1e38;
+      color: #e0e0e0;
+    }
+
+    .concertina-row--open {
+      background: #1a1a2e;
+      color: #c0c0e0;
+    }
+
+    .concertina-icon {
+      display: flex;
+      align-items: center;
+      flex-shrink: 0;
+    }
+
+    .concertina-label {
+      flex: 1;
+    }
+
+    .concertina-chevron {
+      display: flex;
+      align-items: center;
+      flex-shrink: 0;
+      transition: transform 0.2s ease;
+    }
+
+    .concertina-chevron--open {
+      transform: rotate(90deg);
+    }
+
+    .concertina-content {
+      padding: 16px 14px;
+      background: #0e0e1f;
+      border-bottom: 1px solid #1e1e32;
+    }
+
+    .concertina-placeholder {
+      display: block;
+      text-align: center;
+      color: #5a5a7a;
+      font-size: 0.82rem;
+      font-style: italic;
     }
 
     /* ── chat pane ───────────────────────────────────────────── */
@@ -500,7 +577,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       };
     })();
   </script>
-<link rel="modulepreload" href="/gander-chat-8f849303bb6e87fe.js" crossorigin="anonymous" integrity="sha384-BPliJkmgOVGw6ou0Zh9c5xjZD6Pk01l9j2Kxwl0BJMt3kK5XXz9xeKfizjhof8Mn"><link rel="preload" href="/gander-chat-8f849303bb6e87fe_bg.wasm" crossorigin="anonymous" integrity="sha384-eI05Shre9BKXKT7i09kUANtwmFrv8OgrDXG6V+aqojguYoVPa+/TyIxiLPs1jRkI" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/gander-chat-77a34c4a228b27d8.js" crossorigin="anonymous" integrity="sha384-9cj0RPgOn1VA+MymDiSV5EXAehHKkMIZGIIJqkqkZi5QYWefI651tA4R4eF6Rjw9"><link rel="preload" href="/gander-chat-77a34c4a228b27d8_bg.wasm" crossorigin="anonymous" integrity="sha384-fhSUYXWYt6V8vy8nTu4VTEkJ4tDwEwr+05rCyBLz4j62KbX4VCwp04v2fGgfdLg5" as="fetch" type="application/wasm"></head>
 <body>
   <!--
     Trunk injects the WASM loader at the end of <body>.
