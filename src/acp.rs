@@ -471,8 +471,7 @@ async fn run_worker(
 /// Read `SessionMessage`s from `session` until a `StopReason` arrives (or an
 /// error), forwarding each `SessionUpdate` to `evt_tx` as an [`AcpEvent`].
 ///
-/// Used for both live prompt streaming and history replay after
-/// `session/load`.
+/// Used for live prompt streaming.
 async fn drain_session_updates(
     session: &mut ActiveSession<'_, Agent>,
     evt_tx: &mpsc::Sender<AcpEvent>,
@@ -511,26 +510,35 @@ async fn drain_session_updates(
     }
 }
 
-/// Like [`drain_session_updates`] but for history replay after
-/// `session/load`. The agent streams historical messages as notifications
-/// then simply stops — there's no `StopReason` to terminate the read loop
-/// (that signal is per-prompt). We use a quiet-period heuristic: if no
-/// update arrives for `IDLE_MS` milliseconds, assume replay is complete.
+/// Drain buffered [`SessionMessage`]s from the session channel after a
+/// successful `session/load` response.
 ///
-/// This is a heuristic, not a protocol guarantee. If history is very large
-/// and goose pauses mid-stream we'd cut it short. Acceptable tradeoff for
-/// v1 — alternative is a deadlock per gander#46.
+/// ## Why this is correct without a timeout
+///
+/// The ACP SDK's `incoming_actor` processes wire messages sequentially in a
+/// single loop. Goose sends all history notifications before returning the
+/// `LoadSessionResponse`; the actor routes each notification into the session
+/// channel **before** it routes the response to the `block_task` awaiter.
+/// Therefore, when `LoadSessionRequest.block_task().await` resolves with
+/// `Ok(_)`, every history notification is already queued in the session
+/// channel — a non-blocking drain (zero-duration timeout) is both sufficient
+/// and correct.
+///
+/// Using `Duration::ZERO` acts like `try_recv`: the inner future is polled
+/// once; if the channel has a message it is returned immediately, otherwise
+/// the timeout fires at once and we break. No waiting, no truncation risk,
+/// no timing heuristics.
+///
+/// Replaces the previous 500 ms idle-period heuristic (gander#48).
 async fn drain_history_replay(
     session: &mut ActiveSession<'_, Agent>,
     evt_tx: &mpsc::Sender<AcpEvent>,
 ) {
-    const IDLE_MS: u64 = 500;
     loop {
-        let next =
-            tokio::time::timeout(Duration::from_millis(IDLE_MS), session.read_update()).await;
+        let next = tokio::time::timeout(Duration::ZERO, session.read_update()).await;
 
         let update = match next {
-            Err(_timeout) => break, // quiet period — assume replay done
+            Err(_elapsed) => break, // channel empty — all history consumed
             Ok(Ok(u)) => u,
             Ok(Err(error)) => {
                 let _ = evt_tx.send(AcpEvent::Error(error.to_string())).await;
@@ -626,5 +634,97 @@ fn runtime_dir() -> PathBuf {
             let home = env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
             PathBuf::from(home).join(".cache").join("geese")
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::schema::{
+        ContentChunk, TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+    };
+
+    // Helper: send one SessionUpdate through forward_update and return whatever
+    // AcpEvent was produced (if any).
+    async fn forwarded(update: SessionUpdate) -> Option<AcpEvent> {
+        let (tx, mut rx) = mpsc::channel(4);
+        forward_update(update, &tx).await;
+        rx.try_recv().ok()
+    }
+
+    #[tokio::test]
+    async fn forward_agent_text_chunk_produces_agent_text_event() {
+        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello")));
+        let event = forwarded(SessionUpdate::AgentMessageChunk(chunk)).await;
+        assert!(matches!(event, Some(AcpEvent::AgentText(t)) if t == "hello"));
+    }
+
+    #[tokio::test]
+    async fn forward_user_text_chunk_produces_user_text_event() {
+        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("world")));
+        let event = forwarded(SessionUpdate::UserMessageChunk(chunk)).await;
+        assert!(matches!(event, Some(AcpEvent::UserText(t)) if t == "world"));
+    }
+
+    #[tokio::test]
+    async fn forward_tool_call_produces_tool_use_event() {
+        let tool = ToolCall::new(ToolCallId::new("tc-1"), "my_tool");
+        let event = forwarded(SessionUpdate::ToolCall(tool)).await;
+        assert!(matches!(event, Some(AcpEvent::ToolUse { name, .. }) if name == "my_tool"));
+    }
+
+    #[tokio::test]
+    async fn forward_tool_call_update_produces_tool_result_event() {
+        let fields = ToolCallUpdateFields::new().raw_output(serde_json::json!({"result": "ok"}));
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-1"), fields);
+        let event = forwarded(SessionUpdate::ToolCallUpdate(update)).await;
+        assert!(matches!(event, Some(AcpEvent::ToolResult { name, .. }) if name == "tc-1"));
+    }
+
+    #[tokio::test]
+    async fn forward_unknown_variant_produces_no_event() {
+        // SessionInfoUpdate is one of the variants intentionally ignored in v1.
+        use agent_client_protocol::schema::SessionInfoUpdate;
+        let update = SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new());
+        let event = forwarded(update).await;
+        assert!(event.is_none());
+    }
+
+    /// Demonstrates the drain mechanism used in `drain_history_replay`.
+    ///
+    /// After `session/load` completes the ACP SDK guarantees every history
+    /// notification is already queued in the session channel.  A zero-duration
+    /// timeout acts like `try_recv`: it returns a buffered message immediately
+    /// and fires `Elapsed` the instant the channel is empty, so the drain
+    /// loop terminates without waiting.
+    #[tokio::test]
+    async fn zero_duration_timeout_drains_buffered_channel_then_stops() {
+        let (tx, mut rx) = mpsc::channel::<u32>(16);
+        tx.send(1).await.unwrap();
+        tx.send(2).await.unwrap();
+        tx.send(3).await.unwrap();
+
+        let mut received: Vec<u32> = Vec::new();
+        while let Ok(Some(v)) = tokio::time::timeout(Duration::ZERO, rx.recv()).await {
+            received.push(v);
+        }
+        assert_eq!(received, [1, 2, 3]);
+    }
+
+    /// An empty channel (no history) must terminate immediately — no hang.
+    #[tokio::test]
+    async fn zero_duration_timeout_terminates_immediately_on_empty_channel() {
+        let (_tx, mut rx) = mpsc::channel::<u32>(16);
+        // Don't drop tx so the channel isn't closed — mirrors the real case
+        // where the session channel stays open after history drain.
+        let result = tokio::time::timeout(Duration::ZERO, rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "should time out immediately on empty channel"
+        );
     }
 }
