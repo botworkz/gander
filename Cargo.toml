@@ -18,6 +18,17 @@ description = "A post-modern goose: a tabbed COSMIC viewer for geese profiles"
 repository = "https://github.com/phlax/gander"
 rust-version = "1.85"
 
+[lib]
+name = "gander"
+path = "src/lib.rs"
+
+# mock-acp-agent is a test fixture: a minimal ACP v1 server used by the
+# integration tests in tests/session_load_drain.rs.  It speaks JSON-RPC over
+# stdin/stdout and is invoked by geesed as the "goose" binary.
+[[bin]]
+name = "mock-acp-agent"
+path = "tests/fixtures/mock_acp_agent.rs"
+
 [dependencies]
 agent-client-protocol = "0.14.0"
 anyhow = "1.0"
@@ -57,6 +68,7 @@ features = [
 
 [dev-dependencies]
 agent-client-protocol = "0.14.0"
+geesed = { git = "https://github.com/phlax/geese", branch = "main" }
 tempfile = "3.10"
 
 # wry + WebKitGTK for the per-tab embedded webview (Linux only).
