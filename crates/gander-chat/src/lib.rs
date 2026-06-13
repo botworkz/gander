@@ -411,6 +411,83 @@ pub fn App() -> impl IntoView {
     // session_list and session_active so the sidebar populates.
     bridge::post_json(r#"{"type":"ready"}"#);
 
+    // Window-level keydown handler for session cycling.
+    //
+    // Shift+ArrowLeft → previous visible session (with wrap-around).
+    // Shift+ArrowRight → next visible session (with wrap-around).
+    //
+    // Skipped when the focused element is a <textarea>, <input>, or
+    // contenteditable so Shift+Arrow continues to select text normally in
+    // the chat input box.
+    //
+    // The Closure is leaked intentionally — it must live for the entire
+    // lifetime of the app, matching the bridge subscription above.
+    {
+        let cb = Closure::wrap(Box::new(move |ev: web_sys::KeyboardEvent| {
+            if !ev.shift_key() {
+                return;
+            }
+            let dir: i32 = match ev.key().as_str() {
+                "ArrowLeft" => -1,
+                "ArrowRight" => 1,
+                _ => return,
+            };
+
+            // Don't steal arrow keys from focused text inputs.
+            if let Some(target) = ev.target() {
+                if let Some(el) = target.dyn_ref::<web_sys::Element>() {
+                    let tag = el.tag_name().to_ascii_uppercase();
+                    if tag == "TEXTAREA" || tag == "INPUT" {
+                        return;
+                    }
+                    if let Some(html) = el.dyn_ref::<web_sys::HtmlElement>() {
+                        if html.content_editable() == "true" {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let ids: Vec<String> = sessions.get_untracked().into_iter().map(|s| s.id).collect();
+
+            // No-op with zero or one sessions — nothing to cycle to.
+            if ids.len() <= 1 {
+                return;
+            }
+
+            let current = active_session_id.get_untracked();
+            let current_idx = current
+                .as_deref()
+                .and_then(|id| ids.iter().position(|s| s == id));
+
+            // If the active session is not in the visible list, do nothing.
+            let Some(idx) = current_idx else {
+                return;
+            };
+
+            let len = ids.len() as i32;
+            let next_idx = (idx as i32 + dir).rem_euclid(len) as usize;
+
+            let obj = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("type"),
+                &JsValue::from_str("session_select"),
+            );
+            let _ = js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("id"),
+                &JsValue::from_str(&ids[next_idx]),
+            );
+            bridge::post_value(obj.into());
+        }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
+
+        if let Some(window) = web_sys::window() {
+            let _ = window.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+        }
+        cb.forget();
+    }
+
     // Submit the current input as a user message.
     let submit = move || {
         let text = input_text.get_untracked().trim().to_string();
