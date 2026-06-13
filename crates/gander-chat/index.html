@@ -499,6 +499,17 @@
       color: #c0c0d8;
       overflow-x: auto;
     }
+
+    /* Sandboxed inline UI resource frame */
+    .tool-call-iframe {
+      display: block;
+      width: 100%;
+      height: 320px;
+      border: 1px solid #282838;
+      border-radius: 6px;
+      background: white;
+      overflow: auto;
+    }
   </style>
 
   <script>
@@ -572,11 +583,22 @@
               rawInput:  { path: "." },
               rawOutput: { entries: ["src", "Cargo.toml", "README.md"] }
           }},
-          // Tool B: completed with I/O
+          // Tool B: completed with I/O and an inline UI resource
           { delay: 800, call: {
               toolCallId: "tc-mock-2", title: "show_panel", status: "completed",
               rawInput:  {},
-              rawOutput: { resourceUri: "ui://demo/panel" }
+              rawOutput: { resourceUri: "ui://demo/panel" },
+              content: [{
+                type: "content",
+                content: {
+                  type: "resource",
+                  resource: {
+                    uri: "ui://demo/widget",
+                    mime_type: "text/html",
+                    text: "<!DOCTYPE html><html><body style='margin:0;padding:16px;font-family:sans-serif;background:#fef;'><h3>Demo widget</h3><button onclick=\"alert('hi')\">Click me</button></body></html>"
+                  }
+                }
+              }]
           }},
         ];
 
