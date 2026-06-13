@@ -1023,6 +1023,10 @@ fn render_inline_resource(resource: InlineResource) -> AnyView {
         InlineResource::Html { uri, text } => view! {
             <div class="tool-call-section">
                 <div class="tool-call-section-label">"UI"</div>
+                // `sandbox="allow-scripts"` is a whitelist — every capability
+                // not named is blocked.  In particular, `allow-same-origin`,
+                // `allow-forms`, `allow-top-navigation`, and `allow-downloads`
+                // are all absent and therefore denied.
                 <iframe
                     class="tool-call-iframe"
                     srcdoc=text
@@ -1054,6 +1058,16 @@ fn render_inline_resource(resource: InlineResource) -> AnyView {
 #[cfg(test)]
 mod tests {
     use super::is_ui_iframe_candidate;
+
+    /// Inline HTML payload used in the dev mock and in the shape test below.
+    /// Kept as a constant so it is easy to compare against the index.html mock.
+    const MOCK_WIDGET_HTML: &str = concat!(
+        "<!DOCTYPE html><html><body style='margin:0;padding:16px;",
+        "font-family:sans-serif;background:#fef;'>",
+        "<h3>Demo widget</h3>",
+        "<button onclick=\"alert('hi')\">Click me</button>",
+        "</body></html>",
+    );
 
     // ── is_ui_iframe_candidate ───────────────────────────────────────────────
 
@@ -1097,26 +1111,29 @@ mod tests {
     /// any WASM runtime.
     #[test]
     fn mock_ui_resource_json_has_expected_shape() {
-        let json = r#"{
-            "toolCallId": "tc-mock-2",
-            "title": "show_panel",
-            "status": "completed",
-            "rawInput": {},
-            "rawOutput": {"resourceUri": "ui://demo/panel"},
-            "content": [{
-                "type": "content",
-                "content": {
-                    "type": "resource",
-                    "resource": {
-                        "uri": "ui://demo/widget",
-                        "mime_type": "text/html",
-                        "text": "<!DOCTYPE html><html><body style='margin:0;padding:16px;font-family:sans-serif;background:#fef;'><h3>Demo widget</h3><button onclick=\"alert('hi')\">Click me</button></body></html>"
-                    }
-                }
-            }]
-        }"#;
+        let json = format!(
+            r#"{{
+                "toolCallId": "tc-mock-2",
+                "title": "show_panel",
+                "status": "completed",
+                "rawInput": {{}},
+                "rawOutput": {{"resourceUri": "ui://demo/panel"}},
+                "content": [{{
+                    "type": "content",
+                    "content": {{
+                        "type": "resource",
+                        "resource": {{
+                            "uri": "ui://demo/widget",
+                            "mime_type": "text/html",
+                            "text": {text:?}
+                        }}
+                    }}
+                }}]
+            }}"#,
+            text = MOCK_WIDGET_HTML,
+        );
 
-        let value: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         let content = value["content"].as_array().expect("content is array");
         assert_eq!(content.len(), 1, "exactly one content item");
 
@@ -1138,6 +1155,8 @@ mod tests {
         );
     }
 }
+
+/// Footer bar showing session metadata below the input row.
 ///
 /// Each field is driven by its own signal so only the changed span re-renders.
 /// Fields that have not yet been populated show `—` (em-dash).
