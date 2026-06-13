@@ -667,19 +667,24 @@ async fn forward_update(
         SessionUpdate::ToolCall(tc) => {
             let mut map = tool_calls.lock().await;
             map.insert(tc.tool_call_id.clone(), tc.clone());
+            tracing::info!(
+                target: "gander::tool_snapshot",
+                stage = "create",
+                snapshot = %serde_json::to_string(&tc).unwrap_or_default(),
+                "TOOL_CALL_SNAPSHOT"
+            );
             let _ = tx.send(AcpEvent::ToolCall(Box::new(tc))).await;
         }
-        SessionUpdate::ToolCallUpdate(update) => {
+        SessionUpdate::ToolCall(tc) => {
             let mut map = tool_calls.lock().await;
-            if let Some(existing) = map.get_mut(&update.tool_call_id) {
-                apply_tool_call_update(existing, update.fields);
-                let merged = existing.clone();
-                drop(map);
-                let _ = tx.send(AcpEvent::ToolCall(Box::new(merged))).await;
-            }
-            // If no prior ToolCall was received for this id, silently ignore.
-            // This can only happen when history is replayed out of order, which
-            // ACP does not do in practice.
+            map.insert(tc.tool_call_id.clone(), tc.clone());
+            tracing::info!(
+                target: "gander::tool_snapshot",
+                stage = "create",
+                snapshot = %serde_json::to_string(&tc).unwrap_or_default(),
+                "TOOL_CALL_SNAPSHOT"
+            );
+            let _ = tx.send(AcpEvent::ToolCall(Box::new(tc))).await;
         }
         // AgentThoughtChunk and other variants are intentionally ignored in v1.
         _ => {}

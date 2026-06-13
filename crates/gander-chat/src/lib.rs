@@ -837,6 +837,7 @@ fn ToolCallCard(message: ChatMessage) -> impl IntoView {
                     .then(|| {
                         let json = message.content.get();
                         let (input_str, output_str) = parse_tool_io(&json);
+                        let resources = extract_inline_resources(&json);
                         view! {
                             <div class="tool-call-body">
                                 {input_str
@@ -857,6 +858,10 @@ fn ToolCallCard(message: ChatMessage) -> impl IntoView {
                                             </div>
                                         }
                                     })}
+                                {resources
+                                    .into_iter()
+                                    .map(render_inline_resource)
+                                    .collect::<Vec<_>>()}
                             </div>
                         }
                     })
@@ -920,6 +925,248 @@ fn parse_tool_io(json: &str) -> (Option<String>, Option<String>) {
             })
     };
     (pretty("rawInput"), pretty("rawOutput"))
+}
+
+// ─── Inline UI resource rendering ────────────────────────────────────────────
+
+/// A single inline content item extracted from a `ToolCall.content[]` entry.
+///
+/// Only `Content::Resource` items are considered; `Diff` and `Terminal` items
+/// are ignored (not yet rendered).
+#[derive(Debug, PartialEq)]
+enum InlineResource {
+    /// Text resource with `mime_type == "text/html"` or `uri` starting with
+    /// `"ui://"` — rendered as a sandboxed iframe.
+    Html { uri: String, text: String },
+    /// Text resource that is not HTML/UI — rendered as a plain-text block.
+    Text { text: String },
+    /// Blob resource (no `text` field) — rendered as a placeholder line.
+    Blob { uri: String },
+}
+
+/// Return `true` when an embedded resource should be rendered as a sandboxed
+/// iframe.
+///
+/// This is a pure function (no JS interop) so it can be tested in native
+/// unit tests as well as in the WASM binary.
+pub(crate) fn is_ui_iframe_candidate(uri: &str, mime_type: Option<&str>) -> bool {
+    mime_type == Some("text/html") || uri.starts_with("ui://")
+}
+
+/// Extract inline resources from a serialised `ToolCall` JSON string.
+///
+/// Iterates `content[]`, selects `type == "content"` entries whose inner
+/// `content.type == "resource"`, and classifies each as HTML/UI (iframe),
+/// plain text, or blob (placeholder).  Entries of other types (`diff`,
+/// `terminal`) are silently skipped.
+fn extract_inline_resources(json: &str) -> Vec<InlineResource> {
+    let Ok(obj) = js_sys::JSON::parse(json) else {
+        return Vec::new();
+    };
+    let content_val = match js_sys::Reflect::get(&obj, &JsValue::from_str("content")).ok() {
+        Some(v) if v.is_array() => v,
+        _ => return Vec::new(),
+    };
+    let items = js_sys::Array::from(&content_val);
+
+    let mut result = Vec::new();
+    for i in 0..items.length() {
+        let item = items.get(i);
+
+        // Only handle "content" type items.
+        let item_type = js_sys::Reflect::get(&item, &JsValue::from_str("type"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        if item_type != "content" {
+            continue;
+        }
+
+        // Drill into the inner content object.
+        let inner = match js_sys::Reflect::get(&item, &JsValue::from_str("content")).ok() {
+            Some(v) if !v.is_null() && !v.is_undefined() => v,
+            _ => continue,
+        };
+        let inner_type = js_sys::Reflect::get(&inner, &JsValue::from_str("type"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        if inner_type != "resource" {
+            continue;
+        }
+
+        // Extract the resource fields.
+        let resource = match js_sys::Reflect::get(&inner, &JsValue::from_str("resource")).ok() {
+            Some(v) if !v.is_null() && !v.is_undefined() => v,
+            _ => continue,
+        };
+        let uri = js_sys::Reflect::get(&resource, &JsValue::from_str("uri"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        let mime_type = js_sys::Reflect::get(&resource, &JsValue::from_str("mime_type"))
+            .ok()
+            .and_then(|v| v.as_string());
+        let text = js_sys::Reflect::get(&resource, &JsValue::from_str("text"))
+            .ok()
+            .and_then(|v| v.as_string());
+
+        match text {
+            Some(t) => {
+                if is_ui_iframe_candidate(&uri, mime_type.as_deref()) {
+                    result.push(InlineResource::Html { uri, text: t });
+                } else {
+                    result.push(InlineResource::Text { text: t });
+                }
+            }
+            // No `text` field present — this is a BlobResourceContents.
+            None => result.push(InlineResource::Blob { uri }),
+        }
+    }
+    result
+}
+
+/// Render a single [`InlineResource`] as an `AnyView`.
+///
+/// - `Html` → sandboxed `<iframe srcdoc=…>` with fixed height.
+/// - `Text` → `<pre>` block with the literal text.
+/// - `Blob` → `<pre>` block with a `[binary resource: …]` placeholder.
+fn render_inline_resource(resource: InlineResource) -> AnyView {
+    match resource {
+        InlineResource::Html { uri, text } => view! {
+            <div class="tool-call-section">
+                <div class="tool-call-section-label">"UI"</div>
+                // `sandbox="allow-scripts"` is a whitelist — every capability
+                // not named is blocked.  In particular, `allow-same-origin`,
+                // `allow-forms`, `allow-top-navigation`, and `allow-downloads`
+                // are all absent and therefore denied.
+                <iframe
+                    class="tool-call-iframe"
+                    srcdoc=text
+                    sandbox="allow-scripts"
+                    title=uri
+                />
+            </div>
+        }
+        .into_any(),
+        InlineResource::Text { text } => view! {
+            <div class="tool-call-section">
+                <div class="tool-call-section-label">"Resource"</div>
+                <pre class="tool-call-pre">{text}</pre>
+            </div>
+        }
+        .into_any(),
+        InlineResource::Blob { uri } => view! {
+            <div class="tool-call-section">
+                <div class="tool-call-section-label">"Resource"</div>
+                <pre class="tool-call-pre">{format!("[binary resource: {uri}]")}</pre>
+            </div>
+        }
+        .into_any(),
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::is_ui_iframe_candidate;
+
+    /// Inline HTML payload used in the dev mock and in the shape test below.
+    /// Kept as a constant so it is easy to compare against the index.html mock.
+    const MOCK_WIDGET_HTML: &str = concat!(
+        "<!DOCTYPE html><html><body style='margin:0;padding:16px;",
+        "font-family:sans-serif;background:#fef;'>",
+        "<h3>Demo widget</h3>",
+        "<button onclick=\"alert('hi')\">Click me</button>",
+        "</body></html>",
+    );
+
+    // ── is_ui_iframe_candidate ───────────────────────────────────────────────
+
+    #[test]
+    fn html_mime_type_triggers_iframe() {
+        assert!(is_ui_iframe_candidate(
+            "resource://example/foo",
+            Some("text/html")
+        ));
+    }
+
+    #[test]
+    fn ui_scheme_without_mime_triggers_iframe() {
+        assert!(is_ui_iframe_candidate("ui://botwork-ui/panel", None));
+    }
+
+    #[test]
+    fn ui_scheme_with_html_mime_triggers_iframe() {
+        assert!(is_ui_iframe_candidate("ui://demo/widget", Some("text/html")));
+    }
+
+    #[test]
+    fn plain_text_non_ui_does_not_trigger_iframe() {
+        assert!(!is_ui_iframe_candidate(
+            "resource://example/foo",
+            Some("text/plain")
+        ));
+    }
+
+    #[test]
+    fn no_mime_non_ui_scheme_does_not_trigger_iframe() {
+        assert!(!is_ui_iframe_candidate("resource://example/foo", None));
+    }
+
+    // ── mock data serialisation ──────────────────────────────────────────────
+
+    /// Verify the JSON shape expected by `extract_inline_resources` matches
+    /// the mock payload embedded in the dev `index.html`.
+    ///
+    /// Uses plain serde_json so this test runs on the native target without
+    /// any WASM runtime.
+    #[test]
+    fn mock_ui_resource_json_has_expected_shape() {
+        let json = format!(
+            r#"{{
+                "toolCallId": "tc-mock-2",
+                "title": "show_panel",
+                "status": "completed",
+                "rawInput": {{}},
+                "rawOutput": {{"resourceUri": "ui://demo/panel"}},
+                "content": [{{
+                    "type": "content",
+                    "content": {{
+                        "type": "resource",
+                        "resource": {{
+                            "uri": "ui://demo/widget",
+                            "mime_type": "text/html",
+                            "text": {text:?}
+                        }}
+                    }}
+                }}]
+            }}"#,
+            text = MOCK_WIDGET_HTML,
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let content = value["content"].as_array().expect("content is array");
+        assert_eq!(content.len(), 1, "exactly one content item");
+
+        let item = &content[0];
+        assert_eq!(item["type"].as_str(), Some("content"));
+
+        let inner = &item["content"];
+        assert_eq!(inner["type"].as_str(), Some("resource"));
+
+        let resource = &inner["resource"];
+        let uri = resource["uri"].as_str().expect("uri present");
+        let mime = resource["mime_type"].as_str();
+        assert!(resource["text"].as_str().is_some(), "text field present");
+
+        // Confirm the detection logic agrees with the mock's intent.
+        assert!(
+            is_ui_iframe_candidate(uri, mime),
+            "mock resource must trigger iframe rendering"
+        );
+    }
 }
 
 /// Footer bar showing session metadata below the input row.
