@@ -28,7 +28,7 @@
 //!    activated, an ACP connection to geesed is started, state is persisted,
 //!    page returns to [`Page::Tab`]
 //! 3. user types a prompt → IPC handler → [`AcpCommand::Prompt`] → ACP task
-//! 4. tokens stream back → [`AcpEvent::TextChunk`] → `evaluate_script`
+//! 4. tokens stream back → [`AcpEvent::AgentText`] → `evaluate_script`
 
 use std::{
     collections::HashMap,
@@ -938,17 +938,54 @@ fn json_str(s: &str) -> String {
 #[cfg(target_os = "linux")]
 fn acp_event_to_js(event: &AcpEvent) -> String {
     match event {
-        AcpEvent::TextChunk(text) => {
+        AcpEvent::AgentText(text) => {
             format!(
-                "window.gander._publish({{type:'token',content:{}}})",
+                "window.gander._publish({{type:'agent_text',content:{}}})",
                 json_str(text)
             )
         }
+        AcpEvent::UserText(text) => {
+            format!(
+                "window.gander._publish({{type:'user_text',content:{}}})",
+                json_str(text)
+            )
+        }
+        AcpEvent::ToolUse { name, input } => {
+            format!(
+                "window.gander._publish({{type:'tool_use',name:{},input:{}}})",
+                json_str(name),
+                json_str(input)
+            )
+        }
+        AcpEvent::ToolResult { name, output } => {
+            format!(
+                "window.gander._publish({{type:'tool_result',name:{},output:{}}})",
+                json_str(name),
+                json_str(output)
+            )
+        }
+        AcpEvent::SessionLoadStart => {
+            "window.gander._publish({type:'session_load_start'})".to_owned()
+        }
+        AcpEvent::SessionLoadEnd => "window.gander._publish({type:'session_load_end'})".to_owned(),
         AcpEvent::Complete(_) => "window.gander._publish({type:'done'})".to_owned(),
         AcpEvent::Error(msg) => {
             format!(
                 "window.gander._publish({{type:'error',message:{}}})",
                 json_str(msg)
+            )
+        }
+        AcpEvent::SessionList(sessions) => {
+            let sessions_json = serde_json::to_string(sessions).unwrap_or_else(|_| "[]".into());
+            format!(
+                "window.gander._publish({{type:'session_list',sessions:{}}})",
+                sessions_json
+            )
+        }
+        AcpEvent::SessionActive(id) => {
+            format!(
+                "window.gander._publish({{type:'session_active',id:{},history:[]}})",
+                json_str(id)
             )
         }
     }
