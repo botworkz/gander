@@ -950,18 +950,11 @@ fn acp_event_to_js(event: &AcpEvent) -> String {
                 json_str(text)
             )
         }
-        AcpEvent::ToolUse { name, input } => {
+        AcpEvent::ToolCall(tc) => {
+            let call_json = serde_json::to_string(tc.as_ref()).unwrap_or_else(|_| "{}".to_string());
             format!(
-                "window.gander._publish({{type:'tool_use',name:{},input:{}}})",
-                json_str(name),
-                json_str(input)
-            )
-        }
-        AcpEvent::ToolResult { name, output } => {
-            format!(
-                "window.gander._publish({{type:'tool_result',name:{},output:{}}})",
-                json_str(name),
-                json_str(output)
+                "window.gander._publish({{type:'tool_call',call:{}}})",
+                json_str(&call_json)
             )
         }
         AcpEvent::SessionLoadStart => {

@@ -238,14 +238,14 @@ async fn history_drain_completes_with_expected_events() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AcpEvent::ToolUse { name, .. } if name == "calculator")),
-        "expected ToolUse(calculator) in events; got: {events:?}"
+            .any(|e| matches!(e, AcpEvent::ToolCall(tc) if tc.title == "calculator")),
+        "expected ToolCall(calculator) in events; got: {events:?}"
     );
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AcpEvent::ToolResult { name, .. } if name == "tc-1")),
-        "expected ToolResult(tc-1) in events; got: {events:?}"
+            .any(|e| matches!(e, AcpEvent::ToolCall(tc) if tc.tool_call_id.0.as_ref() == "tc-1" && tc.raw_output.is_some())),
+        "expected ToolCall(tc-1) with raw_output in events; got: {events:?}"
     );
     assert!(
         events
@@ -283,10 +283,7 @@ async fn history_drain_completes_with_expected_events() {
         .filter(|(_, e)| {
             matches!(
                 e,
-                AcpEvent::UserText(_)
-                    | AcpEvent::AgentText(_)
-                    | AcpEvent::ToolUse { .. }
-                    | AcpEvent::ToolResult { .. }
+                AcpEvent::UserText(_) | AcpEvent::AgentText(_) | AcpEvent::ToolCall(_)
             )
         })
         .map(|(i, _)| i)
