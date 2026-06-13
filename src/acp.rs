@@ -103,6 +103,16 @@ pub enum AcpEvent {
     /// `SessionSelect` — that path uses `SessionLoadStart`/`SessionLoadEnd`
     /// to replay history.
     SessionActive(String),
+    /// Session metadata for the footer bar.
+    ///
+    /// Emitted once on initial connect and again on `RequestSessionInfo`.
+    /// `model` is the agent name reported by `InitializeResponse.agent_info`.
+    /// `tool_count` is `None` when the count cannot be determined via ACP v1.
+    SessionInfo {
+        cwd: String,
+        model: String,
+        tool_count: Option<u32>,
+    },
 }
 
 /// Commands sent from the UI/IPC handler to the ACP background task.
@@ -322,9 +332,18 @@ async fn run_worker(
         .builder()
         .name("gander")
         .connect_with(transport, async move |cx| {
-            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+            let init_resp = cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
+
+            // Extract the agent name from the InitializeResponse to display in the footer.
+            // This is typically the agent implementation name (e.g. "goose"), not the LLM
+            // model name, which ACP v1 does not expose directly.
+            let agent_model = init_resp
+                .agent_info
+                .as_ref()
+                .map(|i| i.title.clone().unwrap_or_else(|| i.name.clone()))
+                .unwrap_or_default();
 
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
 
@@ -363,7 +382,8 @@ async fn run_worker(
                 let _ = tx.send(Ok(()));
             }
 
-            // Cache the initial session list so RequestSessionInfo can re-send it.
+            // Cache session metadata for reuse on RequestSessionInfo.
+            let cwd_str = cwd.to_string_lossy().into_owned();
             let mut cached_listed = listed;
 
             while let Some(cmd) = cmd_rx.recv().await {
@@ -448,6 +468,13 @@ async fn run_worker(
                             .await;
                         let _ = evt_tx_clone
                             .send(AcpEvent::SessionActive(active_id.clone()))
+                            .await;
+                        let _ = evt_tx_clone
+                            .send(AcpEvent::SessionInfo {
+                                cwd: cwd_str.clone(),
+                                model: agent_model.clone(),
+                                tool_count: None,
+                            })
                             .await;
                     }
 

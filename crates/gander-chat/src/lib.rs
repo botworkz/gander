@@ -4,12 +4,13 @@
 //!
 //! # Architecture
 //!
-//! ```
+//! ```text
 //! App
 //! ├── Sidebar       (session list, "+ New session" button)
 //! └── ChatPane
 //!     ├── MessageList   (scrollable, one MessageView per message)
-//!     └── input row     (textarea + Send button)
+//!     ├── input row     (textarea + Send button)
+//!     └── Footer        (cwd, attach, tokens, model, mode, tools, settings)
 //! ```
 //!
 //! All chat state lives in [`App`] as [`leptos::RwSignal`]s.  Because
@@ -45,12 +46,19 @@
 //! `{type:"session_active", id:"…"}`.  Clicking a session fires
 //! `session_select`; clicking "+ New session" fires `session_new`.
 //!
+//! ## Footer
+//!
+//! The host fires `{type:"session_info", cwd:"…", model:"…", tool_count:N}`
+//! (or `tool_count:null` when unavailable) after the bridge `ready` handshake.
+//! Each field drives its own signal so only the changed span re-renders.
+//!
 //! # Entry point
 //!
 //! [`main`] is called by the Trunk-generated JS loader when the WASM
 //! module is instantiated.
 
 use leptos::prelude::*;
+use leptos_icons::Icon;
 use wasm_bindgen::prelude::*;
 
 pub mod bridge;
@@ -140,6 +148,7 @@ pub struct SessionEntry {
 ///
 /// Called from the `Closure` registered with `bridge::subscribe`.
 /// Runs outside any reactive context, so signal reads use `get_untracked`.
+#[allow(clippy::too_many_arguments)]
 fn handle_bridge_event(
     event: JsValue,
     in_flight: RwSignal<Option<ChatMessage>>,
@@ -149,6 +158,9 @@ fn handle_bridge_event(
     next_id: RwSignal<u32>,
     sessions: RwSignal<Vec<SessionEntry>>,
     active_session_id: RwSignal<Option<String>>,
+    footer_cwd: RwSignal<Option<String>>,
+    footer_model: RwSignal<Option<String>>,
+    footer_tool_count: RwSignal<Option<u32>>,
 ) {
     let event_type = js_sys::Reflect::get(&event, &JsValue::from_str("type"))
         .ok()
@@ -322,6 +334,29 @@ fn handle_bridge_event(
             sending.set(false);
         }
 
+        // ── session metadata for the footer bar ───────────────────────────
+        Some("session_info") => {
+            let cwd = js_sys::Reflect::get(&event, &JsValue::from_str("cwd"))
+                .ok()
+                .and_then(|v| v.as_string());
+            let model = js_sys::Reflect::get(&event, &JsValue::from_str("model"))
+                .ok()
+                .and_then(|v| v.as_string());
+            // tool_count may be null (not yet supported) or a number.
+            let tool_count = js_sys::Reflect::get(&event, &JsValue::from_str("tool_count"))
+                .ok()
+                .and_then(|v| v.as_f64())
+                .map(|n| n as u32);
+
+            if let Some(c) = cwd {
+                footer_cwd.set(Some(c));
+            }
+            if let Some(m) = model {
+                footer_model.set(Some(m));
+            }
+            footer_tool_count.set(tool_count);
+        }
+
         _ => {
             // Ignore unrecognised events so future protocol extensions are
             // forwards-compatible.
@@ -386,6 +421,10 @@ pub fn App() -> impl IntoView {
     // Session sidebar state.
     let sessions: RwSignal<Vec<SessionEntry>> = RwSignal::new(Vec::new());
     let active_session_id: RwSignal<Option<String>> = RwSignal::new(None);
+    // Footer metadata — populated when the host fires `session_info`.
+    let footer_cwd: RwSignal<Option<String>> = RwSignal::new(None);
+    let footer_model: RwSignal<Option<String>> = RwSignal::new(None);
+    let footer_tool_count: RwSignal<Option<u32>> = RwSignal::new(None);
 
     // Register the event callback once for the lifetime of the app.
     // The Closure is leaked intentionally — it must outlive the app.
@@ -400,6 +439,9 @@ pub fn App() -> impl IntoView {
                 next_id,
                 sessions,
                 active_session_id,
+                footer_cwd,
+                footer_model,
+                footer_tool_count,
             );
         }) as Box<dyn FnMut(JsValue)>);
 
@@ -471,6 +513,7 @@ pub fn App() -> impl IntoView {
                         "Send"
                     </button>
                 </div>
+                <Footer cwd=footer_cwd model=footer_model tool_count=footer_tool_count />
             </div>
         </div>
     }
@@ -599,6 +642,95 @@ fn MessageView(message: ChatMessage) -> impl IntoView {
                     .get()
                     .map(|e| view! { <div class="error-notice">{e}</div> })
             }}
+        </div>
+    }
+}
+
+/// Footer bar showing session metadata below the input row.
+///
+/// Each field is driven by its own signal so only the changed span re-renders.
+/// Fields that have not yet been populated show `—` (em-dash).
+///
+/// ## Layout
+///
+/// ```text
+/// 📁 /home/…  📎  |  — / —  |  model  |  —  |  N tools  |  ⚙
+///   cwd      attach  tokens    model   mode   tools   settings
+/// ```
+#[component]
+fn Footer(
+    cwd: RwSignal<Option<String>>,
+    model: RwSignal<Option<String>>,
+    tool_count: RwSignal<Option<u32>>,
+) -> impl IntoView {
+    // Repeated string literals extracted to locals so changes stay in one place.
+    const SEP: &str = "|";
+    const PLACEHOLDER: &str = "—";
+
+    view! {
+        <div class="input-footer">
+            // ── cwd ────────────────────────────────────────────────────────
+            <span class="footer-cwd" title=move || cwd.get().unwrap_or_default()>
+                <Icon icon=icondata::LuFolder width="14px" height="14px" />
+                {move || cwd.get().unwrap_or_else(|| PLACEHOLDER.to_string())}
+            </span>
+
+            // ── attach (no-op placeholder) ─────────────────────────────────
+            <button
+                class="footer-btn"
+                title="Attach file (not implemented)"
+                on:click=|_| {
+                    web_sys::console::log_1(
+                        &wasm_bindgen::JsValue::from_str("attach not implemented"),
+                    );
+                }
+            >
+                <Icon icon=icondata::LuPaperclip width="14px" height="14px" />
+            </button>
+
+            <span class="footer-sep">{SEP}</span>
+
+            // ── token usage (placeholder) ──────────────────────────────────
+            <span class="footer-tokens">"— / —"</span>
+
+            <span class="footer-sep">{SEP}</span>
+
+            // ── model ──────────────────────────────────────────────────────
+            <span class="footer-model">
+                {move || model.get().unwrap_or_else(|| PLACEHOLDER.to_string())}
+            </span>
+
+            <span class="footer-sep">{SEP}</span>
+
+            // ── mode (placeholder) ─────────────────────────────────────────
+            <span class="footer-mode">{PLACEHOLDER}</span>
+
+            <span class="footer-sep">{SEP}</span>
+
+            // ── tool count ─────────────────────────────────────────────────
+            <span class="footer-tools">
+                {move || {
+                    tool_count
+                        .get()
+                        .map(|n| format!("{n} tools"))
+                        .unwrap_or_else(|| PLACEHOLDER.to_string())
+                }}
+            </span>
+
+            <span class="footer-sep">{SEP}</span>
+
+            // ── settings (no-op placeholder) ──────────────────────────────
+            <button
+                class="footer-btn"
+                title="Settings (not implemented)"
+                on:click=|_| {
+                    web_sys::console::log_1(
+                        &wasm_bindgen::JsValue::from_str("settings not implemented"),
+                    );
+                }
+            >
+                <Icon icon=icondata::LuSettings2 width="14px" height="14px" />
+            </button>
         </div>
     }
 }

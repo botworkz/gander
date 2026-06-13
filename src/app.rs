@@ -988,6 +988,22 @@ fn acp_event_to_js(event: &AcpEvent) -> String {
                 json_str(id)
             )
         }
+        AcpEvent::SessionInfo {
+            cwd,
+            model,
+            tool_count,
+        } => {
+            let tool_count_js = match tool_count {
+                Some(n) => n.to_string(),
+                None => "null".to_string(),
+            };
+            format!(
+                "window.gander._publish({{type:'session_info',cwd:{},model:{},tool_count:{}}})",
+                json_str(cwd),
+                json_str(model),
+                tool_count_js,
+            )
+        }
     }
 }
 

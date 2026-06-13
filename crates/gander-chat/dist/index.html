@@ -11,8 +11,8 @@
   -->
   
 <script type="module">
-import init, * as bindings from '/gander-chat-1c509714fca3a8b0.js';
-const wasm = await init({ module_or_path: '/gander-chat-1c509714fca3a8b0_bg.wasm' });
+import init, * as bindings from '/gander-chat-8f849303bb6e87fe.js';
+const wasm = await init({ module_or_path: '/gander-chat-8f849303bb6e87fe_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -270,6 +270,64 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     .send-btn:hover:not(:disabled) {
       background: #3d6bf3;
     }
+    /* ── input footer ────────────────────────────────────────── */
+
+    .input-footer {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 16px;
+      border-top: 1px solid #282838;
+      font-size: 0.78rem;
+      color: #8888a8;
+      background: #16162a;
+      overflow: hidden;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    /* cwd: takes available space but clips with ellipsis rather than wrapping */
+    .footer-cwd {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      min-width: 0;
+      flex: 0 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* thin divider between groups */
+    .footer-sep {
+      opacity: 0.35;
+      flex-shrink: 0;
+    }
+
+    /* placeholder fields — they stay on one line and don't grow */
+    .footer-tokens,
+    .footer-model,
+    .footer-mode,
+    .footer-tools {
+      flex-shrink: 0;
+    }
+
+    /* icon-only buttons (attach, settings) */
+    .footer-btn {
+      display: flex;
+      align-items: center;
+      background: none;
+      border: none;
+      padding: 0 2px;
+      cursor: pointer;
+      color: inherit;
+      font-size: inherit;
+      flex-shrink: 0;
+    }
+
+    .footer-btn:hover {
+      color: #b0b0d0;
+    }
   </style>
 
   <script>
@@ -378,6 +436,14 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
           setTimeout(function () {
             fireEvent({ type: "session_list", sessions: MOCK_SESSIONS });
             fireEvent({ type: "session_active", id: _activeSessionId, history: [] });
+            // Footer metadata: cwd and model are real fields; tool_count is a
+            // placeholder until ACP v1 exposes it.
+            fireEvent({
+              type: "session_info",
+              cwd: "/home/phlax/dev/local/gander",
+              model: "claude-opus-4.7",
+              tool_count: 9,
+            });
           }, 50);
         } else if (type === "session_select") {
           var id = message.id;
@@ -434,7 +500,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       };
     })();
   </script>
-<link rel="modulepreload" href="/gander-chat-1c509714fca3a8b0.js" crossorigin="anonymous" integrity="sha384-SHdRDWbp4jyWJuitHE/NvfYSWzIem+6LOpXRwF8o/2QIIOel+QSNqOKwactf6O1u"><link rel="preload" href="/gander-chat-1c509714fca3a8b0_bg.wasm" crossorigin="anonymous" integrity="sha384-U/flh2EB+hPAfTLq2ty3R7EltZ+Fq5jVNexmKAkodPZlOiCuNz51gV/t+tAyuSVp" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/gander-chat-8f849303bb6e87fe.js" crossorigin="anonymous" integrity="sha384-BPliJkmgOVGw6ou0Zh9c5xjZD6Pk01l9j2Kxwl0BJMt3kK5XXz9xeKfizjhof8Mn"><link rel="preload" href="/gander-chat-8f849303bb6e87fe_bg.wasm" crossorigin="anonymous" integrity="sha384-eI05Shre9BKXKT7i09kUANtwmFrv8OgrDXG6V+aqojguYoVPa+/TyIxiLPs1jRkI" as="fetch" type="application/wasm"></head>
 <body>
   <!--
     Trunk injects the WASM loader at the end of <body>.
