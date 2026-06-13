@@ -663,12 +663,16 @@ fn Footer(
     model: RwSignal<Option<String>>,
     tool_count: RwSignal<Option<u32>>,
 ) -> impl IntoView {
+    // Repeated string literals extracted to locals so changes stay in one place.
+    const SEP: &str = "|";
+    const PLACEHOLDER: &str = "—";
+
     view! {
         <div class="input-footer">
             // ── cwd ────────────────────────────────────────────────────────
             <span class="footer-cwd" title=move || cwd.get().unwrap_or_default()>
                 <Icon icon=icondata::LuFolder width="14px" height="14px" />
-                {move || cwd.get().unwrap_or_else(|| "—".to_string())}
+                {move || cwd.get().unwrap_or_else(|| PLACEHOLDER.to_string())}
             </span>
 
             // ── attach (no-op placeholder) ─────────────────────────────────
@@ -684,24 +688,24 @@ fn Footer(
                 <Icon icon=icondata::LuPaperclip width="14px" height="14px" />
             </button>
 
-            <span class="footer-sep">"|"</span>
+            <span class="footer-sep">{SEP}</span>
 
             // ── token usage (placeholder) ──────────────────────────────────
             <span class="footer-tokens">"— / —"</span>
 
-            <span class="footer-sep">"|"</span>
+            <span class="footer-sep">{SEP}</span>
 
             // ── model ──────────────────────────────────────────────────────
             <span class="footer-model">
-                {move || model.get().unwrap_or_else(|| "—".to_string())}
+                {move || model.get().unwrap_or_else(|| PLACEHOLDER.to_string())}
             </span>
 
-            <span class="footer-sep">"|"</span>
+            <span class="footer-sep">{SEP}</span>
 
             // ── mode (placeholder) ─────────────────────────────────────────
-            <span class="footer-mode">"—"</span>
+            <span class="footer-mode">{PLACEHOLDER}</span>
 
-            <span class="footer-sep">"|"</span>
+            <span class="footer-sep">{SEP}</span>
 
             // ── tool count ─────────────────────────────────────────────────
             <span class="footer-tools">
@@ -709,11 +713,11 @@ fn Footer(
                     tool_count
                         .get()
                         .map(|n| format!("{n} tools"))
-                        .unwrap_or_else(|| "—".to_string())
+                        .unwrap_or_else(|| PLACEHOLDER.to_string())
                 }}
             </span>
 
-            <span class="footer-sep">"|"</span>
+            <span class="footer-sep">{SEP}</span>
 
             // ── settings (no-op placeholder) ──────────────────────────────
             <button
