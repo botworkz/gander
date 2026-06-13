@@ -21,7 +21,7 @@
 use std::{env, path::PathBuf};
 
 use agent_client_protocol::{
-    ByteStreams, SessionMessage,
+    ActiveSession, Agent, ByteStreams, SessionMessage,
     schema::{
         ContentBlock, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
         NewSessionResponse, ProtocolVersion, SessionId, SessionNotification, SessionUpdate,
@@ -73,8 +73,19 @@ pub struct ListedSession {
 /// Events sent from the ACP background task to the GTK pump.
 #[derive(Debug)]
 pub enum AcpEvent {
-    /// A streaming text chunk from the assistant.
-    TextChunk(String),
+    /// A streaming text chunk from the agent (live prompt or history replay).
+    AgentText(String),
+    /// A user message chunk (history replay only).
+    UserText(String),
+    /// The agent invoked a tool.  `name` is the tool title; `input` is the
+    /// raw JSON input.
+    ToolUse { name: String, input: String },
+    /// A tool returned output.
+    ToolResult { name: String, output: String },
+    /// History replay starting — the UI should clear its message list.
+    SessionLoadStart,
+    /// History replay complete — the UI may accept new user input.
+    SessionLoadEnd,
     /// The assistant's response is complete.
     #[allow(dead_code)]
     Complete(StopReason),
@@ -85,11 +96,11 @@ pub enum AcpEvent {
     /// Sent once on connect (after the initial session is established) and
     /// again after a `session_new` command creates a fresh session.
     SessionList(Vec<ListedSession>),
-    /// The active session has been established or switched.
+    /// The active session has been established or switched to a new session.
     ///
-    /// The `String` is the session ID. History is not replayed —
-    /// `session/load` does not return prior messages — agents reattach
-    /// to the session but the chat history isn't replayed in the wire.
+    /// Emitted by `SessionNew` and on initial connect. Not emitted by
+    /// `SessionSelect` — that path uses `SessionLoadStart`/`SessionLoadEnd`
+    /// to replay history.
     SessionActive(String),
 }
 
@@ -363,51 +374,7 @@ async fn run_worker(
                             continue;
                         }
 
-                        // Drain events for this prompt.
-                        loop {
-                            let update = match current_session.read_update().await {
-                                Ok(update) => update,
-                                Err(error) => {
-                                    let _ =
-                                        evt_tx_clone.send(AcpEvent::Error(error.to_string())).await;
-                                    break;
-                                }
-                            };
-
-                            match update {
-                                SessionMessage::SessionMessage(dispatch) => {
-                                    let tx = evt_tx_clone.clone();
-                                    let handled = MatchDispatch::new(dispatch)
-                                        .if_notification(async move |n: SessionNotification| {
-                                            if let SessionUpdate::AgentMessageChunk(chunk) =
-                                                n.update
-                                            {
-                                                if let ContentBlock::Text(text) = chunk.content {
-                                                    let _ = tx
-                                                        .send(AcpEvent::TextChunk(text.text))
-                                                        .await;
-                                                }
-                                            }
-                                            Ok(())
-                                        })
-                                        .await
-                                        .otherwise_ignore();
-
-                                    if let Err(error) = handled {
-                                        let _ = evt_tx_clone
-                                            .send(AcpEvent::Error(error.to_string()))
-                                            .await;
-                                        break;
-                                    }
-                                }
-                                SessionMessage::StopReason(stop_reason) => {
-                                    let _ =
-                                        evt_tx_clone.send(AcpEvent::Complete(stop_reason)).await;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
+                        drain_session_updates(&mut current_session, &evt_tx_clone).await;
                     }
 
                     AcpCommand::SessionSelect(id) => {
@@ -421,12 +388,21 @@ async fn run_worker(
                                 match cx.attach_session(NewSessionResponse::new(sid), vec![]) {
                                     Ok(s) => {
                                         current_session = s;
-                                        active_id = id.clone();
-                                        let _ =
-                                            evt_tx_clone.send(AcpEvent::SessionActive(id)).await;
+                                        active_id = id;
+                                        let _ = evt_tx_clone
+                                            .send(AcpEvent::SessionLoadStart)
+                                            .await;
+                                        drain_session_updates(
+                                            &mut current_session,
+                                            &evt_tx_clone,
+                                        )
+                                        .await;
+                                        let _ = evt_tx_clone
+                                            .send(AcpEvent::SessionLoadEnd)
+                                            .await;
                                     }
                                     Err(err) => {
-                                        tracing::warn!(%err, "attach_session failed after resume");
+                                        tracing::warn!(%err, "attach_session failed after session/load");
                                         let _ = evt_tx_clone
                                             .send(AcpEvent::Error(format!(
                                                 "session switch failed: {err}"
@@ -485,6 +461,102 @@ async fn run_worker(
 
     if let Err(error) = result {
         let _ = evt_tx.send(AcpEvent::Error(error.to_string())).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session update drain
+// ---------------------------------------------------------------------------
+
+/// Read `SessionMessage`s from `session` until a `StopReason` arrives (or an
+/// error), forwarding each `SessionUpdate` to `evt_tx` as an [`AcpEvent`].
+///
+/// Used for both live prompt streaming and history replay after
+/// `session/load`.
+async fn drain_session_updates(
+    session: &mut ActiveSession<'_, Agent>,
+    evt_tx: &mpsc::Sender<AcpEvent>,
+) {
+    loop {
+        let update = match session.read_update().await {
+            Ok(u) => u,
+            Err(error) => {
+                let _ = evt_tx.send(AcpEvent::Error(error.to_string())).await;
+                break;
+            }
+        };
+
+        match update {
+            SessionMessage::SessionMessage(dispatch) => {
+                let tx = evt_tx.clone();
+                let handled = MatchDispatch::new(dispatch)
+                    .if_notification(async move |n: SessionNotification| {
+                        forward_update(n.update, &tx).await;
+                        Ok(())
+                    })
+                    .await
+                    .otherwise_ignore();
+
+                if let Err(error) = handled {
+                    let _ = evt_tx.send(AcpEvent::Error(error.to_string())).await;
+                    break;
+                }
+            }
+            SessionMessage::StopReason(stop_reason) => {
+                let _ = evt_tx.send(AcpEvent::Complete(stop_reason)).await;
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Map a single [`SessionUpdate`] variant to the appropriate [`AcpEvent`] and
+/// send it.  Unrecognised variants are silently ignored for forward
+/// compatibility.
+async fn forward_update(update: SessionUpdate, tx: &mpsc::Sender<AcpEvent>) {
+    match update {
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            if let ContentBlock::Text(text) = chunk.content {
+                let _ = tx.send(AcpEvent::AgentText(text.text)).await;
+            }
+        }
+        SessionUpdate::UserMessageChunk(chunk) => {
+            if let ContentBlock::Text(text) = chunk.content {
+                let _ = tx.send(AcpEvent::UserText(text.text)).await;
+            }
+        }
+        SessionUpdate::ToolCall(tool_call) => {
+            let input = tool_call
+                .raw_input
+                .as_ref()
+                .and_then(|v| serde_json::to_string_pretty(v).ok())
+                .unwrap_or_else(|| "{}".to_string());
+            let _ = tx
+                .send(AcpEvent::ToolUse {
+                    name: tool_call.title.clone(),
+                    input,
+                })
+                .await;
+        }
+        SessionUpdate::ToolCallUpdate(update) => {
+            let output = update
+                .fields
+                .raw_output
+                .as_ref()
+                .and_then(|v| serde_json::to_string_pretty(v).ok())
+                .unwrap_or_default();
+            let _ = tx
+                .send(AcpEvent::ToolResult {
+                    // The ACP spec doesn't carry the tool title in ToolCallUpdate;
+                    // use the tool_call_id as the identifier for display.
+                    name: update.tool_call_id.0.to_string(),
+                    output,
+                })
+                .await;
+        }
+        // AgentThoughtChunk and other variants are intentionally ignored in v1.
+        _ => {}
     }
 }
 

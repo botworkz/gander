@@ -154,6 +154,15 @@
       align-self: flex-start;
     }
 
+    /* tool call / result: gray, narrower, monospace feel */
+    .message--tool {
+      background: #1e2030;
+      align-self: flex-start;
+      border: 1px solid #2e3050;
+      font-size: 0.88em;
+      max-width: 90%;
+    }
+
     /* pulldown-cmark wraps everything in <p>; strip the outer margin */
     .message-content p:first-child { margin-top: 0; }
     .message-content p:last-child  { margin-bottom: 0; }
@@ -222,6 +231,11 @@
     .input-box:focus {
       outline: none;
       border-color: #2d5be3;
+    }
+
+    .input-box:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
     }
 
     .send-btn {
@@ -305,13 +319,45 @@
         var i = 0;
         var interval = setInterval(function () {
           if (i < tokens.length) {
-            fireEvent({ type: "token", content: tokens[i] });
+            fireEvent({ type: "agent_text", content: tokens[i] });
             i++;
           } else {
             fireEvent({ type: "done" });
             clearInterval(interval);
           }
         }, 50);
+      }
+
+      function mockSessionLoad(id) {
+        var entry = MOCK_SESSIONS.find(function(s) { return s.id === id; });
+        var title = entry ? entry.label : id;
+        fireEvent({ type: "session_load_start" });
+        var history = [
+          { role: "user", text: "Tell me about " + title },
+          { role: "agent", text: "Sure! Here is what I know about **" + title + "**." },
+          { role: "tool_use", name: "read_file", input: '{"path": "/project/README.md"}' },
+          { role: "tool_result", name: "read_file", output: "# Project\nThis is the README." },
+          { role: "agent", text: "Done reading. Anything else?" },
+        ];
+        var delay = 80;
+        history.forEach(function(item) {
+          setTimeout(function() {
+            if (item.role === "user") {
+              fireEvent({ type: "user_text", content: item.text });
+            } else if (item.role === "agent") {
+              fireEvent({ type: "agent_text", content: item.text });
+              setTimeout(function() { fireEvent({ type: "done" }); }, 30);
+            } else if (item.role === "tool_use") {
+              fireEvent({ type: "tool_use", name: item.name, input: item.input });
+            } else if (item.role === "tool_result") {
+              fireEvent({ type: "tool_result", name: item.name, output: item.output });
+            }
+          }, delay);
+          delay += 80;
+        });
+        setTimeout(function() {
+          fireEvent({ type: "session_load_end" });
+        }, delay + 40);
       }
 
       function handlePost(message) {
@@ -326,7 +372,7 @@
           var id = message.id;
           console.log("[mock gander] session_select:", id);
           _activeSessionId = id;
-          fireEvent({ type: "session_active", id: id, history: [] });
+          setTimeout(function() { mockSessionLoad(id); }, 150);
         } else if (type === "session_new") {
           console.log("[mock gander] session_new");
           var newId = "mock-session-" + (MOCK_SESSIONS.length + 1);

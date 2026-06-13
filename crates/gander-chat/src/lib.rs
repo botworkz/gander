@@ -18,25 +18,32 @@
 //!
 //! ## Streaming
 //!
-//! Streaming token updates work like this:
+//! Live token streaming:
 //!
 //! 1. User submits text → `bridge::send(text)` called.
-//! 2. An in-flight [`ChatMessage`] (role = Assistant, `streaming = true`)
-//!    is appended to the message list.
-//! 3. The JS bridge fires `{type:"token", content:"…"}` events.
-//! 4. Each token calls `msg.content.update(|c| c.push_str(token))`.
+//! 2. A user bubble and an in-flight assistant bubble are appended.
+//! 3. The JS bridge fires `{type:"agent_text", content:"…"}` events.
+//! 4. Each chunk calls `msg.content.update(|c| c.push_str(chunk))`.
 //! 5. Leptos patches only the single changed text node — no vdom diff.
 //! 6. A `{type:"done"}` event marks the message complete.
+//!
+//! ## History replay
+//!
+//! On session load:
+//!
+//! 1. `session_load_start` → clear message list, set `replaying=true`.
+//! 2. `user_text` → append a completed user bubble.
+//! 3. `agent_text` → create (if needed) and append to in-flight agent bubble.
+//! 4. `tool_use` / `tool_result` → append a tool bubble.
+//! 5. `done` → finalize in-flight agent bubble.
+//! 6. `session_load_end` → clear `replaying`, re-enable input.
 //!
 //! ## Session sidebar
 //!
 //! On startup the WASM sends `{type:"ready"}` to the host, which responds
 //! with `{type:"session_list", sessions:[…]}` and
-//! `{type:"session_active", id:"…", history:[]}`.  Clicking a session fires
+//! `{type:"session_active", id:"…"}`.  Clicking a session fires
 //! `session_select`; clicking "+ New session" fires `session_new`.
-//!
-//! Note: `session/resume` in ACP v1 does not replay history, so
-//! `session_active.history` is always `[]` in this version.
 //!
 //! # Entry point
 //!
@@ -62,6 +69,8 @@ const DEFAULT_SESSION_LABEL: &str = "Session";
 pub enum Role {
     User,
     Assistant,
+    /// A tool invocation or result (gray, monospace-feel).
+    Tool,
 }
 
 /// A single chat message.
@@ -104,6 +113,16 @@ impl ChatMessage {
             error: RwSignal::new(None),
         }
     }
+
+    fn new_tool(id: u32, text: String) -> Self {
+        Self {
+            id,
+            role: Role::Tool,
+            content: RwSignal::new(text),
+            streaming: RwSignal::new(false),
+            error: RwSignal::new(None),
+        }
+    }
 }
 
 /// A session entry shown in the sidebar.
@@ -125,7 +144,9 @@ fn handle_bridge_event(
     event: JsValue,
     in_flight: RwSignal<Option<ChatMessage>>,
     sending: RwSignal<bool>,
+    replaying: RwSignal<bool>,
     messages: RwSignal<Vec<ChatMessage>>,
+    next_id: RwSignal<u32>,
     sessions: RwSignal<Vec<SessionEntry>>,
     active_session_id: RwSignal<Option<String>>,
 ) {
@@ -133,16 +154,104 @@ fn handle_bridge_event(
         .ok()
         .and_then(|v| v.as_string());
 
+    /// Consume and return the next message ID.
+    fn take_id(next_id: RwSignal<u32>) -> u32 {
+        let id = next_id.get_untracked();
+        next_id.set(id + 1);
+        id
+    }
+
     match event_type.as_deref() {
-        Some("token") => {
-            let token = js_sys::Reflect::get(&event, &JsValue::from_str("content"))
+        // ── agent text chunk (live or history replay) ──────────────────────
+        Some("agent_text") => {
+            let chunk = js_sys::Reflect::get(&event, &JsValue::from_str("content"))
                 .ok()
                 .and_then(|v| v.as_string())
                 .unwrap_or_default();
 
+            // Re-use the existing in-flight bubble or start a new one.
+            let msg = match in_flight.get_untracked() {
+                Some(m) => m,
+                None => {
+                    let m = ChatMessage::new_assistant(take_id(next_id));
+                    messages.update(|v| v.push(m));
+                    in_flight.set(Some(m));
+                    m
+                }
+            };
+            msg.content.update(|c| c.push_str(&chunk));
+        }
+
+        // ── user text chunk (history replay only) ──────────────────────────
+        Some("user_text") => {
+            let text = js_sys::Reflect::get(&event, &JsValue::from_str("content"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+
+            // A user message from history is always complete. If there is an
+            // in-flight agent bubble, close it first to keep ordering correct.
             if let Some(msg) = in_flight.get_untracked() {
-                msg.content.update(|c| c.push_str(&token));
+                msg.streaming.set(false);
+                in_flight.set(None);
             }
+
+            let m = ChatMessage::new_user(take_id(next_id), &text);
+            messages.update(|v| v.push(m));
+        }
+
+        // ── tool call ──────────────────────────────────────────────────────
+        Some("tool_use") => {
+            let name = js_sys::Reflect::get(&event, &JsValue::from_str("name"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "(tool)".to_string());
+            let input = js_sys::Reflect::get(&event, &JsValue::from_str("input"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+
+            let text = format!("called **{}**\n```json\n{}\n```", name, input);
+            let m = ChatMessage::new_tool(take_id(next_id), text);
+            messages.update(|v| v.push(m));
+        }
+
+        // ── tool result ────────────────────────────────────────────────────
+        Some("tool_result") => {
+            let name = js_sys::Reflect::get(&event, &JsValue::from_str("name"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "(tool)".to_string());
+            let output = js_sys::Reflect::get(&event, &JsValue::from_str("output"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+
+            let text = if output.is_empty() {
+                format!("**{}** returned (no output)", name)
+            } else {
+                format!("**{}** returned\n```\n{}\n```", name, output)
+            };
+            let m = ChatMessage::new_tool(take_id(next_id), text);
+            messages.update(|v| v.push(m));
+        }
+
+        // ── session load start: clear UI, enter replay mode ────────────────
+        Some("session_load_start") => {
+            messages.set(Vec::new());
+            in_flight.set(None);
+            sending.set(false);
+            replaying.set(true);
+        }
+
+        // ── session load end: leave replay mode ────────────────────────────
+        Some("session_load_end") => {
+            // Close any lingering in-flight bubble from the last replay turn.
+            if let Some(msg) = in_flight.get_untracked() {
+                msg.streaming.set(false);
+                in_flight.set(None);
+            }
+            replaying.set(false);
         }
 
         Some("done") => {
@@ -165,6 +274,7 @@ fn handle_bridge_event(
             }
             in_flight.set(None);
             sending.set(false);
+            replaying.set(false);
         }
 
         Some("session_list") => {
@@ -204,8 +314,9 @@ fn handle_bridge_event(
                 .ok()
                 .and_then(|v| v.as_string());
             active_session_id.set(id);
-            // Clear chat messages when switching sessions.
-            // History replay is not supported in ACP v1 session/resume.
+            // Clear chat messages when a new session is created (via
+            // `session_new` command). History replay uses `session_load_start`
+            // instead and is handled separately above.
             messages.set(Vec::new());
             in_flight.set(None);
             sending.set(false);
@@ -229,7 +340,7 @@ fn time_ago(iso: &str) -> String {
     // `Date::new` with an unparseable string produces NaN for `getTime()`.
     let then_ms = then.get_time();
     if then_ms.is_nan() {
-        return iso.to_string();
+        return "(unknown)".to_string();
     }
 
     let now_ms = js_sys::Date::now();
@@ -266,8 +377,10 @@ pub fn App() -> impl IntoView {
     let messages: RwSignal<Vec<ChatMessage>> = RwSignal::new(Vec::new());
     let next_id: RwSignal<u32> = RwSignal::new(0);
     let input_text: RwSignal<String> = RwSignal::new(String::new());
-    // True while an assistant reply is being streamed.
+    // True while an assistant reply is being streamed (live prompt).
     let sending: RwSignal<bool> = RwSignal::new(false);
+    // True while a session's history is being replayed.
+    let replaying: RwSignal<bool> = RwSignal::new(false);
     // The assistant message currently receiving tokens, if any.
     let in_flight: RwSignal<Option<ChatMessage>> = RwSignal::new(None);
     // Session sidebar state.
@@ -282,7 +395,9 @@ pub fn App() -> impl IntoView {
                 event,
                 in_flight,
                 sending,
+                replaying,
                 messages,
+                next_id,
                 sessions,
                 active_session_id,
             );
@@ -299,7 +414,7 @@ pub fn App() -> impl IntoView {
     // Submit the current input as a user message.
     let submit = move || {
         let text = input_text.get_untracked().trim().to_string();
-        if text.is_empty() || sending.get_untracked() {
+        if text.is_empty() || sending.get_untracked() || replaying.get_untracked() {
             return;
         }
 
@@ -318,6 +433,9 @@ pub fn App() -> impl IntoView {
         bridge::send(&text);
     };
 
+    // Whether input should be disabled.
+    let input_disabled = move || sending.get() || replaying.get();
+
     view! {
         <div class="gander-root">
             <Sidebar sessions active_session_id />
@@ -327,8 +445,11 @@ pub fn App() -> impl IntoView {
                     <textarea
                         class="input-box"
                         rows="3"
-                        placeholder="Message…"
+                        placeholder=move || {
+                            if replaying.get() { "Loading session…" } else { "Message…" }
+                        }
                         prop:value=input_text
+                        prop:disabled=input_disabled
                         on:input=move |ev| {
                             let el: web_sys::HtmlTextAreaElement =
                                 ev.target().unwrap().unchecked_into();
@@ -344,7 +465,7 @@ pub fn App() -> impl IntoView {
                     />
                     <button
                         class="send-btn"
-                        disabled=move || sending.get()
+                        disabled=input_disabled
                         on:click=move |_| submit()
                     >
                         "Send"
@@ -445,7 +566,7 @@ fn MessageList(messages: RwSignal<Vec<ChatMessage>>) -> impl IntoView {
     }
 }
 
-/// A single message bubble (user or assistant).
+/// A single message bubble (user, assistant, or tool).
 ///
 /// The `inner_html` on `.message-content` lets pulldown-cmark HTML land
 /// directly in the DOM.  Content is trusted (local bridge only).
@@ -454,6 +575,7 @@ fn MessageView(message: ChatMessage) -> impl IntoView {
     let role_class = match message.role {
         Role::User => "message message--user",
         Role::Assistant => "message message--assistant",
+        Role::Tool => "message message--tool",
     };
 
     view! {
