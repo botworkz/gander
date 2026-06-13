@@ -33,8 +33,6 @@ profile-config-status = Status
 profile-config-status-locked = locked
 profile-config-status-unlocked = unlocked
 profile-config-parent = Copied from
-profile-config-launch = Launch goose
-profile-config-launch-failed = Failed to launch goose: { $error }
 
 # empty state
 placeholder-no-tab = Click the + button to open a profile.
