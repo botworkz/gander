@@ -149,6 +149,7 @@ window.gander = (function () {
 // gap.
 window.addEventListener('keydown', function (ev) {
     if (!ev.ctrlKey) return;
+    if (ev.repeat) return;
     if (ev.key === 'PageDown') {
         ev.preventDefault();
         window.ipc.postMessage(JSON.stringify({ type: 'tab_nav', dir: 'next' }));
