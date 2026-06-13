@@ -5,7 +5,6 @@ mod app;
 mod config;
 mod i18n;
 mod state;
-mod supervisor;
 mod tab;
 #[cfg(target_os = "linux")]
 mod webview;
