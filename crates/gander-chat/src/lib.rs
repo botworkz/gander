@@ -7,7 +7,7 @@
 //! ```text
 //! App
 //! ├── Sidebar       (session list, "+ New session" button, concertina menu)
-//! │   └── Concertina  (Recipes / Skills / Scheduler / Extensions / Settings)
+//! │   └── Concertina  (Extensions / Settings)
 //! └── ChatPane
 //!     ├── MessageList   (scrollable, one MessageView per message)
 //!     ├── input row     (textarea + Send button)
@@ -619,20 +619,8 @@ struct ConcertinaSection {
     icon: &'static icondata_core::IconData,
 }
 
-/// The five concertina sections shown below the session list.
+/// The concertina sections shown below the session list.
 const CONCERTINA_SECTIONS: &[ConcertinaSection] = &[
-    ConcertinaSection {
-        label: "Recipes",
-        icon: icondata::LuBookOpen,
-    },
-    ConcertinaSection {
-        label: "Skills",
-        icon: icondata::LuZap,
-    },
-    ConcertinaSection {
-        label: "Scheduler",
-        icon: icondata::LuClock,
-    },
     ConcertinaSection {
         label: "Extensions",
         icon: icondata::LuPuzzle,
