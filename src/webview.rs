@@ -88,6 +88,22 @@ use wry::{
 
 use crate::acp::AcpCommand;
 
+/// Direction of tab navigation requested from the webview via IPC.
+///
+/// Posted by the `keydown` listener in [`BRIDGE_SCRIPT`] when the user presses
+/// Ctrl+PageUp or Ctrl+PageDown while the webview has keyboard focus.  The app
+/// drains a channel of these values during each [`Message::PumpGtk`] tick and
+/// dispatches the corresponding [`Message::PrevTab`] / [`Message::NextTab`].
+///
+/// [`Message::PumpGtk`]: crate::app::Message::PumpGtk
+/// [`Message::PrevTab`]: crate::app::Message::PrevTab
+/// [`Message::NextTab`]: crate::app::Message::NextTab
+#[derive(Clone, Copy, Debug)]
+pub enum TabNavDir {
+    Prev,
+    Next,
+}
+
 /// Embedded assets from `crates/gander-chat/dist/`.
 ///
 /// Built by `cargo xtask build-chat [--release]` and embedded at compile time
@@ -126,6 +142,22 @@ window.gander = (function () {
         },
     };
 })();
+
+// Forward Ctrl+PageDown / Ctrl+PageUp to the host as tab-navigation IPC
+// messages.  WebKitGTK captures keyboard events when the webview has focus,
+// so they never reach iced's keyboard subscription; this listener bridges the
+// gap.
+window.addEventListener('keydown', function (ev) {
+    if (!ev.ctrlKey) return;
+    if (ev.repeat) return;
+    if (ev.key === 'PageDown') {
+        ev.preventDefault();
+        window.ipc.postMessage(JSON.stringify({ type: 'tab_nav', dir: 'next' }));
+    } else if (ev.key === 'PageUp') {
+        ev.preventDefault();
+        window.ipc.postMessage(JSON.stringify({ type: 'tab_nav', dir: 'prev' }));
+    }
+});
 "#;
 
 /// Coarse pixel height of the COSMIC header + tab strip stack, used **only**
@@ -437,6 +469,8 @@ impl WebviewStore {
 ///
 /// `cmd_tx` is wired into the WebView's IPC handler so that messages from
 /// `window.gander.send(text)` are forwarded to the per-tab `AcpConnection`.
+/// `nav_tx` receives [`TabNavDir`] values when the user presses
+/// Ctrl+PageUp/Down while the webview has keyboard focus.
 ///
 /// # Panics
 ///
@@ -448,6 +482,7 @@ pub fn create_child_webview(
     handle: &impl raw_window_handle::HasWindowHandle,
     initial_bounds: Rect,
     cmd_tx: mpsc::Sender<AcpCommand>,
+    nav_tx: mpsc::Sender<TabNavDir>,
 ) -> bool {
     let tab_id = entity.data().as_ffi();
     let url = build_chat_url(profile, tab_id);
@@ -461,15 +496,28 @@ pub fn create_child_webview(
         .with_ipc_handler(move |request: wry::http::Request<String>| {
             let body = request.body();
             match serde_json::from_str::<serde_json::Value>(body) {
-                Ok(json) => {
-                    if json.get("type").and_then(|v| v.as_str()) == Some("prompt") {
+                Ok(json) => match json.get("type").and_then(|v| v.as_str()) {
+                    Some("prompt") => {
                         if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
                             if let Err(err) = cmd_tx.try_send(AcpCommand::Prompt(text.to_owned())) {
                                 tracing::warn!(%err, "ipc handler: failed to send prompt");
                             }
                         }
                     }
-                }
+                    Some("tab_nav") => {
+                        let dir = match json.get("dir").and_then(|v| v.as_str()) {
+                            Some("next") => Some(TabNavDir::Next),
+                            Some("prev") => Some(TabNavDir::Prev),
+                            _ => None,
+                        };
+                        if let Some(dir) = dir {
+                            if let Err(err) = nav_tx.try_send(dir) {
+                                tracing::warn!(%err, "ipc handler: failed to send tab_nav");
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 Err(err) => {
                     tracing::warn!(%err, "ipc handler: invalid JSON from webview");
                 }

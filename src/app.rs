@@ -150,6 +150,13 @@ pub struct AppModel {
     /// until both `main_window_id` and `tab_body_bounds` are known.
     #[cfg(target_os = "linux")]
     pending_webviews: Vec<(segmented_button::Entity, String)>,
+    /// Sender cloned into each tab's webview IPC handler so that
+    /// Ctrl+PageUp/Down keypresses from inside the webview reach the app.
+    /// The receiver is drained on every [`Message::PumpGtk`] tick.
+    #[cfg(target_os = "linux")]
+    webview_nav_tx: tokio::sync::mpsc::Sender<webview::TabNavDir>,
+    #[cfg(target_os = "linux")]
+    webview_nav_rx: tokio::sync::mpsc::Receiver<webview::TabNavDir>,
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +272,9 @@ impl cosmic::Application for AppModel {
                 Err(_) => (None, Config::default()),
             };
 
+        #[cfg(target_os = "linux")]
+        let (webview_nav_tx, webview_nav_rx) = tokio::sync::mpsc::channel::<webview::TabNavDir>(16);
+
         let about = About::default()
             .name(fl!("app-title"))
             .version(env!("CARGO_PKG_VERSION"))
@@ -300,6 +310,10 @@ impl cosmic::Application for AppModel {
             tab_body_bounds: None,
             #[cfg(target_os = "linux")]
             pending_webviews: Vec::new(),
+            #[cfg(target_os = "linux")]
+            webview_nav_tx,
+            #[cfg(target_os = "linux")]
+            webview_nav_rx,
         };
 
         // Restore tabs from persisted state. Profiles whose names are in
@@ -754,6 +768,15 @@ impl cosmic::Application for AppModel {
                             self.webview_store.evaluate_script(*entity, &js);
                         }
                     }
+                    // Forward tab-navigation keypresses that originated inside
+                    // a webview (Ctrl+PageUp / Ctrl+PageDown posted via IPC).
+                    if let Ok(dir) = self.webview_nav_rx.try_recv() {
+                        let msg = match dir {
+                            webview::TabNavDir::Prev => Message::PrevTab,
+                            webview::TabNavDir::Next => Message::NextTab,
+                        };
+                        return self.update(msg);
+                    }
                 }
             }
 
@@ -841,9 +864,10 @@ impl cosmic::Application for AppModel {
             .map(|(_, u)| Message::TabBodyRect(u));
 
         // Keyboard shortcut: Ctrl+PageUp / Ctrl+PageDown to cycle tabs.
-        // iced's keyboard subscription fires even when a child webview has
-        // focus (on X11, iced sees keys before WebKitGTK does), so this works
-        // whether the header or the chat input is focused.
+        // This subscription fires when iced/COSMIC header widgets hold keyboard
+        // focus.  When a webview has focus, WebKitGTK captures the keys before
+        // iced sees them; the keydown listener injected via BRIDGE_SCRIPT posts
+        // them back as IPC messages instead (drained in PumpGtk).
         let key_sub = cosmic::iced::keyboard::listen().filter_map(|event| {
             use cosmic::iced::keyboard::Event as KbEvent;
             match event {
@@ -888,6 +912,7 @@ fn build_webview_task_inner(
     width: f64,
     height: f64,
     cmd_tx: tokio::sync::mpsc::Sender<AcpCommand>,
+    nav_tx: tokio::sync::mpsc::Sender<webview::TabNavDir>,
 ) -> Task<cosmic::Action<Message>> {
     let s = webview::display_scale();
     let initial_bounds = WryRect {
@@ -895,7 +920,7 @@ fn build_webview_task_inner(
         size: LogicalSize::new((width * s).max(1.0), (height * s).max(1.0)).into(),
     };
     cosmic::iced::window::run_with_handle(window_id, move |handle| {
-        webview::create_child_webview(entity, &profile, &handle, initial_bounds, cmd_tx);
+        webview::create_child_webview(entity, &profile, &handle, initial_bounds, cmd_tx, nav_tx);
         cosmic::Action::App(Message::WebviewReady(entity))
     })
 }
@@ -951,9 +976,19 @@ impl AppModel {
         // Create the command channel upfront so the IPC handler (installed at
         // webview-creation time) and the ACP task both get the right ends.
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<AcpCommand>(64);
+        let nav_tx = self.webview_nav_tx.clone();
 
-        let wv_task =
-            build_webview_task_inner(entity, profile.clone(), window_id, x, y, w, h, cmd_tx);
+        let wv_task = build_webview_task_inner(
+            entity,
+            profile.clone(),
+            window_id,
+            x,
+            y,
+            w,
+            h,
+            cmd_tx,
+            nav_tx,
+        );
 
         let inbox = Arc::clone(&self.acp_inbox);
         let acp_task = Task::perform(
