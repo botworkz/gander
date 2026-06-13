@@ -102,15 +102,18 @@ struct ChatAssets;
 ///
 /// Satisfies the bridge contract documented in `crates/gander-chat/src/bridge.rs`.
 /// `send` posts a JSON-encoded `{type:"prompt",text:...}` message to the
-/// native IPC handler. `subscribe` wires up the subscriber list.
-/// `_publish` is called by gander (via `evaluate_script`) to fan events out
-/// to all registered subscribers.
+/// native IPC handler. `post` posts an arbitrary JSON message. `subscribe`
+/// wires up the subscriber list. `_publish` is called by gander (via
+/// `evaluate_script`) to fan events out to all registered subscribers.
 const BRIDGE_SCRIPT: &str = r#"
 window.gander = (function () {
     const subscribers = [];
     return {
         send: function (text) {
             window.ipc.postMessage(JSON.stringify({ type: 'prompt', text: text }));
+        },
+        post: function (message) {
+            window.ipc.postMessage(JSON.stringify(message));
         },
         subscribe: function (cb) {
             subscribers.push(cb);
@@ -461,15 +464,35 @@ pub fn create_child_webview(
         .with_ipc_handler(move |request: wry::http::Request<String>| {
             let body = request.body();
             match serde_json::from_str::<serde_json::Value>(body) {
-                Ok(json) => {
-                    if json.get("type").and_then(|v| v.as_str()) == Some("prompt") {
+                Ok(json) => match json.get("type").and_then(|v| v.as_str()) {
+                    Some("prompt") => {
                         if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
                             if let Err(err) = cmd_tx.try_send(AcpCommand::Prompt(text.to_owned())) {
                                 tracing::warn!(%err, "ipc handler: failed to send prompt");
                             }
                         }
                     }
-                }
+                    Some("session_select") => {
+                        if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
+                            if let Err(err) =
+                                cmd_tx.try_send(AcpCommand::SessionSelect(id.to_owned()))
+                            {
+                                tracing::warn!(%err, "ipc handler: failed to send session_select");
+                            }
+                        }
+                    }
+                    Some("session_new") => {
+                        if let Err(err) = cmd_tx.try_send(AcpCommand::SessionNew) {
+                            tracing::warn!(%err, "ipc handler: failed to send session_new");
+                        }
+                    }
+                    Some("ready") => {
+                        if let Err(err) = cmd_tx.try_send(AcpCommand::RequestSessionInfo) {
+                            tracing::warn!(%err, "ipc handler: failed to send ready");
+                        }
+                    }
+                    _ => {}
+                },
                 Err(err) => {
                     tracing::warn!(%err, "ipc handler: invalid JSON from webview");
                 }
