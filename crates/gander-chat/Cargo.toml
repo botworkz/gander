@@ -33,3 +33,4 @@ pulldown-cmark = { version = "0.9", default-features = false }
 console_error_panic_hook = "0.1"
 leptos_icons = "0.7.1"
 icondata = "0.7.0"
+icondata_core = "0.1.0"
