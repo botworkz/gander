@@ -2,12 +2,13 @@
 
 //! JS bridge bindings to `window.gander`.
 //!
-//! The host (gander binary) must expose a `window.gander` object with two
+//! The host (gander binary) must expose a `window.gander` object with three
 //! methods before the WASM module is instantiated:
 //!
 //! ```js
 //! window.gander = {
 //!   send(text)          // queue a user message; starts streaming events
+//!   post(message)       // post an arbitrary JSON message to the host
 //!   subscribe(callback) // register one event-receiver callback
 //! }
 //! ```
@@ -59,6 +60,33 @@ pub fn send(text: &str) {
         .expect("window.gander.send must be a function; ensure the host initializes the bridge before WASM loads");
 
     let _ = send_fn.call1(&gander, &JsValue::from_str(text));
+}
+
+/// Call `window.gander.post(json_str)` with an arbitrary JSON-encoded message.
+///
+/// Used for session control messages (`session_select`, `session_new`, `ready`)
+/// that are not user prompts.  The string must be valid JSON; it is passed
+/// verbatim to the native IPC handler.
+///
+/// No-ops (with a console warning) if `window.gander` is not present.
+pub fn post_json(json: &str) {
+    let Some(gander) = get_gander() else {
+        web_sys::console::warn_1(&JsValue::from_str(
+            "gander-chat: window.gander is not available; post_json() is a no-op",
+        ));
+        return;
+    };
+
+    // Parse the JSON string into a JS value so gander's `post` handler gets
+    // a plain object rather than a string.
+    let value = js_sys::JSON::parse(json).unwrap_or(JsValue::UNDEFINED);
+
+    let post_fn: Function = js_sys::Reflect::get(&gander, &JsValue::from_str("post"))
+        .ok()
+        .and_then(|v| v.dyn_into::<Function>().ok())
+        .expect("window.gander.post must be a function; ensure the host initializes the bridge before WASM loads");
+
+    let _ = post_fn.call1(&gander, &value);
 }
 
 /// Call `window.gander.subscribe(callback)`.

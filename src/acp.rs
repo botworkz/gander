@@ -23,8 +23,8 @@ use std::{env, path::PathBuf};
 use agent_client_protocol::{
     ByteStreams, SessionMessage,
     schema::{
-        ContentBlock, InitializeRequest, ProtocolVersion, SessionNotification, SessionUpdate,
-        StopReason,
+        ContentBlock, InitializeRequest, ListSessionsRequest, NewSessionResponse, ProtocolVersion,
+        ResumeSessionRequest, SessionId, SessionNotification, SessionUpdate, StopReason,
     },
     util::MatchDispatch,
 };
@@ -58,6 +58,17 @@ pub struct AcpConnection {
     _task: JoinHandle<()>,
 }
 
+/// A trimmed-down session descriptor for the sidebar.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ListedSession {
+    /// Goose session ID.
+    pub id: String,
+    /// Human-readable label (title from goose, or `"Session"` as fallback).
+    pub label: String,
+    /// ISO 8601 `updated_at` from `session/list`, if reported by the agent.
+    pub last_active: Option<String>,
+}
+
 /// Events sent from the ACP background task to the GTK pump.
 #[derive(Debug)]
 pub enum AcpEvent {
@@ -68,6 +79,16 @@ pub enum AcpEvent {
     Complete(StopReason),
     /// An error mid-conversation; the tab enters a disconnected state.
     Error(String),
+    /// Up to 5 most-recently-active sessions for this profile.
+    ///
+    /// Sent once on connect (after the initial session is established) and
+    /// again after a `session_new` command creates a fresh session.
+    SessionList(Vec<ListedSession>),
+    /// The active session has been established or switched.
+    ///
+    /// The `String` is the session ID. History is not replayed —
+    /// `session/resume` in ACP v1 does not return prior messages.
+    SessionActive(String),
 }
 
 /// Commands sent from the UI/IPC handler to the ACP background task.
@@ -78,6 +99,12 @@ pub enum AcpCommand {
     /// Close the connection cleanly.
     #[allow(dead_code)]
     Shutdown,
+    /// Switch the active session to an existing session by ID.
+    SessionSelect(String),
+    /// Create a brand-new session and make it active.
+    SessionNew,
+    /// The webview bridge is ready; re-emit the session list and active ID.
+    RequestSessionInfo,
 }
 
 /// Errors that can occur during handshake.
@@ -226,6 +253,45 @@ async fn do_handshake(profile: &str) -> Result<UnixStream, ConnectError> {
 // Worker task
 // ---------------------------------------------------------------------------
 
+/// Retrieve up to 5 most-recently-active sessions from `session/list`.
+///
+/// Errors from the call are swallowed — an empty list is the safe fallback.
+async fn fetch_top_sessions<R: agent_client_protocol::role::Role>(
+    cx: &agent_client_protocol::ConnectionTo<R>,
+) -> Vec<ListedSession>
+where
+    R: agent_client_protocol::role::HasPeer<R>,
+{
+    let response = match cx
+        .send_request(ListSessionsRequest::new())
+        .block_task()
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(%err, "session/list failed; starting fresh");
+            return Vec::new();
+        }
+    };
+
+    let mut sessions = response.sessions;
+    // Sort most-recently-active first (ISO 8601 sorts lexicographically).
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions.truncate(5);
+
+    sessions
+        .into_iter()
+        .map(|s| ListedSession {
+            label: s
+                .title
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "Session".to_string()),
+            id: s.session_id.to_string(),
+            last_active: s.updated_at,
+        })
+        .collect()
+}
+
 async fn run_worker(
     stream: UnixStream,
     mut cmd_rx: mpsc::Receiver<AcpCommand>,
@@ -246,60 +312,167 @@ async fn run_worker(
                 .block_task()
                 .await?;
 
-            let mut session = cx.build_session_cwd()?.block_task().start_session().await?;
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+
+            // --- Session bootstrap -------------------------------------------
+            // List existing sessions (silently falls back to empty on error).
+            let listed = fetch_top_sessions(&cx).await;
+
+            // Resume the most-recent session, or create a fresh one.
+            let mut active_id: String;
+            let mut current_session = if let Some(first) = listed.first() {
+                let sid = SessionId::new(first.id.clone());
+                match cx
+                    .send_request(ResumeSessionRequest::new(sid.clone(), cwd.clone()))
+                    .block_task()
+                    .await
+                {
+                    Ok(_) => {
+                        active_id = first.id.clone();
+                        cx.attach_session(NewSessionResponse::new(sid), vec![])?
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "session/resume failed; creating new session");
+                        let s = cx.build_session_cwd()?.block_task().start_session().await?;
+                        active_id = s.session_id().to_string();
+                        s
+                    }
+                }
+            } else {
+                let s = cx.build_session_cwd()?.block_task().start_session().await?;
+                active_id = s.session_id().to_string();
+                s
+            };
 
             // Signal the connect() caller that we are ready.
             if let Some(tx) = ready_tx_opt.take() {
                 let _ = tx.send(Ok(()));
             }
 
+            // Cache the initial session list so RequestSessionInfo can re-send it.
+            let mut cached_listed = listed;
+
             while let Some(cmd) = cmd_rx.recv().await {
-                let text = match cmd {
-                    AcpCommand::Prompt(text) => text,
-                    AcpCommand::Shutdown => break,
-                };
-
-                if let Err(error) = session.send_prompt(&text) {
-                    let _ = evt_tx_clone.send(AcpEvent::Error(error.to_string())).await;
-                    continue;
-                }
-
-                // Drain events for this prompt.
-                loop {
-                    let update = match session.read_update().await {
-                        Ok(update) => update,
-                        Err(error) => {
+                match cmd {
+                    AcpCommand::Prompt(text) => {
+                        if let Err(error) = current_session.send_prompt(&text) {
                             let _ = evt_tx_clone.send(AcpEvent::Error(error.to_string())).await;
-                            break;
+                            continue;
                         }
-                    };
 
-                    match update {
-                        SessionMessage::SessionMessage(dispatch) => {
-                            let tx = evt_tx_clone.clone();
-                            let handled = MatchDispatch::new(dispatch)
-                                .if_notification(async move |n: SessionNotification| {
-                                    if let SessionUpdate::AgentMessageChunk(chunk) = n.update {
-                                        if let ContentBlock::Text(text) = chunk.content {
-                                            let _ = tx.send(AcpEvent::TextChunk(text.text)).await;
-                                        }
+                        // Drain events for this prompt.
+                        loop {
+                            let update = match current_session.read_update().await {
+                                Ok(update) => update,
+                                Err(error) => {
+                                    let _ =
+                                        evt_tx_clone.send(AcpEvent::Error(error.to_string())).await;
+                                    break;
+                                }
+                            };
+
+                            match update {
+                                SessionMessage::SessionMessage(dispatch) => {
+                                    let tx = evt_tx_clone.clone();
+                                    let handled = MatchDispatch::new(dispatch)
+                                        .if_notification(async move |n: SessionNotification| {
+                                            if let SessionUpdate::AgentMessageChunk(chunk) =
+                                                n.update
+                                            {
+                                                if let ContentBlock::Text(text) = chunk.content {
+                                                    let _ = tx
+                                                        .send(AcpEvent::TextChunk(text.text))
+                                                        .await;
+                                                }
+                                            }
+                                            Ok(())
+                                        })
+                                        .await
+                                        .otherwise_ignore();
+
+                                    if let Err(error) = handled {
+                                        let _ = evt_tx_clone
+                                            .send(AcpEvent::Error(error.to_string()))
+                                            .await;
+                                        break;
                                     }
-                                    Ok(())
-                                })
-                                .await
-                                .otherwise_ignore();
-
-                            if let Err(error) = handled {
-                                let _ = evt_tx_clone.send(AcpEvent::Error(error.to_string())).await;
-                                break;
+                                }
+                                SessionMessage::StopReason(stop_reason) => {
+                                    let _ =
+                                        evt_tx_clone.send(AcpEvent::Complete(stop_reason)).await;
+                                    break;
+                                }
+                                _ => {}
                             }
                         }
-                        SessionMessage::StopReason(stop_reason) => {
-                            let _ = evt_tx_clone.send(AcpEvent::Complete(stop_reason)).await;
-                            break;
-                        }
-                        _ => {}
                     }
+
+                    AcpCommand::SessionSelect(id) => {
+                        let sid = SessionId::new(id.clone());
+                        match cx
+                            .send_request(ResumeSessionRequest::new(sid.clone(), cwd.clone()))
+                            .block_task()
+                            .await
+                        {
+                            Ok(_) => {
+                                match cx.attach_session(NewSessionResponse::new(sid), vec![]) {
+                                    Ok(s) => {
+                                        current_session = s;
+                                        active_id = id.clone();
+                                        let _ =
+                                            evt_tx_clone.send(AcpEvent::SessionActive(id)).await;
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(%err, "attach_session failed after resume");
+                                        let _ = evt_tx_clone
+                                            .send(AcpEvent::Error(format!(
+                                                "session switch failed: {err}"
+                                            )))
+                                            .await;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(%err, "session/resume failed");
+                                let _ = evt_tx_clone
+                                    .send(AcpEvent::Error(format!("session/resume failed: {err}")))
+                                    .await;
+                            }
+                        }
+                    }
+
+                    AcpCommand::SessionNew => {
+                        match cx.build_session_cwd()?.block_task().start_session().await {
+                            Ok(s) => {
+                                active_id = s.session_id().to_string();
+                                current_session = s;
+                                // Refresh the list so the new session appears.
+                                cached_listed = fetch_top_sessions(&cx).await;
+                                let _ = evt_tx_clone
+                                    .send(AcpEvent::SessionList(cached_listed.clone()))
+                                    .await;
+                                let _ = evt_tx_clone
+                                    .send(AcpEvent::SessionActive(active_id.clone()))
+                                    .await;
+                            }
+                            Err(err) => {
+                                let _ = evt_tx_clone
+                                    .send(AcpEvent::Error(format!("session/new failed: {err}")))
+                                    .await;
+                            }
+                        }
+                    }
+
+                    AcpCommand::RequestSessionInfo => {
+                        let _ = evt_tx_clone
+                            .send(AcpEvent::SessionList(cached_listed.clone()))
+                            .await;
+                        let _ = evt_tx_clone
+                            .send(AcpEvent::SessionActive(active_id.clone()))
+                            .await;
+                    }
+
+                    AcpCommand::Shutdown => break,
                 }
             }
 
@@ -308,12 +481,6 @@ async fn run_worker(
         .await;
 
     if let Err(error) = result {
-        // If the error occurred before `ready_tx_opt` was consumed inside the
-        // closure, the oneshot sender is dropped here (along with the closure),
-        // and `ready_rx.await` in `connect()`/`connect_with_rx()` returns
-        // `Err(RecvError)` — the callers map that to `ConnectError::Protocol`.
-        // If the error occurred mid-session (after "ready" was already sent),
-        // forward it to the UI as an `AcpEvent::Error`.
         let _ = evt_tx.send(AcpEvent::Error(error.to_string())).await;
     }
 }

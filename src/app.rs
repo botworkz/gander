@@ -888,6 +888,19 @@ fn acp_event_to_js(event: &AcpEvent) -> String {
                 json_str(msg)
             )
         }
+        AcpEvent::SessionList(sessions) => {
+            let sessions_json = serde_json::to_string(sessions).unwrap_or_else(|_| "[]".into());
+            format!(
+                "window.gander._publish({{type:'session_list',sessions:{}}})",
+                sessions_json
+            )
+        }
+        AcpEvent::SessionActive(id) => {
+            format!(
+                "window.gander._publish({{type:'session_active',id:{},history:[]}})",
+                json_str(id)
+            )
+        }
     }
 }
 

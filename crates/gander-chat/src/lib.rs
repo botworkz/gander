@@ -6,9 +6,10 @@
 //!
 //! ```
 //! App
-//! ├── MessageList   (scrollable, one MessageView per message)
-//! │   └── MessageView  (user bubble / assistant bubble)
-//! └── input row     (textarea + Send button)
+//! ├── Sidebar       (session list, "+ New session" button)
+//! └── ChatPane
+//!     ├── MessageList   (scrollable, one MessageView per message)
+//!     └── input row     (textarea + Send button)
 //! ```
 //!
 //! All chat state lives in [`App`] as [`leptos::RwSignal`]s.  Because
@@ -26,6 +27,16 @@
 //! 4. Each token calls `msg.content.update(|c| c.push_str(token))`.
 //! 5. Leptos patches only the single changed text node — no vdom diff.
 //! 6. A `{type:"done"}` event marks the message complete.
+//!
+//! ## Session sidebar
+//!
+//! On startup the WASM sends `{type:"ready"}` to the host, which responds
+//! with `{type:"session_list", sessions:[…]}` and
+//! `{type:"session_active", id:"…", history:[]}`.  Clicking a session fires
+//! `session_select`; clicking "+ New session" fires `session_new`.
+//!
+//! Note: `session/resume` in ACP v1 does not replay history, so
+//! `session_active.history` is always `[]` in this version.
 //!
 //! # Entry point
 //!
@@ -89,6 +100,15 @@ impl ChatMessage {
     }
 }
 
+/// A session entry shown in the sidebar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionEntry {
+    pub id: String,
+    pub label: String,
+    /// ISO 8601 `updated_at` from the host, if available.
+    pub last_active: Option<String>,
+}
+
 // ─── Event handling ───────────────────────────────────────────────────────────
 
 /// Dispatch a raw JS bridge event to the appropriate signal update.
@@ -99,6 +119,9 @@ fn handle_bridge_event(
     event: JsValue,
     in_flight: RwSignal<Option<ChatMessage>>,
     sending: RwSignal<bool>,
+    messages: RwSignal<Vec<ChatMessage>>,
+    sessions: RwSignal<Vec<SessionEntry>>,
+    active_session_id: RwSignal<Option<String>>,
 ) {
     let event_type = js_sys::Reflect::get(&event, &JsValue::from_str("type"))
         .ok()
@@ -138,6 +161,50 @@ fn handle_bridge_event(
             sending.set(false);
         }
 
+        Some("session_list") => {
+            let raw_sessions = js_sys::Reflect::get(&event, &JsValue::from_str("sessions"))
+                .ok()
+                .filter(|v| v.is_array())
+                .map(|v| js_sys::Array::from(&v))
+                .unwrap_or_default();
+
+            let mut entries: Vec<SessionEntry> = Vec::new();
+            for i in 0..raw_sessions.length() {
+                let item = raw_sessions.get(i);
+                let id = js_sys::Reflect::get(&item, &JsValue::from_str("id"))
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
+                let label = js_sys::Reflect::get(&item, &JsValue::from_str("label"))
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_else(|| "Session".to_string());
+                let last_active = js_sys::Reflect::get(&item, &JsValue::from_str("last_active"))
+                    .ok()
+                    .and_then(|v| v.as_string());
+                if !id.is_empty() {
+                    entries.push(SessionEntry {
+                        id,
+                        label,
+                        last_active,
+                    });
+                }
+            }
+            sessions.set(entries);
+        }
+
+        Some("session_active") => {
+            let id = js_sys::Reflect::get(&event, &JsValue::from_str("id"))
+                .ok()
+                .and_then(|v| v.as_string());
+            active_session_id.set(id);
+            // Clear chat messages when switching sessions.
+            // History replay is not supported in ACP v1 session/resume.
+            messages.set(Vec::new());
+            in_flight.set(None);
+            sending.set(false);
+        }
+
         _ => {
             // Ignore unrecognised events so future protocol extensions are
             // forwards-compatible.
@@ -145,11 +212,53 @@ fn handle_bridge_event(
     }
 }
 
+// ─── Time-ago formatting ──────────────────────────────────────────────────────
+
+/// Format an ISO 8601 timestamp as a short "time ago" string.
+///
+/// Parses only the date part for simplicity; sub-day precision is not needed.
+fn time_ago(iso: &str) -> String {
+    // Extract just the date prefix (YYYY-MM-DD).
+    let date_part = iso.get(..10).unwrap_or(iso);
+    let parts: Vec<&str> = date_part.split('-').collect();
+    if parts.len() != 3 {
+        return iso.to_string();
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (
+        parts[0].parse::<i32>(),
+        parts[1].parse::<i32>(),
+        parts[2].parse::<i32>(),
+    ) else {
+        return iso.to_string();
+    };
+
+    // Convert to a rough day-count for comparison.
+    let days = y * 365 + m * 30 + d;
+
+    // Current date via JS Date.
+    let now = js_sys::Date::new_0();
+    let now_y = now.get_full_year() as i32;
+    let now_m = now.get_month() as i32 + 1;
+    let now_d = now.get_date() as i32;
+    let now_days = now_y * 365 + now_m * 30 + now_d;
+
+    let diff = now_days - days;
+    match diff {
+        0 => "today".to_string(),
+        1 => "yesterday".to_string(),
+        2..=6 => format!("{diff}d ago"),
+        7..=13 => "1w ago".to_string(),
+        14..=29 => format!("{}w ago", diff / 7),
+        30..=364 => format!("{}mo ago", diff / 30),
+        _ => format!("{}y ago", diff / 365),
+    }
+}
+
 // ─── Components ───────────────────────────────────────────────────────────────
 
 /// Root application component.
 ///
-/// Owns all chat state and wires up the JS bridge subscription.
+/// Owns all chat and session state and wires up the JS bridge subscription.
 #[component]
 pub fn App() -> impl IntoView {
     let messages: RwSignal<Vec<ChatMessage>> = RwSignal::new(Vec::new());
@@ -159,17 +268,31 @@ pub fn App() -> impl IntoView {
     let sending: RwSignal<bool> = RwSignal::new(false);
     // The assistant message currently receiving tokens, if any.
     let in_flight: RwSignal<Option<ChatMessage>> = RwSignal::new(None);
+    // Session sidebar state.
+    let sessions: RwSignal<Vec<SessionEntry>> = RwSignal::new(Vec::new());
+    let active_session_id: RwSignal<Option<String>> = RwSignal::new(None);
 
     // Register the event callback once for the lifetime of the app.
     // The Closure is leaked intentionally — it must outlive the app.
     {
         let cb = Closure::wrap(Box::new(move |event: JsValue| {
-            handle_bridge_event(event, in_flight, sending);
+            handle_bridge_event(
+                event,
+                in_flight,
+                sending,
+                messages,
+                sessions,
+                active_session_id,
+            );
         }) as Box<dyn FnMut(JsValue)>);
 
         bridge::subscribe(cb.as_ref().unchecked_ref());
         cb.forget();
     }
+
+    // Tell the host that the bridge is ready; it will respond with
+    // session_list and session_active so the sidebar populates.
+    bridge::post_json(r#"{"type":"ready"}"#);
 
     // Submit the current input as a user message.
     let submit = move || {
@@ -194,34 +317,104 @@ pub fn App() -> impl IntoView {
     };
 
     view! {
-        <div class="gander-chat">
-            <MessageList messages />
-            <div class="input-row">
-                <textarea
-                    class="input-box"
-                    rows="3"
-                    placeholder="Message…"
-                    prop:value=input_text
-                    on:input=move |ev| {
-                        let el: web_sys::HtmlTextAreaElement =
-                            ev.target().unwrap().unchecked_into();
-                        input_text.set(el.value());
-                    }
-                    on:keydown=move |ev: web_sys::KeyboardEvent| {
-                        // Enter (without Shift) submits; Shift+Enter inserts a newline.
-                        if ev.key() == "Enter" && !ev.shift_key() {
-                            ev.prevent_default();
-                            submit();
+        <div class="gander-root">
+            <Sidebar sessions active_session_id />
+            <div class="gander-chat">
+                <MessageList messages />
+                <div class="input-row">
+                    <textarea
+                        class="input-box"
+                        rows="3"
+                        placeholder="Message…"
+                        prop:value=input_text
+                        on:input=move |ev| {
+                            let el: web_sys::HtmlTextAreaElement =
+                                ev.target().unwrap().unchecked_into();
+                            input_text.set(el.value());
+                        }
+                        on:keydown=move |ev: web_sys::KeyboardEvent| {
+                            // Enter (without Shift) submits; Shift+Enter inserts a newline.
+                            if ev.key() == "Enter" && !ev.shift_key() {
+                                ev.prevent_default();
+                                submit();
+                            }
+                        }
+                    />
+                    <button
+                        class="send-btn"
+                        disabled=move || sending.get()
+                        on:click=move |_| submit()
+                    >
+                        "Send"
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+/// Left-edge session sidebar.
+///
+/// Shows up to 5 sessions, a "+ New session" button, and highlights the
+/// active session.
+#[component]
+fn Sidebar(
+    sessions: RwSignal<Vec<SessionEntry>>,
+    active_session_id: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let on_new = move |_| {
+        bridge::post_json(r#"{"type":"session_new"}"#);
+    };
+
+    view! {
+        <div class="sidebar">
+            <button class="new-session-btn" on:click=on_new>
+                "+ New session"
+            </button>
+            <div class="session-list">
+                <For
+                    each=move || sessions.get()
+                    key=|s| s.id.clone()
+                    children=move |entry| {
+                        let id = entry.id.clone();
+                        let label = entry.label.clone();
+                        let ago = entry
+                            .last_active
+                            .as_deref()
+                            .map(time_ago)
+                            .unwrap_or_default();
+                        let id_for_click = id.clone();
+                        let is_active = move || {
+                            active_session_id
+                                .get()
+                                .as_deref()
+                                .map(|a| a == id.as_str())
+                                .unwrap_or(false)
+                        };
+                        let on_click = move |_| {
+                            let msg = format!(
+                                "{{\"type\":\"session_select\",\"id\":\"{}\"}}",
+                                id_for_click.replace('"', "\\\"")
+                            );
+                            bridge::post_json(&msg);
+                        };
+                        view! {
+                            <button
+                                class=move || {
+                                    if is_active() {
+                                        "session-item session-item--active"
+                                    } else {
+                                        "session-item"
+                                    }
+                                }
+                                on:click=on_click
+                            >
+                                <span class="session-label">{label}</span>
+                                <span class="session-ago">{ago}</span>
+                            </button>
                         }
                     }
                 />
-                <button
-                    class="send-btn"
-                    disabled=move || sending.get()
-                    on:click=move |_| submit()
-                >
-                    "Send"
-                </button>
             </div>
         </div>
     }
