@@ -276,7 +276,7 @@
       }
 
       var _subscriber = null;
-      var _activeSesionId = "mock-session-1";
+      var _activeSessionId = "mock-session-1";
 
       var MOCK_SESSIONS = [
         { id: "mock-session-1", label: "Session 1", last_active: new Date(Date.now() - 5 * 60 * 1000).toISOString() },
@@ -320,12 +320,12 @@
           // Respond to the WASM startup handshake with mock session data.
           setTimeout(function () {
             fireEvent({ type: "session_list", sessions: MOCK_SESSIONS });
-            fireEvent({ type: "session_active", id: _activeSesionId, history: [] });
+            fireEvent({ type: "session_active", id: _activeSessionId, history: [] });
           }, 50);
         } else if (type === "session_select") {
           var id = message.id;
           console.log("[mock gander] session_select:", id);
-          _activeSesionId = id;
+          _activeSessionId = id;
           fireEvent({ type: "session_active", id: id, history: [] });
         } else if (type === "session_new") {
           console.log("[mock gander] session_new");
@@ -336,7 +336,7 @@
             last_active: new Date().toISOString(),
           };
           MOCK_SESSIONS.unshift(newEntry);
-          _activeSesionId = newId;
+          _activeSessionId = newId;
           fireEvent({ type: "session_list", sessions: MOCK_SESSIONS.slice(0, 5) });
           fireEvent({ type: "session_active", id: newId, history: [] });
         } else {

@@ -285,6 +285,7 @@ where
             label: s
                 .title
                 .filter(|t| !t.is_empty())
+                // Keep in sync with DEFAULT_SESSION_LABEL in crates/gander-chat/src/lib.rs.
                 .unwrap_or_else(|| "Session".to_string()),
             id: s.session_id.to_string(),
             last_active: s.updated_at,

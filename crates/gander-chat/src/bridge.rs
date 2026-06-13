@@ -89,7 +89,28 @@ pub fn post_json(json: &str) {
     let _ = post_fn.call1(&gander, &value);
 }
 
-/// Call `window.gander.subscribe(callback)`.
+/// Call `window.gander.post(val)` with a pre-built JS value.
+///
+/// Use this when the message object has already been constructed (e.g. via
+/// `js_sys::Reflect`) so no JSON round-trip is needed.
+///
+/// No-ops (with a console warning) if `window.gander` is not present.
+pub fn post_value(val: JsValue) {
+    let Some(gander) = get_gander() else {
+        web_sys::console::warn_1(&JsValue::from_str(
+            "gander-chat: window.gander is not available; post_value() is a no-op",
+        ));
+        return;
+    };
+
+    let post_fn: Function = js_sys::Reflect::get(&gander, &JsValue::from_str("post"))
+        .ok()
+        .and_then(|v| v.dyn_into::<Function>().ok())
+        .expect("window.gander.post must be a function; ensure the host initializes the bridge before WASM loads");
+
+    let _ = post_fn.call1(&gander, &val);
+}
+
 ///
 /// Registers `callback` as the receiver of streaming events.  Only one
 /// callback is active at a time; a second call replaces the first.

@@ -49,6 +49,12 @@ use wasm_bindgen::prelude::*;
 pub mod bridge;
 pub mod markdown;
 
+/// Fallback label used when a session has no title.
+///
+/// Must match `ListedSession`'s fallback in `src/acp.rs` (different crate —
+/// keep both in sync if this string ever changes).
+const DEFAULT_SESSION_LABEL: &str = "Session";
+
 // ─── Data model ──────────────────────────────────────────────────────────────
 
 /// Whether a message was written by the user or the assistant.
@@ -178,7 +184,7 @@ fn handle_bridge_event(
                 let label = js_sys::Reflect::get(&item, &JsValue::from_str("label"))
                     .ok()
                     .and_then(|v| v.as_string())
-                    .unwrap_or_else(|| "Session".to_string());
+                    .unwrap_or_else(|| DEFAULT_SESSION_LABEL.to_string());
                 let last_active = js_sys::Reflect::get(&item, &JsValue::from_str("last_active"))
                     .ok()
                     .and_then(|v| v.as_string());
@@ -216,41 +222,37 @@ fn handle_bridge_event(
 
 /// Format an ISO 8601 timestamp as a short "time ago" string.
 ///
-/// Parses only the date part for simplicity; sub-day precision is not needed.
+/// Uses `js_sys::Date` to parse the timestamp and compute the elapsed days
+/// accurately, including correct handling of variable-length months.
 fn time_ago(iso: &str) -> String {
-    // Extract just the date prefix (YYYY-MM-DD).
-    let date_part = iso.get(..10).unwrap_or(iso);
-    let parts: Vec<&str> = date_part.split('-').collect();
-    if parts.len() != 3 {
+    let then = js_sys::Date::new(&JsValue::from_str(iso));
+    // `Date::new` with an unparseable string produces NaN for `getTime()`.
+    let then_ms = then.get_time();
+    if then_ms.is_nan() {
         return iso.to_string();
     }
-    let (Ok(y), Ok(m), Ok(d)) = (
-        parts[0].parse::<i32>(),
-        parts[1].parse::<i32>(),
-        parts[2].parse::<i32>(),
-    ) else {
-        return iso.to_string();
-    };
 
-    // Convert to a rough day-count for comparison.
-    let days = y * 365 + m * 30 + d;
+    let now_ms = js_sys::Date::now();
+    let diff_ms = now_ms - then_ms;
+    if diff_ms < 0.0 {
+        return "just now".to_string();
+    }
 
-    // Current date via JS Date.
-    let now = js_sys::Date::new_0();
-    let now_y = now.get_full_year() as i32;
-    let now_m = now.get_month() as i32 + 1;
-    let now_d = now.get_date() as i32;
-    let now_days = now_y * 365 + now_m * 30 + now_d;
+    let diff_mins = (diff_ms / 60_000.0) as u64;
+    let diff_hours = diff_mins / 60;
+    let diff_days = diff_hours / 24;
 
-    let diff = now_days - days;
-    match diff {
-        0 => "today".to_string(),
-        1 => "yesterday".to_string(),
-        2..=6 => format!("{diff}d ago"),
-        7..=13 => "1w ago".to_string(),
-        14..=29 => format!("{}w ago", diff / 7),
-        30..=364 => format!("{}mo ago", diff / 30),
-        _ => format!("{}y ago", diff / 365),
+    match diff_mins {
+        0..=1 => "just now".to_string(),
+        2..=59 => format!("{diff_mins}m ago"),
+        60..=119 => "1h ago".to_string(),
+        _ if diff_hours < 24 => format!("{diff_hours}h ago"),
+        _ if diff_days == 1 => "yesterday".to_string(),
+        _ if diff_days < 7 => format!("{diff_days}d ago"),
+        _ if diff_days < 14 => "1w ago".to_string(),
+        _ if diff_days < 30 => format!("{}w ago", diff_days / 7),
+        _ if diff_days < 365 => format!("{}mo ago", diff_days / 30),
+        _ => format!("{}y ago", diff_days / 365),
     }
 }
 
@@ -392,11 +394,20 @@ fn Sidebar(
                                 .unwrap_or(false)
                         };
                         let on_click = move |_| {
-                            let msg = format!(
-                                "{{\"type\":\"session_select\",\"id\":\"{}\"}}",
-                                id_for_click.replace('"', "\\\"")
+                            // Build the message as a proper JS object to avoid
+                            // manual JSON escaping and potential injection.
+                            let obj = js_sys::Object::new();
+                            let _ = js_sys::Reflect::set(
+                                &obj,
+                                &JsValue::from_str("type"),
+                                &JsValue::from_str("session_select"),
                             );
-                            bridge::post_json(&msg);
+                            let _ = js_sys::Reflect::set(
+                                &obj,
+                                &JsValue::from_str("id"),
+                                &JsValue::from_str(&id_for_click),
+                            );
+                            bridge::post_value(obj.into());
                         };
                         view! {
                             <button
