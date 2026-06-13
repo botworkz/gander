@@ -11,8 +11,8 @@
   -->
   
 <script type="module">
-import init, * as bindings from '/gander-chat-77a34c4a228b27d8.js';
-const wasm = await init({ module_or_path: '/gander-chat-77a34c4a228b27d8_bg.wasm' });
+import init, * as bindings from '/gander-chat-8e9a70020601a43b.js';
+const wasm = await init({ module_or_path: '/gander-chat-8e9a70020601a43b_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -405,6 +405,111 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     .footer-btn:hover {
       color: #b0b0d0;
     }
+
+    /* ── tool call card ──────────────────────────────────────────── */
+
+    /* Override the generic .message padding so the card controls its own */
+    .tool-call-card {
+      padding: 0;
+      border-radius: 8px;
+      background: #16162a;
+      border: 1px solid #282838;
+    }
+
+    /* Full-width clickable header — no browser button chrome */
+    .tool-call-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      background: transparent;
+      border: none;
+      box-shadow: none;
+      color: inherit;
+      font-family: inherit;
+      font-size: inherit;
+      text-align: left;
+      cursor: pointer;
+      padding: 8px 12px;
+      border-radius: 8px;
+    }
+
+    .tool-call-header:hover {
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    /* Title takes all remaining space, clips with ellipsis */
+    .tool-call-title {
+      flex: 1;
+      font-weight: 500;
+      color: #b0b0d0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Status badge: small, muted; ✓ and ✗ get their own tint */
+    .tool-call-status {
+      flex-shrink: 0;
+      font-size: 0.78rem;
+      color: #8888a8;
+    }
+
+    /* ✓ completed */
+    .tool-call-status:not(:empty) {
+      color: #8888a8;
+    }
+
+    /* Chevron rotates when the body is open */
+    .tool-call-chevron {
+      display: flex;
+      align-items: center;
+      flex-shrink: 0;
+      color: #8888a8;
+      transition: transform 0.15s ease;
+    }
+
+    .tool-call-chevron--open {
+      transform: rotate(90deg);
+    }
+
+    /* Expanded body, separated from header by a thin border */
+    .tool-call-body {
+      border-top: 1px solid #282838;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .tool-call-section {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    /* "Input" / "Output" label above each pre block */
+    .tool-call-section-label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: #8888a8;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    /* Monospace pre block with subtle background tint */
+    .tool-call-pre {
+      margin: 0;
+      padding: 8px 10px;
+      background: #0e0e1f;
+      border-radius: 6px;
+      font-family: ui-monospace, monospace;
+      font-size: 0.82rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #c0c0d8;
+      overflow-x: auto;
+    }
   </style>
 
   <script>
@@ -460,18 +565,52 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
           "}\n" +
           "```";
 
-        // Split into word-like tokens and drip them out 50 ms apart.
+        // Fire two tool calls before the text reply arrives, each going
+        // through pending → in_progress → completed so the card lifecycle
+        // can be exercised in dev without a live goose process.
+        var toolSequence = [
+          // Tool A: pending
+          { delay: 100, call: { toolCallId: "tc-mock-1", title: "list_dir",   status: "pending" } },
+          // Tool B: pending
+          { delay: 200, call: { toolCallId: "tc-mock-2", title: "show_panel", status: "pending" } },
+          // Tool A: in_progress
+          { delay: 400, call: { toolCallId: "tc-mock-1", title: "list_dir",   status: "in_progress" } },
+          // Tool B: in_progress
+          { delay: 500, call: { toolCallId: "tc-mock-2", title: "show_panel", status: "in_progress" } },
+          // Tool A: completed with I/O
+          { delay: 700, call: {
+              toolCallId: "tc-mock-1", title: "list_dir", status: "completed",
+              rawInput:  { path: "." },
+              rawOutput: { entries: ["src", "Cargo.toml", "README.md"] }
+          }},
+          // Tool B: completed with I/O
+          { delay: 800, call: {
+              toolCallId: "tc-mock-2", title: "show_panel", status: "completed",
+              rawInput:  {},
+              rawOutput: { resourceUri: "ui://demo/panel" }
+          }},
+        ];
+
+        toolSequence.forEach(function(item) {
+          setTimeout(function() {
+            fireEvent({ type: "tool_call", call: JSON.stringify(item.call) });
+          }, item.delay);
+        });
+
+        // Stream the text reply after the tool calls have settled.
         var tokens = reply.split(/(?<=\s)|(?=\s)/);
         var i = 0;
-        var interval = setInterval(function () {
-          if (i < tokens.length) {
-            fireEvent({ type: "agent_text", content: tokens[i] });
-            i++;
-          } else {
-            fireEvent({ type: "done" });
-            clearInterval(interval);
-          }
-        }, 50);
+        setTimeout(function() {
+          var interval = setInterval(function () {
+            if (i < tokens.length) {
+              fireEvent({ type: "agent_text", content: tokens[i] });
+              i++;
+            } else {
+              fireEvent({ type: "done" });
+              clearInterval(interval);
+            }
+          }, 50);
+        }, 1000);
       }
 
       function mockSessionLoad(id) {
@@ -577,7 +716,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       };
     })();
   </script>
-<link rel="modulepreload" href="/gander-chat-77a34c4a228b27d8.js" crossorigin="anonymous" integrity="sha384-9cj0RPgOn1VA+MymDiSV5EXAehHKkMIZGIIJqkqkZi5QYWefI651tA4R4eF6Rjw9"><link rel="preload" href="/gander-chat-77a34c4a228b27d8_bg.wasm" crossorigin="anonymous" integrity="sha384-fhSUYXWYt6V8vy8nTu4VTEkJ4tDwEwr+05rCyBLz4j62KbX4VCwp04v2fGgfdLg5" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/gander-chat-8e9a70020601a43b.js" crossorigin="anonymous" integrity="sha384-hIlwBRmdswUN4NLwGqlQjpu56gu42R4rtSKtAhodAV/CUKP8HrssoHU1+qZg1edn"><link rel="preload" href="/gander-chat-8e9a70020601a43b_bg.wasm" crossorigin="anonymous" integrity="sha384-VZBbeXHbqnYGa1VcYcl38jZBBc1ZwSDBl/u51WR1muaFWSmR3xheEXFXpGLl6Ur2" as="fetch" type="application/wasm"></head>
 <body>
   <!--
     Trunk injects the WASM loader at the end of <body>.

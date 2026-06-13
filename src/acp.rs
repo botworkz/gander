@@ -18,14 +18,14 @@
 //! socket. Geesed detects the socket close and stops the goose process for
 //! that profile.
 
-use std::{env, path::PathBuf};
+use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 
 use agent_client_protocol::{
     ActiveSession, Agent, ByteStreams, SessionMessage,
     schema::{
         ContentBlock, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
         NewSessionResponse, ProtocolVersion, SessionId, SessionNotification, SessionUpdate,
-        StopReason,
+        StopReason, ToolCall, ToolCallId,
     },
     util::MatchDispatch,
 };
@@ -34,7 +34,7 @@ use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
-    sync::{mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -78,11 +78,10 @@ pub enum AcpEvent {
     AgentText(String),
     /// A user message chunk (history replay only).
     UserText(String),
-    /// The agent invoked a tool.  `name` is the tool title; `input` is the
-    /// raw JSON input.
-    ToolUse { name: String, input: String },
-    /// A tool returned output.
-    ToolResult { name: String, output: String },
+    /// Merged tool-call snapshot.  Emitted once when the tool call is created
+    /// and again on every update with the fully-merged state, so the UI can
+    /// find-or-create a card by `tool_call_id` and replace its content.
+    ToolCall(Box<ToolCall>),
     /// History replay starting — the UI should clear its message list.
     SessionLoadStart,
     /// History replay complete — the UI may accept new user input.
@@ -328,6 +327,12 @@ async fn run_worker(
     let evt_tx_clone = evt_tx.clone();
     let mut ready_tx_opt = Some(ready_tx);
 
+    // Per-session tool-call map: receives ToolCall on creation and merges
+    // ToolCallUpdate patches in, emitting a full snapshot each time so the UI
+    // stays dumb.  Cleared on every session switch to prevent history leaks.
+    let tool_calls: Arc<Mutex<HashMap<ToolCallId, ToolCall>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     let result = agent_client_protocol::Client
         .builder()
         .name("gander")
@@ -394,7 +399,12 @@ async fn run_worker(
                             continue;
                         }
 
-                        drain_session_updates(&mut current_session, &evt_tx_clone).await;
+                        drain_session_updates(
+                            &mut current_session,
+                            &evt_tx_clone,
+                            &tool_calls,
+                        )
+                        .await;
                     }
 
                     AcpCommand::SessionSelect(id) => {
@@ -409,12 +419,16 @@ async fn run_worker(
                                     Ok(s) => {
                                         current_session = s;
                                         active_id = id;
+                                        // Clear stale tool-call state before replaying the
+                                        // new session's history.
+                                        tool_calls.lock().await.clear();
                                         let _ = evt_tx_clone
                                             .send(AcpEvent::SessionLoadStart)
                                             .await;
                                         drain_history_replay(
                                             &mut current_session,
                                             &evt_tx_clone,
+                                            &tool_calls,
                                         )
                                         .await;
                                         let _ = evt_tx_clone
@@ -502,6 +516,7 @@ async fn run_worker(
 async fn drain_session_updates(
     session: &mut ActiveSession<'_, Agent>,
     evt_tx: &mpsc::Sender<AcpEvent>,
+    tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
 ) {
     loop {
         let update = match session.read_update().await {
@@ -515,9 +530,10 @@ async fn drain_session_updates(
         match update {
             SessionMessage::SessionMessage(dispatch) => {
                 let tx = evt_tx.clone();
+                let tc_arc = Arc::clone(tool_calls);
                 let handled = MatchDispatch::new(dispatch)
                     .if_notification(async move |n: SessionNotification| {
-                        forward_update(n.update, &tx).await;
+                        forward_update(n.update, &tx, &tc_arc).await;
                         Ok(())
                     })
                     .await
@@ -560,6 +576,7 @@ async fn drain_session_updates(
 async fn drain_history_replay(
     session: &mut ActiveSession<'_, Agent>,
     evt_tx: &mpsc::Sender<AcpEvent>,
+    tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
 ) {
     loop {
         let next = tokio::time::timeout(Duration::ZERO, session.read_update()).await;
@@ -576,9 +593,10 @@ async fn drain_history_replay(
         match update {
             SessionMessage::SessionMessage(dispatch) => {
                 let tx = evt_tx.clone();
+                let tc_arc = Arc::clone(tool_calls);
                 let handled = MatchDispatch::new(dispatch)
                     .if_notification(async move |n: SessionNotification| {
-                        forward_update(n.update, &tx).await;
+                        forward_update(n.update, &tx, &tc_arc).await;
                         Ok(())
                     })
                     .await
@@ -594,10 +612,47 @@ async fn drain_history_replay(
     }
 }
 
+/// Apply the fields of a [`ToolCallUpdate`] onto an existing [`ToolCall`] in place.
+fn apply_tool_call_update(
+    tc: &mut ToolCall,
+    fields: agent_client_protocol::schema::ToolCallUpdateFields,
+) {
+    if let Some(kind) = fields.kind {
+        tc.kind = kind;
+    }
+    if let Some(status) = fields.status {
+        tc.status = status;
+    }
+    if let Some(title) = fields.title {
+        tc.title = title;
+    }
+    if let Some(content) = fields.content {
+        tc.content = content;
+    }
+    if let Some(locations) = fields.locations {
+        tc.locations = locations;
+    }
+    if let Some(raw_input) = fields.raw_input {
+        tc.raw_input = Some(raw_input);
+    }
+    if let Some(raw_output) = fields.raw_output {
+        tc.raw_output = Some(raw_output);
+    }
+}
+
 /// Map a single [`SessionUpdate`] variant to the appropriate [`AcpEvent`] and
 /// send it.  Unrecognised variants are silently ignored for forward
 /// compatibility.
-async fn forward_update(update: SessionUpdate, tx: &mpsc::Sender<AcpEvent>) {
+///
+/// For `ToolCall` and `ToolCallUpdate`, the per-session `tool_calls` map is
+/// updated and a **full snapshot** of the merged `ToolCall` is emitted.  This
+/// keeps the Leptos side dumb: it receives complete state and never needs to
+/// apply deltas itself.
+async fn forward_update(
+    update: SessionUpdate,
+    tx: &mpsc::Sender<AcpEvent>,
+    tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+) {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             if let ContentBlock::Text(text) = chunk.content {
@@ -609,34 +664,22 @@ async fn forward_update(update: SessionUpdate, tx: &mpsc::Sender<AcpEvent>) {
                 let _ = tx.send(AcpEvent::UserText(text.text)).await;
             }
         }
-        SessionUpdate::ToolCall(tool_call) => {
-            let input = tool_call
-                .raw_input
-                .as_ref()
-                .and_then(|v| serde_json::to_string_pretty(v).ok())
-                .unwrap_or_else(|| "{}".to_string());
-            let _ = tx
-                .send(AcpEvent::ToolUse {
-                    name: tool_call.title.clone(),
-                    input,
-                })
-                .await;
+        SessionUpdate::ToolCall(tc) => {
+            let mut map = tool_calls.lock().await;
+            map.insert(tc.tool_call_id.clone(), tc.clone());
+            let _ = tx.send(AcpEvent::ToolCall(Box::new(tc))).await;
         }
         SessionUpdate::ToolCallUpdate(update) => {
-            let output = update
-                .fields
-                .raw_output
-                .as_ref()
-                .and_then(|v| serde_json::to_string_pretty(v).ok())
-                .unwrap_or_default();
-            let _ = tx
-                .send(AcpEvent::ToolResult {
-                    // The ACP spec doesn't carry the tool title in ToolCallUpdate;
-                    // use the tool_call_id as the identifier for display.
-                    name: update.tool_call_id.0.to_string(),
-                    output,
-                })
-                .await;
+            let mut map = tool_calls.lock().await;
+            if let Some(existing) = map.get_mut(&update.tool_call_id) {
+                apply_tool_call_update(existing, update.fields);
+                let merged = existing.clone();
+                drop(map);
+                let _ = tx.send(AcpEvent::ToolCall(Box::new(merged))).await;
+            }
+            // If no prior ToolCall was received for this id, silently ignore.
+            // This can only happen when history is replayed out of order, which
+            // ACP does not do in practice.
         }
         // AgentThoughtChunk and other variants are intentionally ignored in v1.
         _ => {}
@@ -675,11 +718,24 @@ mod tests {
         ContentChunk, TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
     };
 
+    /// Build a fresh shared tool-call map for use in tests.
+    fn empty_map() -> Arc<Mutex<HashMap<ToolCallId, ToolCall>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
     // Helper: send one SessionUpdate through forward_update and return whatever
-    // AcpEvent was produced (if any).
+    // AcpEvent was produced (if any).  Uses a fresh empty map.
     async fn forwarded(update: SessionUpdate) -> Option<AcpEvent> {
+        forwarded_with_map(update, &empty_map()).await
+    }
+
+    // Helper: send one SessionUpdate through forward_update with a given map.
+    async fn forwarded_with_map(
+        update: SessionUpdate,
+        map: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+    ) -> Option<AcpEvent> {
         let (tx, mut rx) = mpsc::channel(4);
-        forward_update(update, &tx).await;
+        forward_update(update, &tx, map).await;
         rx.try_recv().ok()
     }
 
@@ -698,18 +754,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_tool_call_produces_tool_use_event() {
+    async fn forward_tool_call_emits_tool_call_event_with_title() {
         let tool = ToolCall::new(ToolCallId::new("tc-1"), "my_tool");
         let event = forwarded(SessionUpdate::ToolCall(tool)).await;
-        assert!(matches!(event, Some(AcpEvent::ToolUse { name, .. }) if name == "my_tool"));
+        assert!(
+            matches!(&event, Some(AcpEvent::ToolCall(tc)) if tc.title == "my_tool"),
+            "expected ToolCall event with title 'my_tool', got {event:?}"
+        );
     }
 
     #[tokio::test]
-    async fn forward_tool_call_update_produces_tool_result_event() {
+    async fn forward_tool_call_update_emits_merged_snapshot() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-2"), "list_dir");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        // Now send an update with raw_output — the merged snapshot must carry
+        // the original title AND the new output.
+        let fields =
+            ToolCallUpdateFields::new().raw_output(serde_json::json!({"entries": ["a", "b"]}));
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-2"), fields);
+        let event = forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        match event {
+            Some(AcpEvent::ToolCall(tc)) => {
+                assert_eq!(
+                    tc.title, "list_dir",
+                    "title must be preserved from creation"
+                );
+                assert!(
+                    tc.raw_output.is_some(),
+                    "raw_output must be set from update"
+                );
+            }
+            other => panic!("expected merged ToolCall event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_tool_call_update_without_prior_call_produces_no_event() {
+        // An orphaned update (no prior ToolCall) is silently dropped.
         let fields = ToolCallUpdateFields::new().raw_output(serde_json::json!({"result": "ok"}));
-        let update = ToolCallUpdate::new(ToolCallId::new("tc-1"), fields);
+        let update = ToolCallUpdate::new(ToolCallId::new("orphan"), fields);
         let event = forwarded(SessionUpdate::ToolCallUpdate(update)).await;
-        assert!(matches!(event, Some(AcpEvent::ToolResult { name, .. }) if name == "tc-1"));
+        assert!(event.is_none(), "orphaned update must not emit an event");
     }
 
     #[tokio::test]
@@ -752,6 +840,49 @@ mod tests {
         assert!(
             result.is_err(),
             "should time out immediately on empty channel"
+        );
+    }
+
+    // ToolCall JSON serialisation must use camelCase field names because
+    // `ToolCall` is `#[serde(rename_all = "camelCase")]`.  The Leptos reader
+    // in gander-chat uses `js_sys::Reflect::get` with these exact key strings,
+    // so a regression here silently breaks all tool-call cards.
+    #[test]
+    fn tool_call_serialises_with_camel_case_keys() {
+        let mut tc = ToolCall::new(ToolCallId::new("tc-serde-test"), "echo");
+        let fields = ToolCallUpdateFields::new()
+            .raw_input(serde_json::json!({"text": "hi"}))
+            .raw_output(serde_json::json!({"result": "ok"}));
+        apply_tool_call_update(&mut tc, fields);
+
+        let json = serde_json::to_string(&tc).expect("ToolCall serializes to JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(&json).expect("serialized ToolCall is valid JSON");
+
+        assert_eq!(
+            v["toolCallId"], "tc-serde-test",
+            "tool_call_id must serialise as 'toolCallId'"
+        );
+        assert!(
+            !v["rawInput"].is_null(),
+            "raw_input must serialise as 'rawInput'"
+        );
+        assert!(
+            !v["rawOutput"].is_null(),
+            "raw_output must serialise as 'rawOutput'"
+        );
+        // Confirm snake_case keys are absent — if these exist the renaming is broken.
+        assert!(
+            v.get("tool_call_id").is_none(),
+            "snake_case 'tool_call_id' must not appear in JSON"
+        );
+        assert!(
+            v.get("raw_input").is_none(),
+            "snake_case 'raw_input' must not appear in JSON"
+        );
+        assert!(
+            v.get("raw_output").is_none(),
+            "snake_case 'raw_output' must not appear in JSON"
         );
     }
 }

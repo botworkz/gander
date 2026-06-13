@@ -95,11 +95,18 @@ pub struct ChatMessage {
     pub id: u32,
     pub role: Role,
     /// Accumulated text.  Grows token-by-token for in-flight messages.
+    /// For `Role::Tool` messages this holds the full serialised `ToolCall`
+    /// JSON snapshot, replaced on every update.
     pub content: RwSignal<String>,
     /// `true` while the host is still streaming tokens for this message.
+    /// For tool messages, `true` means the tool call is still in progress.
     pub streaming: RwSignal<bool>,
     /// Non-`None` when the stream ended with an error.
     pub error: RwSignal<Option<String>>,
+    /// For `Role::Tool` messages: the ACP `tool_call_id` string, used to
+    /// match subsequent update snapshots to the right card.  `None` for
+    /// user and assistant messages.
+    pub tool_call_id: RwSignal<Option<String>>,
 }
 
 impl ChatMessage {
@@ -110,6 +117,7 @@ impl ChatMessage {
             content: RwSignal::new(text.to_string()),
             streaming: RwSignal::new(false),
             error: RwSignal::new(None),
+            tool_call_id: RwSignal::new(None),
         }
     }
 
@@ -120,16 +128,19 @@ impl ChatMessage {
             content: RwSignal::new(String::new()),
             streaming: RwSignal::new(true),
             error: RwSignal::new(None),
+            tool_call_id: RwSignal::new(None),
         }
     }
 
-    fn new_tool(id: u32, text: String) -> Self {
+    fn new_tool(id: u32, tool_call_id: String, json: String) -> Self {
         Self {
             id,
             role: Role::Tool,
-            content: RwSignal::new(text),
-            streaming: RwSignal::new(false),
+            content: RwSignal::new(json),
+            // Tool call is in progress until we receive a terminal status.
+            streaming: RwSignal::new(true),
             error: RwSignal::new(None),
+            tool_call_id: RwSignal::new(Some(tool_call_id)),
         }
     }
 }
@@ -213,40 +224,45 @@ fn handle_bridge_event(
             messages.update(|v| v.push(m));
         }
 
-        // ── tool call ──────────────────────────────────────────────────────
-        Some("tool_use") => {
-            let name = js_sys::Reflect::get(&event, &JsValue::from_str("name"))
-                .ok()
-                .and_then(|v| v.as_string())
-                .unwrap_or_else(|| "(tool)".to_string());
-            let input = js_sys::Reflect::get(&event, &JsValue::from_str("input"))
+        // ── tool call (merged snapshot) ────────────────────────────────────
+        Some("tool_call") => {
+            let call_json = js_sys::Reflect::get(&event, &JsValue::from_str("call"))
                 .ok()
                 .and_then(|v| v.as_string())
                 .unwrap_or_default();
 
-            let text = format!("called **{}**\n```json\n{}\n```", name, input);
-            let m = ChatMessage::new_tool(take_id(next_id), text);
-            messages.update(|v| v.push(m));
-        }
-
-        // ── tool result ────────────────────────────────────────────────────
-        Some("tool_result") => {
-            let name = js_sys::Reflect::get(&event, &JsValue::from_str("name"))
-                .ok()
-                .and_then(|v| v.as_string())
-                .unwrap_or_else(|| "(tool)".to_string());
-            let output = js_sys::Reflect::get(&event, &JsValue::from_str("output"))
-                .ok()
+            // Parse the JSON string to extract tool_call_id and status.
+            let parsed = js_sys::JSON::parse(&call_json).ok();
+            let tool_call_id = parsed
+                .as_ref()
+                .and_then(|obj| js_sys::Reflect::get(obj, &JsValue::from_str("toolCallId")).ok())
                 .and_then(|v| v.as_string())
                 .unwrap_or_default();
+            let status = parsed
+                .as_ref()
+                .and_then(|obj| js_sys::Reflect::get(obj, &JsValue::from_str("status")).ok())
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            let is_done = is_terminal_status(&status);
 
-            let text = if output.is_empty() {
-                format!("**{}** returned (no output)", name)
-            } else {
-                format!("**{}** returned\n```\n{}\n```", name, output)
-            };
-            let m = ChatMessage::new_tool(take_id(next_id), text);
-            messages.update(|v| v.push(m));
+            // Find an existing card for this tool call id, or create one.
+            let existing = messages
+                .get_untracked()
+                .iter()
+                .find(|m| m.tool_call_id.get_untracked().as_deref() == Some(tool_call_id.as_str()))
+                .copied();
+
+            match existing {
+                Some(msg) => {
+                    msg.content.set(call_json);
+                    msg.streaming.set(!is_done);
+                }
+                None => {
+                    let m = ChatMessage::new_tool(take_id(next_id), tool_call_id, call_json);
+                    m.streaming.set(!is_done);
+                    messages.update(|v| v.push(m));
+                }
+            }
         }
 
         // ── session load start: clear UI, enter replay mode ────────────────
@@ -717,39 +733,180 @@ fn MessageList(messages: RwSignal<Vec<ChatMessage>>) -> impl IntoView {
 
 /// A single message bubble (user, assistant, or tool).
 ///
-/// The `inner_html` on `.message-content` lets pulldown-cmark HTML land
-/// directly in the DOM.  Content is trusted (local bridge only).
+/// Tool messages are rendered as a collapsible card via [`ToolCallCard`].
+/// All other messages render their content via the markdown renderer.
 #[component]
 fn MessageView(message: ChatMessage) -> impl IntoView {
-    let role_class = match message.role {
-        Role::User => "message message--user",
-        Role::Assistant => "message message--assistant",
-        Role::Tool => "message message--tool",
-    };
+    match message.role {
+        Role::Tool => view! { <ToolCallCard message /> }.into_any(),
+        _ => {
+            let role_class = match message.role {
+                Role::User => "message message--user",
+                Role::Assistant => "message message--assistant",
+                Role::Tool => unreachable!(),
+            };
+            view! {
+                <div class=role_class>
+                    // Reactive inner HTML: re-evaluates only when `content` changes.
+                    <div
+                        class="message-content"
+                        inner_html=move || markdown::render(&message.content.get())
+                    />
+                    // Blinking cursor while the host is still streaming tokens.
+                    {move || {
+                        message
+                            .streaming
+                            .get()
+                            .then(|| view! { <span class="streaming-cursor">"▋"</span> })
+                    }}
+                    // Error notice, shown only on failure.
+                    {move || {
+                        message
+                            .error
+                            .get()
+                            .map(|e| view! { <div class="error-notice">{e}</div> })
+                    }}
+                </div>
+            }
+            .into_any()
+        }
+    }
+}
+
+/// Collapsible card for a single tool-call / tool-result pair.
+///
+/// The card header always shows the tool title and a status badge.  The body
+/// (raw input and raw output) is hidden by default and revealed when the user
+/// clicks the header.
+///
+/// `message.content` holds the full ACP `ToolCall` JSON snapshot; it is
+/// re-evaluated whenever the host emits an update for this tool call id.
+#[component]
+fn ToolCallCard(message: ChatMessage) -> impl IntoView {
+    // Local signal for the collapsed/expanded state of this card.
+    let expanded: RwSignal<bool> = RwSignal::new(false);
+    let toggle = move |_| expanded.update(|e| *e = !*e);
 
     view! {
-        <div class=role_class>
-            // Reactive inner HTML: re-evaluates only when `content` changes.
-            <div
-                class="message-content"
-                inner_html=move || markdown::render(&message.content.get())
-            />
-            // Blinking cursor while the host is still streaming tokens.
+        <div class="message message--tool tool-call-card">
+            // ── header ───────────────────────────────────────────────────
+            <button class="tool-call-header" on:click=toggle>
+                <span class="tool-call-title">
+                    {move || {
+                        let json = message.content.get();
+                        parse_tool_title(&json)
+                    }}
+                </span>
+                <span class="tool-call-status">
+                    {move || {
+                        let json = message.content.get();
+                        tool_status_badge(&json, message.streaming.get())
+                    }}
+                </span>
+                <span class=move || {
+                    if expanded.get() {
+                        "tool-call-chevron tool-call-chevron--open"
+                    } else {
+                        "tool-call-chevron"
+                    }
+                }>
+                    <Icon
+                        icon=icondata::LuChevronRight
+                        width="14px"
+                        height="14px"
+                    />
+                </span>
+            </button>
+            // ── body (shown when expanded) ────────────────────────────
             {move || {
-                message
-                    .streaming
+                expanded
                     .get()
-                    .then(|| view! { <span class="streaming-cursor">"▋"</span> })
-            }}
-            // Error notice, shown only on failure.
-            {move || {
-                message
-                    .error
-                    .get()
-                    .map(|e| view! { <div class="error-notice">{e}</div> })
+                    .then(|| {
+                        let json = message.content.get();
+                        let (input_str, output_str) = parse_tool_io(&json);
+                        view! {
+                            <div class="tool-call-body">
+                                {input_str
+                                    .map(|inp| {
+                                        view! {
+                                            <div class="tool-call-section">
+                                                <div class="tool-call-section-label">"Input"</div>
+                                                <pre class="tool-call-pre">{inp}</pre>
+                                            </div>
+                                        }
+                                    })}
+                                {output_str
+                                    .map(|out| {
+                                        view! {
+                                            <div class="tool-call-section">
+                                                <div class="tool-call-section-label">"Output"</div>
+                                                <pre class="tool-call-pre">{out}</pre>
+                                            </div>
+                                        }
+                                    })}
+                            </div>
+                        }
+                    })
             }}
         </div>
     }
+}
+
+/// Return `true` for ACP `ToolCallStatus` values that indicate the call
+/// is finished (`"completed"` or `"failed"`).
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed")
+}
+
+/// Extract the tool title from a serialised `ToolCall` JSON string.
+fn parse_tool_title(json: &str) -> String {
+    js_sys::JSON::parse(json)
+        .ok()
+        .and_then(|obj| js_sys::Reflect::get(&obj, &JsValue::from_str("title")).ok())
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| "(tool)".to_string())
+}
+
+/// Return a short status badge string for the card header.
+fn tool_status_badge(json: &str, streaming: bool) -> &'static str {
+    if streaming {
+        return "running…";
+    }
+    let status = js_sys::JSON::parse(json)
+        .ok()
+        .and_then(|obj| js_sys::Reflect::get(&obj, &JsValue::from_str("status")).ok())
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    match status.as_str() {
+        s if is_terminal_status(s) && s == "completed" => "✓",
+        s if is_terminal_status(s) => "✗",
+        "in_progress" => "running…",
+        _ => "",
+    }
+}
+
+/// Extract pretty-printed input and output from a serialised `ToolCall` JSON string.
+///
+/// Returns `(input, output)` where each is `None` when absent.
+fn parse_tool_io(json: &str) -> (Option<String>, Option<String>) {
+    let Ok(obj) = js_sys::JSON::parse(json) else {
+        return (None, None);
+    };
+    let pretty = |key: &str| -> Option<String> {
+        js_sys::Reflect::get(&obj, &JsValue::from_str(key))
+            .ok()
+            .filter(|v| !v.is_null() && !v.is_undefined())
+            .and_then(|v| {
+                js_sys::JSON::stringify_with_replacer_and_space(
+                    &v,
+                    &JsValue::NULL,
+                    &JsValue::from_f64(2.0),
+                )
+                .ok()
+                .and_then(|s| s.as_string())
+            })
+    };
+    (pretty("rawInput"), pretty("rawOutput"))
 }
 
 /// Footer bar showing session metadata below the input row.
