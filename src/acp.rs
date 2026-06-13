@@ -853,11 +853,24 @@ fn apply_tool_call_update(
 /// keeps the Leptos side dumb: it receives complete state and never needs to
 /// apply deltas itself.
 ///
-/// When a `ToolCallUpdate` transitions a call to `Completed` status and the
-/// tool's definition in `tool_metadata` carries a `_meta.ui.resourceUri`, the
-/// (tool_call_id, resource_uri) pair is pushed onto `pending_fetches`.  The
-/// caller (which holds a live `cx`) drains that queue and emits
+/// When a `ToolCallUpdate` transitions a call to `Completed` status, we
+/// determine the UI resource URI using two complementary sources:
+///
+/// 1. **`rawOutput.resourceUri`** — goose embeds the URI directly in the
+///    `ToolCallUpdate` payload (observed via wire-level logging).  This is the
+///    primary source because it requires no title→name mapping.
+/// 2. **`tool_metadata` cache** — populated from `goose/tools` at session bind.
+///    Used as a fallback and as a guard: we only proceed if either the metadata
+///    map confirms a UI resource for this tool or the raw output carries one.
+///
+/// The (tool_call_id, resource_uri) pair is pushed onto `pending_fetches`.
+/// The caller (which holds a live `cx`) drains that queue and emits
 /// `AcpEvent::ToolResource` after this function returns.
+///
+/// Note: `ToolCall.title` in ACP v1 is a **human-readable display label**
+/// (e.g. "botworkui: show botspace panel"), not the canonical tool name.
+/// We therefore prefer the `rawOutput` path for URI resolution and use the
+/// metadata cache only when the title happens to match the tool name exactly.
 async fn forward_update(
     update: SessionUpdate,
     tx: &mpsc::Sender<AcpEvent>,
@@ -885,22 +898,46 @@ async fn forward_update(
             let mut map = tool_calls.lock().await;
             if let Some(existing) = map.get_mut(&update.tool_call_id) {
                 apply_tool_call_update(existing, update.fields);
+
+                // Determine the UI resource URI before we clone `existing` for
+                // the event — this avoids cloning again just to read two fields.
+                //
+                // Resolution order (first non-empty wins):
+                // 1. rawOutput.resourceUri — embedded by goose in the update payload
+                // 2. tool_metadata keyed by title — only reliable when title == name
+                let resource_uri = if existing.status == ToolCallStatus::Completed {
+                    // Primary: rawOutput.resourceUri (directly in wire payload)
+                    let from_output = existing
+                        .raw_output
+                        .as_ref()
+                        .and_then(|v| v.get("resourceUri"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+
+                    if from_output.is_some() {
+                        from_output
+                    } else {
+                        // Fallback: metadata cache keyed by title.
+                        // Works when the title is the bare tool name; silent
+                        // no-op when it is a human-readable label.
+                        let meta = tool_metadata.lock().await;
+                        meta.get(existing.title.as_str()).and_then(|v| v.clone())
+                    }
+                } else {
+                    None
+                };
+
+                let tool_call_id = existing.tool_call_id.clone();
                 let merged = existing.clone();
                 drop(map);
-                let _ = tx.send(AcpEvent::ToolCall(Box::new(merged.clone()))).await;
+                let _ = tx.send(AcpEvent::ToolCall(Box::new(merged))).await;
 
-                // Queue a resource fetch if this call just completed and its
-                // tool definition advertises a UI resource URI.  The actual
-                // network call is made by process_pending_fetches() after the
-                // drain loop exits, where cx is in scope.
-                if merged.status == ToolCallStatus::Completed {
-                    let meta = tool_metadata.lock().await;
-                    if let Some(Some(resource_uri)) = meta.get(merged.title.as_str()) {
-                        pending_fetches
-                            .lock()
-                            .await
-                            .push((merged.tool_call_id.clone(), resource_uri.clone()));
-                    }
+                // Queue the resource fetch if we resolved a URI above.  The
+                // actual network call is made by process_pending_fetches() after
+                // the drain loop exits, where cx is in scope.
+                if let Some(uri) = resource_uri {
+                    pending_fetches.lock().await.push((tool_call_id, uri));
                 }
             }
             // If no prior ToolCall was received for this id, silently ignore.
@@ -1057,10 +1094,48 @@ mod tests {
 
     // ── ToolResource queuing tests ───────────────────────────────────────────
 
-    /// A completed tool whose definition has `_meta.ui.resourceUri` must push
-    /// an entry onto `pending_fetches`.
+    /// A completed tool whose update carries `rawOutput.resourceUri` (the
+    /// primary path — what goose actually embeds in the wire payload) must
+    /// push an entry onto `pending_fetches` even when the metadata cache is
+    /// empty.
     #[tokio::test]
-    async fn completed_tool_with_resource_uri_queues_fetch() {
+    async fn completed_tool_with_raw_output_resource_uri_queues_fetch() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-raw"), "botworkui: show botspace panel");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        let pending = empty_pending();
+
+        // Simulate the actual goose wire payload: status=completed +
+        // rawOutput.resourceUri.  Metadata is empty (title is a human-readable
+        // label that won't match any tool name).
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .raw_output(serde_json::json!({ "resourceUri": "ui://botwork-ui/panel" }));
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-raw"), fields);
+        forwarded_with_maps(
+            SessionUpdate::ToolCallUpdate(update),
+            &map,
+            &empty_metadata(),
+            &pending,
+        )
+        .await;
+
+        let fetches = pending.lock().await;
+        assert_eq!(
+            fetches.len(),
+            1,
+            "rawOutput.resourceUri must queue a pending fetch"
+        );
+        assert_eq!(fetches[0].0.to_string(), "tc-raw");
+        assert_eq!(fetches[0].1, "ui://botwork-ui/panel");
+    }
+
+    /// A completed tool whose definition has `_meta.ui.resourceUri` in the
+    /// metadata cache must push an entry onto `pending_fetches` (fallback path:
+    /// title == tool name, no rawOutput).
+    #[tokio::test]
+    async fn completed_tool_with_metadata_resource_uri_queues_fetch() {
         let map = empty_map();
         // Seed the tool-call map with an initial ToolCall.
         let tool = ToolCall::new(ToolCallId::new("tc-res"), "my_widget");
