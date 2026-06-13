@@ -608,6 +608,25 @@
           }, item.delay);
         });
 
+        // tc-mock-3: demo widget with an inline UI resource (tool_resource).
+        // This simulates what gander emits after goose/resource/read resolves.
+        setTimeout(function() {
+          fireEvent({ type: "tool_call", call: JSON.stringify({
+            toolCallId: "tc-mock-3",
+            title: "demo: show widget",
+            status: "completed",
+            rawInput: {},
+            rawOutput: { resourceUri: "ui://demo/widget" }
+          })});
+          setTimeout(function() {
+            fireEvent({
+              type: "tool_resource",
+              tool_call_id: "tc-mock-3",
+              html: "<!DOCTYPE html><html><body style='margin:0;padding:16px;font-family:sans-serif;background:#fef;'><h3>Demo widget</h3><button onclick=\"alert('hi')\">Click me</button></body></html>"
+            });
+          }, 100);
+        }, 200);
+
         // Stream the text reply after the tool calls have settled.
         var tokens = reply.split(/(?<=\s)|(?=\s)/);
         var i = 0;

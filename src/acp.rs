@@ -21,11 +21,11 @@
 use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 
 use agent_client_protocol::{
-    ActiveSession, Agent, ByteStreams, SessionMessage,
+    ActiveSession, Agent, ByteStreams, SessionMessage, UntypedMessage,
     schema::{
         ContentBlock, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
         NewSessionResponse, ProtocolVersion, SessionId, SessionNotification, SessionUpdate,
-        StopReason, ToolCall, ToolCallId,
+        StopReason, ToolCall, ToolCallId, ToolCallStatus,
     },
     util::MatchDispatch,
 };
@@ -111,6 +111,17 @@ pub enum AcpEvent {
         cwd: String,
         model: String,
         tool_count: Option<u32>,
+    },
+    /// An inline UI resource (HTML body) fetched via `goose/resource/read` for a
+    /// completed tool call whose definition carries `_meta.ui.resourceUri`.
+    ///
+    /// Emitted after the resource fetch succeeds; the Leptos side renders the HTML
+    /// in a sandboxed iframe above the corresponding tool-call card.
+    ToolResource {
+        /// ACP `toolCallId` of the tool call that triggered the fetch.
+        tool_call_id: String,
+        /// Full HTML document returned by `goose/resource/read`.
+        html: String,
     },
 }
 
@@ -315,6 +326,159 @@ where
         .collect()
 }
 
+/// Fetch tool definitions for the current goose session via `goose/tools`.
+///
+/// Goose exposes this non-standard ACP extension after session bind.  Each tool
+/// definition may carry `_meta.ui.resourceUri`; when present, gander will fetch
+/// and render the resource inline after the tool call completes.
+///
+/// Returns a map from tool name → optional `_meta.ui.resourceUri`.  Errors are
+/// swallowed (a warning is logged) and an empty map is the safe fallback.
+async fn fetch_tool_metadata<R>(
+    cx: &agent_client_protocol::ConnectionTo<R>,
+) -> HashMap<String, Option<String>>
+where
+    R: agent_client_protocol::role::Role,
+    R: agent_client_protocol::role::HasPeer<R>,
+{
+    let msg = match UntypedMessage::new("goose/tools", serde_json::json!({})) {
+        Ok(m) => m,
+        Err(err) => {
+            tracing::warn!(%err, "failed to build goose/tools request");
+            return HashMap::new();
+        }
+    };
+
+    let response: Value = match cx.send_request(msg).block_task().await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(%err, "goose/tools failed; proceeding without tool UI metadata");
+            return HashMap::new();
+        }
+    };
+
+    tracing::info!(?response, "goose/tools response");
+
+    let tools = response
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut metadata = HashMap::new();
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // Both `_meta.ui.resourceUri` (goose#8593) and the MCP Apps spec use
+        // this path.  Log the raw value so casing issues are visible in traces.
+        let resource_uri = tool
+            .pointer("/_meta/ui/resourceUri")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        metadata.insert(name, resource_uri);
+    }
+    metadata
+}
+
+/// Fetch HTML content for a UI resource via `goose/resource/read`.
+///
+/// Returns `None` on network error, when the response carries no `text/html`
+/// content item, or when the mime type check fails.  In all error cases a
+/// warning is logged so the caller falls through to plain tool-card rendering.
+async fn fetch_resource_html<R>(
+    cx: &agent_client_protocol::ConnectionTo<R>,
+    resource_uri: &str,
+) -> Option<String>
+where
+    R: agent_client_protocol::role::Role,
+    R: agent_client_protocol::role::HasPeer<R>,
+{
+    let params = serde_json::json!({ "uri": resource_uri });
+    let msg = match UntypedMessage::new("goose/resource/read", params) {
+        Ok(m) => m,
+        Err(err) => {
+            tracing::warn!(%err, "failed to build goose/resource/read request");
+            return None;
+        }
+    };
+
+    let response: Value = match cx.send_request(msg).block_task().await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(%err, resource_uri, "goose/resource/read failed");
+            return None;
+        }
+    };
+
+    // Expected shape: { contents: [{ uri, mimeType, text }] } or
+    //                 { content:  [{ type, mimeType, text }] }
+    // Goose may use either key; try both.
+    let items = response
+        .get("contents")
+        .or_else(|| response.get("content"))
+        .and_then(|v| v.as_array())?;
+
+    for item in items {
+        // `mimeType` is the canonical casing in MCP; `mime_type` shows up in
+        // some goose versions.  Check both to be safe.
+        let mime = item
+            .get("mimeType")
+            .or_else(|| item.get("mime_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if mime == "text/html" {
+            if let Some(html) = item.get("text").and_then(|v| v.as_str()) {
+                return Some(html.to_string());
+            }
+        }
+    }
+
+    tracing::warn!(
+        resource_uri,
+        "goose/resource/read returned no text/html content"
+    );
+    None
+}
+
+/// Drain the `pending_fetches` queue, call `goose/resource/read` for each
+/// entry, and emit `AcpEvent::ToolResource` on success.
+///
+/// Called from `run_worker` after each live-prompt drain loop, where `cx` is
+/// available.  Never called during history replay — that queue is cleared
+/// instead.
+async fn process_pending_fetches<R>(
+    cx: &agent_client_protocol::ConnectionTo<R>,
+    tx: &mpsc::Sender<AcpEvent>,
+    pending_fetches: &Arc<Mutex<Vec<(ToolCallId, String)>>>,
+) where
+    R: agent_client_protocol::role::Role,
+    R: agent_client_protocol::role::HasPeer<R>,
+{
+    let fetches: Vec<(ToolCallId, String)> = {
+        let mut guard = pending_fetches.lock().await;
+        std::mem::take(&mut *guard)
+    };
+
+    for (tool_call_id, resource_uri) in fetches {
+        if let Some(html) = fetch_resource_html(cx, &resource_uri).await {
+            let _ = tx
+                .send(AcpEvent::ToolResource {
+                    tool_call_id: tool_call_id.to_string(),
+                    html,
+                })
+                .await;
+        }
+        // On fetch failure fetch_resource_html already logged a warning.
+        // Fall through silently so the plain tool card remains visible.
+    }
+}
+
 async fn run_worker(
     stream: UnixStream,
     mut cmd_rx: mpsc::Receiver<AcpCommand>,
@@ -332,6 +496,17 @@ async fn run_worker(
     // stays dumb.  Cleared on every session switch to prevent history leaks.
     let tool_calls: Arc<Mutex<HashMap<ToolCallId, ToolCall>>> =
         Arc::new(Mutex::new(HashMap::new()));
+
+    // Per-session map from tool name → optional `_meta.ui.resourceUri`.
+    // Populated once after every session attach (initial connect and
+    // SessionSelect) via `goose/tools`.  Cleared on session switch.
+    let tool_metadata: Arc<Mutex<HashMap<String, Option<String>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Queue of (tool_call_id, resource_uri) pairs for which a resource fetch
+    // must be performed.  forward_update pushes entries; run_worker drains them
+    // (using cx) after drain_session_updates returns.
+    let pending_fetches: Arc<Mutex<Vec<(ToolCallId, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let result = agent_client_protocol::Client
         .builder()
@@ -387,6 +562,10 @@ async fn run_worker(
                 let _ = tx.send(Ok(()));
             }
 
+            // Fetch tool metadata for the initial session.  Errors are swallowed
+            // inside fetch_tool_metadata — an empty map is the safe fallback.
+            *tool_metadata.lock().await = fetch_tool_metadata(&cx).await;
+
             // Cache session metadata for reuse on RequestSessionInfo.
             let cwd_str = cwd.to_string_lossy().into_owned();
             let mut cached_listed = listed;
@@ -403,8 +582,15 @@ async fn run_worker(
                             &mut current_session,
                             &evt_tx_clone,
                             &tool_calls,
+                            &tool_metadata,
+                            &pending_fetches,
                         )
                         .await;
+
+                        // Drain resource fetches queued during the prompt.  The
+                        // cx is available here but not inside forward_update, so
+                        // we two-phase: queue inside the drain loop, fetch here.
+                        process_pending_fetches(&cx, &evt_tx_clone, &pending_fetches).await;
                     }
 
                     AcpCommand::SessionSelect(id) => {
@@ -419,9 +605,10 @@ async fn run_worker(
                                     Ok(s) => {
                                         current_session = s;
                                         active_id = id;
-                                        // Clear stale tool-call state before replaying the
-                                        // new session's history.
+                                        // Clear stale per-session state before replaying.
                                         tool_calls.lock().await.clear();
+                                        tool_metadata.lock().await.clear();
+                                        pending_fetches.lock().await.clear();
                                         let _ = evt_tx_clone
                                             .send(AcpEvent::SessionLoadStart)
                                             .await;
@@ -429,11 +616,19 @@ async fn run_worker(
                                             &mut current_session,
                                             &evt_tx_clone,
                                             &tool_calls,
+                                            &tool_metadata,
+                                            &pending_fetches,
                                         )
                                         .await;
+                                        // Discard any fetches queued during replay —
+                                        // we don't emit ToolResource for history.
+                                        pending_fetches.lock().await.clear();
                                         let _ = evt_tx_clone
                                             .send(AcpEvent::SessionLoadEnd)
                                             .await;
+                                        // Refresh tool metadata for the new session.
+                                        *tool_metadata.lock().await =
+                                            fetch_tool_metadata(&cx).await;
                                     }
                                     Err(err) => {
                                         tracing::warn!(%err, "attach_session failed after session/load");
@@ -459,8 +654,9 @@ async fn run_worker(
                             Ok(s) => {
                                 active_id = s.session_id().to_string();
                                 current_session = s;
-                                // Refresh the list so the new session appears.
+                                // Refresh the list and tool metadata for the new session.
                                 cached_listed = fetch_top_sessions(&cx).await;
+                                *tool_metadata.lock().await = fetch_tool_metadata(&cx).await;
                                 let _ = evt_tx_clone
                                     .send(AcpEvent::SessionList(cached_listed.clone()))
                                     .await;
@@ -517,6 +713,8 @@ async fn drain_session_updates(
     session: &mut ActiveSession<'_, Agent>,
     evt_tx: &mpsc::Sender<AcpEvent>,
     tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+    tool_metadata: &Arc<Mutex<HashMap<String, Option<String>>>>,
+    pending_fetches: &Arc<Mutex<Vec<(ToolCallId, String)>>>,
 ) {
     loop {
         let update = match session.read_update().await {
@@ -531,9 +729,11 @@ async fn drain_session_updates(
             SessionMessage::SessionMessage(dispatch) => {
                 let tx = evt_tx.clone();
                 let tc_arc = Arc::clone(tool_calls);
+                let tm_arc = Arc::clone(tool_metadata);
+                let pf_arc = Arc::clone(pending_fetches);
                 let handled = MatchDispatch::new(dispatch)
                     .if_notification(async move |n: SessionNotification| {
-                        forward_update(n.update, &tx, &tc_arc).await;
+                        forward_update(n.update, &tx, &tc_arc, &tm_arc, &pf_arc).await;
                         Ok(())
                     })
                     .await
@@ -577,6 +777,8 @@ async fn drain_history_replay(
     session: &mut ActiveSession<'_, Agent>,
     evt_tx: &mpsc::Sender<AcpEvent>,
     tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+    tool_metadata: &Arc<Mutex<HashMap<String, Option<String>>>>,
+    pending_fetches: &Arc<Mutex<Vec<(ToolCallId, String)>>>,
 ) {
     loop {
         let next = tokio::time::timeout(Duration::ZERO, session.read_update()).await;
@@ -594,9 +796,11 @@ async fn drain_history_replay(
             SessionMessage::SessionMessage(dispatch) => {
                 let tx = evt_tx.clone();
                 let tc_arc = Arc::clone(tool_calls);
+                let tm_arc = Arc::clone(tool_metadata);
+                let pf_arc = Arc::clone(pending_fetches);
                 let handled = MatchDispatch::new(dispatch)
                     .if_notification(async move |n: SessionNotification| {
-                        forward_update(n.update, &tx, &tc_arc).await;
+                        forward_update(n.update, &tx, &tc_arc, &tm_arc, &pf_arc).await;
                         Ok(())
                     })
                     .await
@@ -648,10 +852,18 @@ fn apply_tool_call_update(
 /// updated and a **full snapshot** of the merged `ToolCall` is emitted.  This
 /// keeps the Leptos side dumb: it receives complete state and never needs to
 /// apply deltas itself.
+///
+/// When a `ToolCallUpdate` transitions a call to `Completed` status and the
+/// tool's definition in `tool_metadata` carries a `_meta.ui.resourceUri`, the
+/// (tool_call_id, resource_uri) pair is pushed onto `pending_fetches`.  The
+/// caller (which holds a live `cx`) drains that queue and emits
+/// `AcpEvent::ToolResource` after this function returns.
 async fn forward_update(
     update: SessionUpdate,
     tx: &mpsc::Sender<AcpEvent>,
     tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+    tool_metadata: &Arc<Mutex<HashMap<String, Option<String>>>>,
+    pending_fetches: &Arc<Mutex<Vec<(ToolCallId, String)>>>,
 ) {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
@@ -675,7 +887,21 @@ async fn forward_update(
                 apply_tool_call_update(existing, update.fields);
                 let merged = existing.clone();
                 drop(map);
-                let _ = tx.send(AcpEvent::ToolCall(Box::new(merged))).await;
+                let _ = tx.send(AcpEvent::ToolCall(Box::new(merged.clone()))).await;
+
+                // Queue a resource fetch if this call just completed and its
+                // tool definition advertises a UI resource URI.  The actual
+                // network call is made by process_pending_fetches() after the
+                // drain loop exits, where cx is in scope.
+                if merged.status == ToolCallStatus::Completed {
+                    let meta = tool_metadata.lock().await;
+                    if let Some(Some(resource_uri)) = meta.get(merged.title.as_str()) {
+                        pending_fetches
+                            .lock()
+                            .await
+                            .push((merged.tool_call_id.clone(), resource_uri.clone()));
+                    }
+                }
             }
             // If no prior ToolCall was received for this id, silently ignore.
             // This can only happen when history is replayed out of order, which
@@ -723,19 +949,39 @@ mod tests {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
-    // Helper: send one SessionUpdate through forward_update and return whatever
-    // AcpEvent was produced (if any).  Uses a fresh empty map.
-    async fn forwarded(update: SessionUpdate) -> Option<AcpEvent> {
-        forwarded_with_map(update, &empty_map()).await
+    /// Build an empty tool-metadata map.
+    fn empty_metadata() -> Arc<Mutex<HashMap<String, Option<String>>>> {
+        Arc::new(Mutex::new(HashMap::new()))
     }
 
-    // Helper: send one SessionUpdate through forward_update with a given map.
+    /// Build an empty pending-fetches queue.
+    fn empty_pending() -> Arc<Mutex<Vec<(ToolCallId, String)>>> {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    // Helper: send one SessionUpdate through forward_update and return whatever
+    // AcpEvent was produced (if any).  Uses fresh empty maps.
+    async fn forwarded(update: SessionUpdate) -> Option<AcpEvent> {
+        forwarded_with_maps(update, &empty_map(), &empty_metadata(), &empty_pending()).await
+    }
+
+    // Helper: send one SessionUpdate through forward_update with given maps.
     async fn forwarded_with_map(
         update: SessionUpdate,
         map: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
     ) -> Option<AcpEvent> {
+        forwarded_with_maps(update, map, &empty_metadata(), &empty_pending()).await
+    }
+
+    // Helper: send one SessionUpdate with all maps supplied.
+    async fn forwarded_with_maps(
+        update: SessionUpdate,
+        map: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+        metadata: &Arc<Mutex<HashMap<String, Option<String>>>>,
+        pending: &Arc<Mutex<Vec<(ToolCallId, String)>>>,
+    ) -> Option<AcpEvent> {
         let (tx, mut rx) = mpsc::channel(4);
-        forward_update(update, &tx, map).await;
+        forward_update(update, &tx, map, metadata, pending).await;
         rx.try_recv().ok()
     }
 
@@ -807,6 +1053,135 @@ mod tests {
         let update = SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new());
         let event = forwarded(update).await;
         assert!(event.is_none());
+    }
+
+    // ── ToolResource queuing tests ───────────────────────────────────────────
+
+    /// A completed tool whose definition has `_meta.ui.resourceUri` must push
+    /// an entry onto `pending_fetches`.
+    #[tokio::test]
+    async fn completed_tool_with_resource_uri_queues_fetch() {
+        let map = empty_map();
+        // Seed the tool-call map with an initial ToolCall.
+        let tool = ToolCall::new(ToolCallId::new("tc-res"), "my_widget");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        // Metadata says my_widget has a UI resource URI.
+        let metadata = Arc::new(Mutex::new(HashMap::from([(
+            "my_widget".to_string(),
+            Some("ui://demo/widget".to_string()),
+        )])));
+        let pending = empty_pending();
+
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-res"), fields);
+        forwarded_with_maps(
+            SessionUpdate::ToolCallUpdate(update),
+            &map,
+            &metadata,
+            &pending,
+        )
+        .await;
+
+        let fetches = pending.lock().await;
+        assert_eq!(fetches.len(), 1, "one pending fetch must be queued");
+        assert_eq!(
+            fetches[0].0.to_string(),
+            "tc-res",
+            "queued tool_call_id must match"
+        );
+        assert_eq!(
+            fetches[0].1, "ui://demo/widget",
+            "queued resource_uri must match"
+        );
+    }
+
+    /// A completed tool whose definition has NO `_meta.ui.resourceUri` must
+    /// not push anything onto `pending_fetches`.
+    #[tokio::test]
+    async fn completed_tool_without_resource_uri_does_not_queue_fetch() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-plain"), "list_dir");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        // Metadata knows about list_dir but it has no resource URI.
+        let metadata = Arc::new(Mutex::new(HashMap::from([(
+            "list_dir".to_string(),
+            None::<String>,
+        )])));
+        let pending = empty_pending();
+
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-plain"), fields);
+        forwarded_with_maps(
+            SessionUpdate::ToolCallUpdate(update),
+            &map,
+            &metadata,
+            &pending,
+        )
+        .await;
+
+        assert!(
+            pending.lock().await.is_empty(),
+            "no fetch should be queued for a tool without resourceUri"
+        );
+    }
+
+    /// An `in_progress` update must not push to `pending_fetches`; only
+    /// `completed` transitions trigger the resource fetch.
+    #[tokio::test]
+    async fn in_progress_tool_with_resource_uri_does_not_queue_fetch() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-wip"), "my_widget");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        let metadata = Arc::new(Mutex::new(HashMap::from([(
+            "my_widget".to_string(),
+            Some("ui://demo/widget".to_string()),
+        )])));
+        let pending = empty_pending();
+
+        // Update to in_progress — must not trigger a fetch.
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-wip"), fields);
+        forwarded_with_maps(
+            SessionUpdate::ToolCallUpdate(update),
+            &map,
+            &metadata,
+            &pending,
+        )
+        .await;
+
+        assert!(
+            pending.lock().await.is_empty(),
+            "in_progress must not queue a resource fetch"
+        );
+    }
+
+    /// A tool whose name is not in the metadata map at all must not queue a fetch.
+    #[tokio::test]
+    async fn completed_tool_not_in_metadata_does_not_queue_fetch() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-unknown"), "unknown_tool");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        // Metadata is completely empty — unknown_tool is not listed.
+        let pending = empty_pending();
+
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-unknown"), fields);
+        forwarded_with_maps(
+            SessionUpdate::ToolCallUpdate(update),
+            &map,
+            &empty_metadata(),
+            &pending,
+        )
+        .await;
+
+        assert!(
+            pending.lock().await.is_empty(),
+            "unknown tool must not queue a resource fetch"
+        );
     }
 
     /// Demonstrates the drain mechanism used in `drain_history_replay`.

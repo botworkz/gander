@@ -107,6 +107,11 @@ pub struct ChatMessage {
     /// match subsequent update snapshots to the right card.  `None` for
     /// user and assistant messages.
     pub tool_call_id: RwSignal<Option<String>>,
+    /// For `Role::Tool` messages: the full HTML document returned by
+    /// `goose/resource/read` when the tool definition carries
+    /// `_meta.ui.resourceUri`.  Set by a `tool_resource` bridge event.
+    /// `None` for all other roles and for tool calls without a UI resource.
+    pub ui_html: RwSignal<Option<String>>,
 }
 
 impl ChatMessage {
@@ -118,6 +123,7 @@ impl ChatMessage {
             streaming: RwSignal::new(false),
             error: RwSignal::new(None),
             tool_call_id: RwSignal::new(None),
+            ui_html: RwSignal::new(None),
         }
     }
 
@@ -129,6 +135,7 @@ impl ChatMessage {
             streaming: RwSignal::new(true),
             error: RwSignal::new(None),
             tool_call_id: RwSignal::new(None),
+            ui_html: RwSignal::new(None),
         }
     }
 
@@ -141,6 +148,7 @@ impl ChatMessage {
             streaming: RwSignal::new(true),
             error: RwSignal::new(None),
             tool_call_id: RwSignal::new(Some(tool_call_id)),
+            ui_html: RwSignal::new(None),
         }
     }
 }
@@ -262,6 +270,34 @@ fn handle_bridge_event(
                     m.streaming.set(!is_done);
                     messages.update(|v| v.push(m));
                 }
+            }
+        }
+
+        // ── tool resource (inline HTML from goose/resource/read) ───────────
+        Some("tool_resource") => {
+            let tool_call_id = js_sys::Reflect::get(&event, &JsValue::from_str("tool_call_id"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            let html = js_sys::Reflect::get(&event, &JsValue::from_str("html"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+
+            if tool_call_id.is_empty() || html.is_empty() {
+                return;
+            }
+
+            // Find the tool-call card by id and attach the HTML so it renders
+            // an inline iframe above the card.
+            let existing = messages
+                .get_untracked()
+                .iter()
+                .find(|m| m.tool_call_id.get_untracked().as_deref() == Some(tool_call_id.as_str()))
+                .copied();
+
+            if let Some(msg) = existing {
+                msg.ui_html.set(Some(html));
             }
         }
 
@@ -734,11 +770,41 @@ fn MessageList(messages: RwSignal<Vec<ChatMessage>>) -> impl IntoView {
 /// A single message bubble (user, assistant, or tool).
 ///
 /// Tool messages are rendered as a collapsible card via [`ToolCallCard`].
+/// When the tool definition carries `_meta.ui.resourceUri` and the resource
+/// has been fetched, a sandboxed `<iframe srcdoc>` is rendered **above** the
+/// card as a sibling — UI resources are always visible, not hidden behind the
+/// collapse toggle.
+///
 /// All other messages render their content via the markdown renderer.
 #[component]
 fn MessageView(message: ChatMessage) -> impl IntoView {
     match message.role {
-        Role::Tool => view! { <ToolCallCard message /> }.into_any(),
+        Role::Tool => view! {
+            <>
+                // Inline UI resource iframe — only present when the host has
+                // delivered a `tool_resource` event for this call.  Rendered
+                // above the card so it acts as presentation content, always
+                // visible regardless of the card's collapsed state.
+                //
+                // Sandbox: allow-scripts only.  No allow-same-origin so the
+                // frame cannot reach parent cookies/DOM/storage.  No
+                // allow-forms, allow-top-navigation, or allow-downloads.
+                {move || {
+                    message.ui_html.get().map(|html| {
+                        view! {
+                            <iframe
+                                class="tool-resource-iframe"
+                                srcdoc=html
+                                sandbox="allow-scripts"
+                                style="display:block;width:100%;height:320px;overflow:hidden;border:none;"
+                            />
+                        }
+                    })
+                }}
+                <ToolCallCard message />
+            </>
+        }
+        .into_any(),
         _ => {
             let role_class = match message.role {
                 Role::User => "message message--user",

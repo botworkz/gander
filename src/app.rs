@@ -997,6 +997,13 @@ fn acp_event_to_js(event: &AcpEvent) -> String {
                 tool_count_js,
             )
         }
+        AcpEvent::ToolResource { tool_call_id, html } => {
+            format!(
+                "window.gander._publish({{type:'tool_resource',tool_call_id:{},html:{}}})",
+                json_str(tool_call_id),
+                json_str(html),
+            )
+        }
     }
 }
 
