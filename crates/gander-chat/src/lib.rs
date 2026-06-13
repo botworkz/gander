@@ -6,7 +6,8 @@
 //!
 //! ```text
 //! App
-//! ├── Sidebar       (session list, "+ New session" button)
+//! ├── Sidebar       (session list, "+ New session" button, concertina menu)
+//! │   └── Concertina  (Recipes / Skills / Scheduler / Extensions / Settings)
 //! └── ChatPane
 //!     ├── MessageList   (scrollable, one MessageView per message)
 //!     ├── input row     (textarea + Send button)
@@ -521,8 +522,8 @@ pub fn App() -> impl IntoView {
 
 /// Left-edge session sidebar.
 ///
-/// Shows up to 5 sessions, a "+ New session" button, and highlights the
-/// active session.
+/// Layout: "+ New session" button at the top, session list at 50% of the
+/// remaining height, and the collapsible concertina menu below.
 #[component]
 fn Sidebar(
     sessions: RwSignal<Vec<SessionEntry>>,
@@ -591,6 +592,111 @@ fn Sidebar(
                     }
                 />
             </div>
+            <Concertina />
+        </div>
+    }
+}
+
+/// A single entry in the concertina menu.
+struct ConcertinaSection {
+    label: &'static str,
+    icon: &'static icondata_core::IconData,
+}
+
+/// The five concertina sections shown below the session list.
+const CONCERTINA_SECTIONS: &[ConcertinaSection] = &[
+    ConcertinaSection {
+        label: "Recipes",
+        icon: icondata::LuBookOpen,
+    },
+    ConcertinaSection {
+        label: "Skills",
+        icon: icondata::LuZap,
+    },
+    ConcertinaSection {
+        label: "Scheduler",
+        icon: icondata::LuClock,
+    },
+    ConcertinaSection {
+        label: "Extensions",
+        icon: icondata::LuPuzzle,
+    },
+    ConcertinaSection {
+        label: "Settings",
+        icon: icondata::LuSettings2,
+    },
+];
+
+/// Collapsible accordion menu placed below the sessions list in the sidebar.
+///
+/// One section open at a time; all sections start collapsed.  Clicking an
+/// open section collapses it; clicking a closed section opens it and closes
+/// whichever was previously open.
+#[component]
+fn Concertina() -> impl IntoView {
+    // Index of the currently open section, or `None` when all are collapsed.
+    let open: RwSignal<Option<usize>> = RwSignal::new(None);
+
+    view! {
+        <div class="concertina">
+            {CONCERTINA_SECTIONS
+                .iter()
+                .enumerate()
+                .map(|(idx, section)| {
+                    let label = section.label;
+                    let icon = section.icon;
+                    let is_open = move || open.get() == Some(idx);
+                    let on_click = move |_| {
+                        open.update(|o| {
+                            *o = if *o == Some(idx) { None } else { Some(idx) };
+                        });
+                    };
+                    view! {
+                        <div class="concertina-section">
+                            <button
+                                class=move || {
+                                    if is_open() {
+                                        "concertina-row concertina-row--open"
+                                    } else {
+                                        "concertina-row"
+                                    }
+                                }
+                                on:click=on_click
+                            >
+                                <span class="concertina-icon">
+                                    <Icon icon=icon width="15px" height="15px" />
+                                </span>
+                                <span class="concertina-label">{label}</span>
+                                <span class=move || {
+                                    if is_open() {
+                                        "concertina-chevron concertina-chevron--open"
+                                    } else {
+                                        "concertina-chevron"
+                                    }
+                                }>
+                                    <Icon
+                                        icon=icondata::LuChevronRight
+                                        width="14px"
+                                        height="14px"
+                                    />
+                                </span>
+                            </button>
+                            {move || {
+                                is_open()
+                                    .then(|| {
+                                        view! {
+                                            <div class="concertina-content">
+                                                <span class="concertina-placeholder">
+                                                    "Not yet implemented"
+                                                </span>
+                                            </div>
+                                        }
+                                    })
+                            }}
+                        </div>
+                    }
+                })
+                .collect::<Vec<_>>()}
         </div>
     }
 }
