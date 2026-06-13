@@ -122,7 +122,7 @@ impl AcpConnection {
         })
     }
 
-    /// Like [`connect`], but uses a caller-supplied command receiver.
+    /// Like [`Self::connect`], but uses a caller-supplied command receiver.
     ///
     /// Use this when the command sender (`cmd_tx`) must be captured by the
     /// webview IPC handler *before* the ACP task starts — the caller creates
