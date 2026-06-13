@@ -13,7 +13,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Leptos CSR (client-side rendering) — no server, no hydration.
-leptos = { version = "0.7", features = ["csr"] }
+# Upgraded to 0.8 to match leptos_icons 0.7 requirement (>=0.8.3).
+leptos = { version = "0.8", features = ["csr"] }
 
 # WASM / JS interop
 wasm-bindgen = "0.2"
@@ -30,3 +31,5 @@ pulldown-cmark = { version = "0.9", default-features = false }
 
 # Route panics to the browser developer-tools console
 console_error_panic_hook = "0.1"
+leptos_icons = "0.7.1"
+icondata = "0.7.0"

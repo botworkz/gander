@@ -259,6 +259,64 @@
     .send-btn:hover:not(:disabled) {
       background: #3d6bf3;
     }
+    /* ── input footer ────────────────────────────────────────── */
+
+    .input-footer {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 16px;
+      border-top: 1px solid #282838;
+      font-size: 0.78rem;
+      color: #8888a8;
+      background: #16162a;
+      overflow: hidden;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    /* cwd: takes available space but clips with ellipsis rather than wrapping */
+    .footer-cwd {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      min-width: 0;
+      flex: 0 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* thin divider between groups */
+    .footer-sep {
+      opacity: 0.35;
+      flex-shrink: 0;
+    }
+
+    /* placeholder fields — they stay on one line and don't grow */
+    .footer-tokens,
+    .footer-model,
+    .footer-mode,
+    .footer-tools {
+      flex-shrink: 0;
+    }
+
+    /* icon-only buttons (attach, settings) */
+    .footer-btn {
+      display: flex;
+      align-items: center;
+      background: none;
+      border: none;
+      padding: 0 2px;
+      cursor: pointer;
+      color: inherit;
+      font-size: inherit;
+      flex-shrink: 0;
+    }
+
+    .footer-btn:hover {
+      color: #b0b0d0;
+    }
   </style>
 
   <script>
@@ -367,6 +425,14 @@
           setTimeout(function () {
             fireEvent({ type: "session_list", sessions: MOCK_SESSIONS });
             fireEvent({ type: "session_active", id: _activeSessionId, history: [] });
+            // Footer metadata: cwd and model are real fields; tool_count is a
+            // placeholder until ACP v1 exposes it.
+            fireEvent({
+              type: "session_info",
+              cwd: "/home/phlax/dev/local/gander",
+              model: "claude-opus-4.7",
+              tool_count: 9,
+            });
           }, 50);
         } else if (type === "session_select") {
           var id = message.id;
