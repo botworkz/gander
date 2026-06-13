@@ -42,6 +42,7 @@ use std::{collections::HashMap, process::Stdio, time::Duration};
 
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
+use cosmic::iced::keyboard::{Key, Modifiers, key::Named};
 use cosmic::iced::{Alignment, Length, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, menu, nav_bar, segmented_button};
@@ -245,6 +246,11 @@ pub enum Message {
 
     /// Window resize event forwarded from the iced subscription.
     WindowResized(cosmic::iced::window::Id, cosmic::iced::Size),
+
+    /// Keyboard shortcut: Ctrl+PageUp — cycle to the previous tab.
+    PrevTab,
+    /// Keyboard shortcut: Ctrl+PageDown — cycle to the next tab.
+    NextTab,
 
     /// Update from libcosmic's `rectangle_tracker` subscription. We use it to
     /// observe the on-screen bounds of the active tab body widget so the
@@ -706,6 +712,17 @@ impl cosmic::Application for AppModel {
                 self.core.window.show_context = false;
             }
 
+            Message::PrevTab => {
+                if let Some(entity) = self.adjacent_tab(-1) {
+                    return self.update(Message::ActivateTab(entity));
+                }
+            }
+            Message::NextTab => {
+                if let Some(entity) = self.adjacent_tab(1) {
+                    return self.update(Message::ActivateTab(entity));
+                }
+            }
+
             // -------------------------------------------------------------------
             // Webview / window messages
             // -------------------------------------------------------------------
@@ -876,11 +893,26 @@ impl cosmic::Application for AppModel {
         let rect_sub = rectangle_tracker_subscription(TAB_BODY_TRACKER_ID)
             .map(|(_, u)| Message::TabBodyRect(u));
 
+        // Keyboard shortcut: Ctrl+PageUp / Ctrl+PageDown to cycle tabs.
+        // iced's keyboard subscription fires even when a child webview has
+        // focus (on X11, iced sees keys before WebKitGTK does), so this works
+        // whether the header or the chat input is focused.
+        let key_sub = cosmic::iced::keyboard::on_key_press(|key, mods| {
+            if !mods.contains(Modifiers::CTRL) {
+                return None;
+            }
+            match key {
+                Key::Named(Named::PageDown) => Some(Message::NextTab),
+                Key::Named(Named::PageUp) => Some(Message::PrevTab),
+                _ => None,
+            }
+        });
+
         #[cfg(target_os = "linux")]
-        return Subscription::batch([config_sub, resize_sub, gtk_pump, rect_sub]);
+        return Subscription::batch([config_sub, resize_sub, gtk_pump, rect_sub, key_sub]);
 
         #[cfg(not(target_os = "linux"))]
-        Subscription::batch([config_sub, resize_sub])
+        Subscription::batch([config_sub, resize_sub, key_sub])
     }
 
     fn on_nav_select(&mut self, _id: nav_bar::Id) -> Task<cosmic::Action<Self::Message>> {
@@ -985,6 +1017,20 @@ impl AppModel {
         self.tab_data
             .get(&self.tabs.active())
             .map(|tab| tab.profile.as_str())
+    }
+
+    /// Return the entity `offset` positions away from the current active tab,
+    /// wrapping around. Returns `None` when there are fewer than two tabs.
+    fn adjacent_tab(&self, offset: i32) -> Option<segmented_button::Entity> {
+        let entities: Vec<segmented_button::Entity> = self.tabs.iter().collect();
+        let len = entities.len();
+        if len < 2 {
+            return None;
+        }
+        let current = self.tabs.active();
+        let pos = entities.iter().position(|&e| e == current)?;
+        let next = ((pos as i32 + offset).rem_euclid(len as i32)) as usize;
+        Some(entities[next])
     }
 
     /// Open `kind`, or close it if it's already open. Closing any drawer also
