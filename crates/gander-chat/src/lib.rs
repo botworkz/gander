@@ -747,25 +747,38 @@ fn MessageView(message: ChatMessage) -> impl IntoView {
             };
             view! {
                 <div class=role_class>
-                    // Reactive inner HTML: re-evaluates only when `content` changes.
-                    <div
-                        class="message-content"
-                        inner_html=move || markdown::render(&message.content.get())
-                    />
-                    // Blinking cursor while the host is still streaming tokens.
-                    {move || {
-                        message
-                            .streaming
-                            .get()
-                            .then(|| view! { <span class="streaming-cursor">"▋"</span> })
-                    }}
-                    // Error notice, shown only on failure.
-                    {move || {
-                        message
-                            .error
-                            .get()
-                            .map(|e| view! { <div class="error-notice">{e}</div> })
-                    }}
+                    // Avatar gutter — only present for assistant messages.
+                    {matches!(message.role, Role::Assistant).then(|| {
+                        view! {
+                            <img
+                                class="message-avatar"
+                                src="/assets/gander.png"
+                                alt="gander"
+                            />
+                        }
+                    })}
+                    // Bubble body: content, streaming cursor, and error notice.
+                    <div class="message-bubble">
+                        // Reactive inner HTML: re-evaluates only when `content` changes.
+                        <div
+                            class="message-content"
+                            inner_html=move || markdown::render(&message.content.get())
+                        />
+                        // Blinking cursor while the host is still streaming tokens.
+                        {move || {
+                            message
+                                .streaming
+                                .get()
+                                .then(|| view! { <span class="streaming-cursor">"▋"</span> })
+                        }}
+                        // Error notice, shown only on failure.
+                        {move || {
+                            message
+                                .error
+                                .get()
+                                .map(|e| view! { <div class="error-notice">{e}</div> })
+                        }}
+                    </div>
                 </div>
             }
             .into_any()
