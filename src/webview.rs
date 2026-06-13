@@ -210,7 +210,7 @@ pub fn claim_pending(entity: segmented_button::Entity) -> Option<WebView> {
 /// tab's WebView.
 ///
 /// `tab_id` is the entity index; the chat UI stamps every outbound IPC message
-/// with it so gander can route replies to the correct [`AcpConnection`].
+/// with it so gander can route replies to the correct `AcpConnection`.
 ///
 /// The profile name is percent-encoded so that special characters (`&`, `?`,
 /// `#`, spaces, …) cannot break the URL or leak into adjacent query params.
@@ -436,7 +436,7 @@ impl WebviewStore {
 /// real on-screen tab body rectangle.
 ///
 /// `cmd_tx` is wired into the WebView's IPC handler so that messages from
-/// `window.gander.send(text)` are forwarded to the per-tab [`AcpConnection`].
+/// `window.gander.send(text)` are forwarded to the per-tab `AcpConnection`.
 ///
 /// # Panics
 ///
