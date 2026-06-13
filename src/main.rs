@@ -13,6 +13,8 @@ mod webview;
 use std::process;
 
 fn main() -> cosmic::iced::Result {
+    install_panic_hook();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -49,4 +51,53 @@ fn main() -> cosmic::iced::Result {
     );
 
     cosmic::app::run::<app::AppModel>(settings, flags)
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let message = panic_message(panic_info.payload());
+        if matches!(
+            message,
+            Some(msg) if is_winit_xim_glx_bad_window_panic_message(msg)
+        ) {
+            eprintln!("gander: GLXBadWindow on shutdown (winit/xim bug, ignored)");
+            return;
+        }
+
+        default_hook(panic_info);
+    }));
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return Some(message);
+    }
+    payload.downcast_ref::<String>().map(String::as_str)
+}
+
+fn is_winit_xim_glx_bad_window_panic_message(message: &str) -> bool {
+    message.contains("Failed to unfocus input context")
+        && message.contains("description: \"GLXBadWindow\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_winit_xim_glx_bad_window_panic_message;
+
+    #[test]
+    fn matches_winit_xim_glx_bad_window_panic_message() {
+        let message = "Failed to unfocus input context: XError { description: \"GLXBadWindow\", error_code: 168, request_code: 149, minor_code: 32 }";
+        assert!(is_winit_xim_glx_bad_window_panic_message(message));
+    }
+
+    #[test]
+    fn does_not_match_other_panics() {
+        assert!(!is_winit_xim_glx_bad_window_panic_message(
+            "Failed to unfocus input context: XError { description: \"BadWindow\" }"
+        ));
+        assert!(!is_winit_xim_glx_bad_window_panic_message(
+            "thread 'main' panicked at something else"
+        ));
+    }
 }
