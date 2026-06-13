@@ -23,8 +23,9 @@ use std::{env, path::PathBuf};
 use agent_client_protocol::{
     ByteStreams, SessionMessage,
     schema::{
-        ContentBlock, InitializeRequest, ListSessionsRequest, NewSessionResponse, ProtocolVersion,
-        ResumeSessionRequest, SessionId, SessionNotification, SessionUpdate, StopReason,
+        ContentBlock, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
+        NewSessionResponse, ProtocolVersion, SessionId, SessionNotification, SessionUpdate,
+        StopReason,
     },
     util::MatchDispatch,
 };
@@ -87,7 +88,8 @@ pub enum AcpEvent {
     /// The active session has been established or switched.
     ///
     /// The `String` is the session ID. History is not replayed —
-    /// `session/resume` in ACP v1 does not return prior messages.
+    /// `session/load` does not return prior messages — agents reattach
+    /// to the session but the chat history isn't replayed in the wire.
     SessionActive(String),
 }
 
@@ -324,7 +326,7 @@ async fn run_worker(
             let mut current_session = if let Some(first) = listed.first() {
                 let sid = SessionId::new(first.id.clone());
                 match cx
-                    .send_request(ResumeSessionRequest::new(sid.clone(), cwd.clone()))
+                    .send_request(LoadSessionRequest::new(sid.clone(), cwd.clone()))
                     .block_task()
                     .await
                 {
@@ -333,7 +335,7 @@ async fn run_worker(
                         cx.attach_session(NewSessionResponse::new(sid), vec![])?
                     }
                     Err(err) => {
-                        tracing::warn!(%err, "session/resume failed; creating new session");
+                        tracing::warn!(%err, "session/load failed; creating new session");
                         let s = cx.build_session_cwd()?.block_task().start_session().await?;
                         active_id = s.session_id().to_string();
                         s
@@ -411,7 +413,7 @@ async fn run_worker(
                     AcpCommand::SessionSelect(id) => {
                         let sid = SessionId::new(id.clone());
                         match cx
-                            .send_request(ResumeSessionRequest::new(sid.clone(), cwd.clone()))
+                            .send_request(LoadSessionRequest::new(sid.clone(), cwd.clone()))
                             .block_task()
                             .await
                         {
@@ -434,9 +436,9 @@ async fn run_worker(
                                 }
                             }
                             Err(err) => {
-                                tracing::warn!(%err, "session/resume failed");
+                                tracing::warn!(%err, "session/load failed");
                                 let _ = evt_tx_clone
-                                    .send(AcpEvent::Error(format!("session/resume failed: {err}")))
+                                    .send(AcpEvent::Error(format!("session/load failed: {err}")))
                                     .await;
                             }
                         }
