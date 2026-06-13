@@ -1,6 +1,10 @@
 /target
-.cargo/
 vendor/
 vendor.tar
-# Trunk (WASM bundler) build output
-crates/gander-chat/dist/
+# Trunk (WASM bundler) build output — keep dist/index.html as a placeholder
+# so the gander build script can locate it without a full trunk build.
+crates/gander-chat/dist/*.wasm
+crates/gander-chat/dist/*.js
+crates/gander-chat/dist/*.css
+crates/gander-chat/dist/*snippet*
+crates/gander-chat/dist/*-hash*
