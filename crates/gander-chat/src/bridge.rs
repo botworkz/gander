@@ -79,7 +79,15 @@ pub fn post_json(json: &str) {
 
     // Parse the JSON string into a JS value so gander's `post` handler gets
     // a plain object rather than a string.
-    let value = js_sys::JSON::parse(json).unwrap_or(JsValue::UNDEFINED);
+    let value = match js_sys::JSON::parse(json) {
+        Ok(v) => v,
+        Err(_) => {
+            web_sys::console::error_1(&JsValue::from_str(&format!(
+                "gander-chat: post_json() received invalid JSON: {json}"
+            )));
+            return;
+        }
+    };
 
     let post_fn: Function = js_sys::Reflect::get(&gander, &JsValue::from_str("post"))
         .ok()
