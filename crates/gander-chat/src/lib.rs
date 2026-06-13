@@ -434,9 +434,11 @@ pub fn App() -> impl IntoView {
             };
 
             // Don't steal arrow keys from focused text inputs.
+            // HTML tagName is always uppercase in HTML documents per spec,
+            // so no case conversion is needed here.
             if let Some(target) = ev.target() {
                 if let Some(el) = target.dyn_ref::<web_sys::Element>() {
-                    let tag = el.tag_name().to_ascii_uppercase();
+                    let tag = el.tag_name();
                     if tag == "TEXTAREA" || tag == "INPUT" {
                         return;
                     }
@@ -483,7 +485,14 @@ pub fn App() -> impl IntoView {
         }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
 
         if let Some(window) = web_sys::window() {
-            let _ = window.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+            if window
+                .add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref())
+                .is_err()
+            {
+                web_sys::console::warn_1(&JsValue::from_str(
+                    "gander-chat: failed to register keydown listener for session cycling",
+                ));
+            }
         }
         cb.forget();
     }
