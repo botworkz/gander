@@ -11,6 +11,9 @@
   -->
   <link data-trunk rel="rust" data-wasm-opt="z">
 
+  <!-- Static assets (icons, images) copied verbatim to dist/assets/. -->
+  <link data-trunk rel="copy-dir" href="assets">
+
   <style>
     *, *::before, *::after { box-sizing: border-box; }
 
@@ -229,6 +232,25 @@
     .message--assistant {
       background: #2a2a3e;
       align-self: flex-start;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+
+    .message-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      flex-shrink: 0;              /* never compress when bubble is wide */
+      object-fit: cover;
+      margin-top: 4px;             /* visual alignment with first text baseline */
+      background: #1a1a2e;         /* falls back nicely if image fails */
+    }
+
+    /* bubble body: takes remaining space so content word-wraps correctly */
+    .message-bubble {
+      flex: 1;
+      min-width: 0;
     }
 
     /* tool call / result: gray, narrower, monospace feel */
