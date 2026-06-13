@@ -243,7 +243,7 @@ fn handle_bridge_event(
                 .and_then(|obj| js_sys::Reflect::get(obj, &JsValue::from_str("status")).ok())
                 .and_then(|v| v.as_string())
                 .unwrap_or_default();
-            let is_done = matches!(status.as_str(), "completed" | "failed");
+            let is_done = is_terminal_status(&status);
 
             // Find an existing card for this tool call id, or create one.
             let existing = messages
@@ -852,6 +852,12 @@ fn ToolCallCard(message: ChatMessage) -> impl IntoView {
     }
 }
 
+/// Return `true` for ACP `ToolCallStatus` values that indicate the call
+/// is finished (`"completed"` or `"failed"`).
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed")
+}
+
 /// Extract the tool title from a serialised `ToolCall` JSON string.
 fn parse_tool_title(json: &str) -> String {
     js_sys::JSON::parse(json)
@@ -872,8 +878,8 @@ fn tool_status_badge(json: &str, streaming: bool) -> &'static str {
         .and_then(|v| v.as_string())
         .unwrap_or_default();
     match status.as_str() {
-        "completed" => "✓",
-        "failed" => "✗",
+        s if is_terminal_status(s) && s == "completed" => "✓",
+        s if is_terminal_status(s) => "✗",
         "in_progress" => "running…",
         _ => "",
     }
