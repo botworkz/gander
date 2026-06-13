@@ -25,12 +25,101 @@
       flex-direction: column;
     }
 
-    /* ── layout ─────────────────────────────────────────────── */
+    /* ── top-level shell: sidebar + chat pane side-by-side ─── */
+
+    .gander-root {
+      display: flex;
+      height: 100dvh;
+      overflow: hidden;
+    }
+
+    /* ── session sidebar ─────────────────────────────────────── */
+
+    .sidebar {
+      width: 200px;
+      flex-shrink: 0;
+      background: #131326;
+      border-right: 1px solid #2a2a3e;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .new-session-btn {
+      background: #2d5be3;
+      color: #fff;
+      border: none;
+      border-radius: 0;
+      padding: 12px 14px;
+      font-family: inherit;
+      font-size: 0.88rem;
+      font-weight: 600;
+      text-align: left;
+      cursor: pointer;
+      flex-shrink: 0;
+      white-space: nowrap;
+    }
+
+    .new-session-btn:hover {
+      background: #3d6bf3;
+    }
+
+    .session-list {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .session-item {
+      background: none;
+      border: none;
+      color: #b0b0c8;
+      padding: 10px 14px;
+      text-align: left;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      border-bottom: 1px solid #1e1e32;
+      font-family: inherit;
+      font-size: 0.85rem;
+    }
+
+    .session-item:hover {
+      background: #1e1e38;
+      color: #e0e0e0;
+    }
+
+    .session-item--active {
+      background: #1e2e54;
+      color: #e0e0ff;
+      border-left: 3px solid #2d5be3;
+    }
+
+    .session-item--active:hover {
+      background: #1e3060;
+    }
+
+    .session-label {
+      font-weight: 500;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .session-ago {
+      font-size: 0.78rem;
+      opacity: 0.65;
+    }
+
+    /* ── chat pane ───────────────────────────────────────────── */
 
     .gander-chat {
       display: flex;
       flex-direction: column;
-      height: 100dvh;
+      flex: 1;
+      min-width: 0;
       max-width: 860px;
       width: 100%;
       margin: 0 auto;
@@ -63,6 +152,15 @@
     .message--assistant {
       background: #2a2a3e;
       align-self: flex-start;
+    }
+
+    /* tool call / result: gray, narrower, monospace feel */
+    .message--tool {
+      background: #1e2030;
+      align-self: flex-start;
+      border: 1px solid #2e3050;
+      font-size: 0.88em;
+      max-width: 90%;
     }
 
     /* pulldown-cmark wraps everything in <p>; strip the outer margin */
@@ -135,6 +233,11 @@
       border-color: #2d5be3;
     }
 
+    .input-box:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
     .send-btn {
       background: #2d5be3;
       color: #fff;
@@ -187,6 +290,13 @@
       }
 
       var _subscriber = null;
+      var _activeSessionId = "mock-session-1";
+
+      var MOCK_SESSIONS = [
+        { id: "mock-session-1", label: "Session 1", last_active: new Date(Date.now() - 5 * 60 * 1000).toISOString() },
+        { id: "mock-session-2", label: "Session 2", last_active: new Date(Date.now() - 2 * 3600 * 1000).toISOString() },
+        { id: "mock-session-3", label: "Session 3", last_active: new Date(Date.now() - 48 * 3600 * 1000).toISOString() },
+      ];
 
       function fireEvent(event) {
         if (_subscriber) {
@@ -209,13 +319,75 @@
         var i = 0;
         var interval = setInterval(function () {
           if (i < tokens.length) {
-            fireEvent({ type: "token", content: tokens[i] });
+            fireEvent({ type: "agent_text", content: tokens[i] });
             i++;
           } else {
             fireEvent({ type: "done" });
             clearInterval(interval);
           }
         }, 50);
+      }
+
+      function mockSessionLoad(id) {
+        var entry = MOCK_SESSIONS.find(function(s) { return s.id === id; });
+        var title = entry ? entry.label : id;
+        fireEvent({ type: "session_load_start" });
+        var history = [
+          { role: "user", text: "Tell me about " + title },
+          { role: "agent", text: "Sure! Here is what I know about **" + title + "**." },
+          { role: "tool_use", name: "read_file", input: '{"path": "/project/README.md"}' },
+          { role: "tool_result", name: "read_file", output: "# Project\nThis is the README." },
+          { role: "agent", text: "Done reading. Anything else?" },
+        ];
+        var delay = 80;
+        history.forEach(function(item) {
+          setTimeout(function() {
+            if (item.role === "user") {
+              fireEvent({ type: "user_text", content: item.text });
+            } else if (item.role === "agent") {
+              fireEvent({ type: "agent_text", content: item.text });
+              setTimeout(function() { fireEvent({ type: "done" }); }, 30);
+            } else if (item.role === "tool_use") {
+              fireEvent({ type: "tool_use", name: item.name, input: item.input });
+            } else if (item.role === "tool_result") {
+              fireEvent({ type: "tool_result", name: item.name, output: item.output });
+            }
+          }, delay);
+          delay += 80;
+        });
+        setTimeout(function() {
+          fireEvent({ type: "session_load_end" });
+        }, delay + 40);
+      }
+
+      function handlePost(message) {
+        var type = message && message.type;
+        if (type === "ready") {
+          // Respond to the WASM startup handshake with mock session data.
+          setTimeout(function () {
+            fireEvent({ type: "session_list", sessions: MOCK_SESSIONS });
+            fireEvent({ type: "session_active", id: _activeSessionId, history: [] });
+          }, 50);
+        } else if (type === "session_select") {
+          var id = message.id;
+          console.log("[mock gander] session_select:", id);
+          _activeSessionId = id;
+          setTimeout(function() { mockSessionLoad(id); }, 150);
+        } else if (type === "session_new") {
+          console.log("[mock gander] session_new");
+          var newId = "mock-session-" + (MOCK_SESSIONS.length + 1);
+          var newEntry = {
+            id: newId,
+            label: "Session " + (MOCK_SESSIONS.length + 1),
+            last_active: new Date().toISOString(),
+          };
+          MOCK_SESSIONS.unshift(newEntry);
+          _activeSessionId = newId;
+          fireEvent({ type: "session_list", sessions: MOCK_SESSIONS.slice(0, 5) });
+          fireEvent({ type: "session_active", id: newId, history: [] });
+        } else {
+          console.log("[mock gander] post:", message);
+        }
       }
 
       window.gander = {
@@ -227,6 +399,16 @@
           console.log("[mock gander] send:", text);
           // Simulate a short network round-trip before the first token.
           setTimeout(function () { mockStream(text); }, 300);
+        },
+
+        /**
+         * Post an arbitrary JSON message object to the host.
+         * Used for session control: ready, session_select, session_new.
+         * @param {object} message
+         */
+        post: function (message) {
+          console.log("[mock gander] post:", message);
+          handlePost(message);
         },
 
         /**

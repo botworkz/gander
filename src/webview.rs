@@ -118,15 +118,18 @@ struct ChatAssets;
 ///
 /// Satisfies the bridge contract documented in `crates/gander-chat/src/bridge.rs`.
 /// `send` posts a JSON-encoded `{type:"prompt",text:...}` message to the
-/// native IPC handler. `subscribe` wires up the subscriber list.
-/// `_publish` is called by gander (via `evaluate_script`) to fan events out
-/// to all registered subscribers.
+/// native IPC handler. `post` posts an arbitrary JSON message. `subscribe`
+/// wires up the subscriber list. `_publish` is called by gander (via
+/// `evaluate_script`) to fan events out to all registered subscribers.
 const BRIDGE_SCRIPT: &str = r#"
 window.gander = (function () {
     const subscribers = [];
     return {
         send: function (text) {
             window.ipc.postMessage(JSON.stringify({ type: 'prompt', text: text }));
+        },
+        post: function (message) {
+            window.ipc.postMessage(JSON.stringify(message));
         },
         subscribe: function (cb) {
             subscribers.push(cb);
@@ -495,6 +498,7 @@ pub fn create_child_webview(
         .with_devtools(std::env::var("GANDER_DEVTOOLS").is_ok())
         .with_ipc_handler(move |request: wry::http::Request<String>| {
             let body = request.body();
+            tracing::debug!(body = %body, "ipc handler received");
             match serde_json::from_str::<serde_json::Value>(body) {
                 Ok(json) => match json.get("type").and_then(|v| v.as_str()) {
                     Some("prompt") => {
@@ -514,6 +518,25 @@ pub fn create_child_webview(
                             if let Err(err) = nav_tx.try_send(dir) {
                                 tracing::warn!(%err, "ipc handler: failed to send tab_nav");
                             }
+                        }
+                    }
+                    Some("session_select") => {
+                        if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
+                            if let Err(err) =
+                                cmd_tx.try_send(AcpCommand::SessionSelect(id.to_owned()))
+                            {
+                                tracing::warn!(%err, "ipc handler: failed to send session_select");
+                            }
+                        }
+                    }
+                    Some("session_new") => {
+                        if let Err(err) = cmd_tx.try_send(AcpCommand::SessionNew) {
+                            tracing::warn!(%err, "ipc handler: failed to send session_new");
+                        }
+                    }
+                    Some("ready") => {
+                        if let Err(err) = cmd_tx.try_send(AcpCommand::RequestSessionInfo) {
+                            tracing::warn!(%err, "ipc handler: failed to send ready");
                         }
                     }
                     _ => {}

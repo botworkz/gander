@@ -69,16 +69,57 @@ interface GanderBridge {
 
 All events are plain JS objects with a `type` discriminant.
 
-#### `token`
+#### `agent_text`
 
-Appends a token to the current in-flight assistant message.
+Appends a text chunk to the current in-flight assistant message. Used for
+both live streaming and history replay.
 
 ```ts
-{ type: "token"; content: string }
+{ type: "agent_text"; content: string }
 ```
 
-`content` is a raw text fragment (not HTML).  Tokens are appended in order.
+`content` is a raw text fragment (not HTML).  Chunks are appended in order.
 The client renders the accumulated text as Markdown at each update.
+
+#### `user_text`
+
+Appends a completed user message. Used during history replay only.
+
+```ts
+{ type: "user_text"; content: string }
+```
+
+#### `tool_use`
+
+Signals the agent invoked a tool.
+
+```ts
+{ type: "tool_use"; name: string; input: string }
+```
+
+#### `tool_result`
+
+Signals a tool returned output.
+
+```ts
+{ type: "tool_result"; name: string; output: string }
+```
+
+#### `session_load_start`
+
+Clears the message list and enters replay mode (input disabled).
+
+```ts
+{ type: "session_load_start" }
+```
+
+#### `session_load_end`
+
+Exits replay mode (input re-enabled).
+
+```ts
+{ type: "session_load_end" }
+```
 
 #### `done`
 
@@ -108,10 +149,22 @@ client calls window.gander.send(text)
   ▼
 host starts streaming
   │
-  ├─▶  {type:"token", content:"Hello"}
-  ├─▶  {type:"token", content:" world"}
-  │    … (many tokens at ~60/s)
+  ├─▶  {type:"agent_text", content:"Hello"}
+  ├─▶  {type:"agent_text", content:" world"}
+  │    … (many chunks at ~60/s)
   └─▶  {type:"done"}
+```
+
+History replay (clicking a session in the sidebar):
+
+```
+client calls window.gander.post({type:"session_select", id:"…"})
+  │
+  ├─▶  {type:"session_load_start"}
+  ├─▶  {type:"user_text", content:"User said this"}
+  ├─▶  {type:"agent_text", content:"Agent replied"}
+  ├─▶  {type:"done"}
+  └─▶  {type:"session_load_end"}
 ```
 
 ### Extending the protocol
@@ -136,8 +189,8 @@ Trunk.toml     — Trunk build config
 ### Fine-grained reactivity
 
 Each `ChatMessage` holds its `content` as a `RwSignal<String>`.  Appending a
-token only re-evaluates the single `inner_html` binding on that message's
-`<div>`, not the whole list.  At 60 tokens/second this avoids per-token
+event only re-evaluates the single `inner_html` binding on that message's
+`<div>`, not the whole list.  At 60 chunks/second this avoids per-chunk
 virtual DOM diffing.
 
 ### Portability
