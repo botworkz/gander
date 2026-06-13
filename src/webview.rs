@@ -79,10 +79,14 @@
 use std::{borrow::Cow, cell::RefCell, collections::HashMap};
 
 use cosmic::widget::segmented_button;
+use slotmap::Key as _;
+use tokio::sync::mpsc;
 use wry::{
     Rect, WebView, WebViewBuilder,
     dpi::{LogicalPosition, LogicalSize},
 };
+
+use crate::acp::AcpCommand;
 
 /// Embedded assets from `crates/gander-chat/dist/`.
 ///
@@ -96,15 +100,17 @@ struct ChatAssets;
 /// Initialization script injected into every tab WebView before the WASM
 /// module instantiates.
 ///
-/// Satisfies the bridge contract documented in `crates/gander-chat/README.md`.
-/// `send` is a stub that logs to the devtools console; `subscribe` wires up the
-/// subscriber list. Real ACP plumbing replaces these stubs in a later PR.
-const STUB_BRIDGE: &str = r#"
+/// Satisfies the bridge contract documented in `crates/gander-chat/src/bridge.rs`.
+/// `send` posts a JSON-encoded `{type:"prompt",text:...}` message to the
+/// native IPC handler. `subscribe` wires up the subscriber list.
+/// `_publish` is called by gander (via `evaluate_script`) to fan events out
+/// to all registered subscribers.
+const BRIDGE_SCRIPT: &str = r#"
 window.gander = (function () {
     const subscribers = [];
     return {
         send: function (text) {
-            console.log('[gander stub] send:', text);
+            window.ipc.postMessage(JSON.stringify({ type: 'prompt', text: text }));
         },
         subscribe: function (cb) {
             subscribers.push(cb);
@@ -112,6 +118,11 @@ window.gander = (function () {
                 const i = subscribers.indexOf(cb);
                 if (i >= 0) subscribers.splice(i, 1);
             };
+        },
+        _publish: function (event) {
+            for (const cb of subscribers) {
+                try { cb(event); } catch (e) { console.error('[gander] subscriber error', e); }
+            }
         },
     };
 })();
@@ -195,13 +206,40 @@ pub fn claim_pending(entity: segmented_button::Entity) -> Option<WebView> {
 // Chat URL helper
 // ---------------------------------------------------------------------------
 
-/// Build the `gander://chat/index.html?profile=…` URL loaded by each tab's
-/// WebView.
+/// Build the `gander://chat/index.html?profile=…&tab_id=…` URL loaded by each
+/// tab's WebView.
 ///
-/// The `gander://chat/` custom protocol serves embedded assets from
-/// `crates/gander-chat/dist/` (built by `cargo xtask build-chat`).
-pub fn build_chat_url(profile: &str) -> String {
-    format!("gander://chat/index.html?profile={profile}")
+/// `tab_id` is the entity index; the chat UI stamps every outbound IPC message
+/// with it so gander can route replies to the correct `AcpConnection`.
+///
+/// The profile name is percent-encoded so that special characters (`&`, `?`,
+/// `#`, spaces, …) cannot break the URL or leak into adjacent query params.
+pub fn build_chat_url(profile: &str, tab_id: u64) -> String {
+    let encoded = percent_encode(profile);
+    format!("gander://chat/index.html?profile={encoded}&tab_id={tab_id}")
+}
+
+/// Percent-encode a string for use as a URL query-parameter value.
+///
+/// Encodes every byte that is not in the unreserved set (`A-Z a-z 0-9 - _ . ~`)
+/// as `%XX` using uppercase hex digits, matching RFC 3986 §2.3.
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b => {
+                let hi = b >> 4;
+                let lo = b & 0xf;
+                out.push('%');
+                out.push(char::from(if hi < 10 { b'0' + hi } else { b'A' + hi - 10 }));
+                out.push(char::from(if lo < 10 { b'0' + lo } else { b'A' + lo - 10 }));
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +405,18 @@ impl WebviewStore {
             tracing::warn!(%err, "set_bounds failed");
         }
     }
+
+    /// Evaluate `js` in the WebView for `entity`.
+    ///
+    /// Used by the GTK pump to push [`AcpEvent`](crate::acp::AcpEvent) payloads
+    /// into the chat UI via `window.gander._publish(...)`.
+    pub fn evaluate_script(&self, entity: segmented_button::Entity, js: &str) {
+        if let Some(view) = self.views.get(&entity) {
+            if let Err(err) = view.evaluate_script(js) {
+                tracing::warn!(?entity, %err, "evaluate_script failed");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +435,9 @@ impl WebviewStore {
 /// entire lifetime. Callers should make sure `initial_bounds` matches the
 /// real on-screen tab body rectangle.
 ///
+/// `cmd_tx` is wired into the WebView's IPC handler so that messages from
+/// `window.gander.send(text)` are forwarded to the per-tab `AcpConnection`.
+///
 /// # Panics
 ///
 /// Panics if `gtk::init()` was not called before this function (required by
@@ -394,14 +447,34 @@ pub fn create_child_webview(
     profile: &str,
     handle: &impl raw_window_handle::HasWindowHandle,
     initial_bounds: Rect,
+    cmd_tx: mpsc::Sender<AcpCommand>,
 ) -> bool {
-    let url = build_chat_url(profile);
+    let tab_id = entity.data().as_ffi();
+    let url = build_chat_url(profile, tab_id);
+
     match WebViewBuilder::new()
-        .with_initialization_script(STUB_BRIDGE)
+        .with_initialization_script(BRIDGE_SCRIPT)
         .with_custom_protocol("gander".into(), make_protocol_handler)
         .with_url(&url)
         .with_bounds(initial_bounds)
         .with_devtools(std::env::var("GANDER_DEVTOOLS").is_ok())
+        .with_ipc_handler(move |request: wry::http::Request<String>| {
+            let body = request.body();
+            match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(json) => {
+                    if json.get("type").and_then(|v| v.as_str()) == Some("prompt") {
+                        if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
+                            if let Err(err) = cmd_tx.try_send(AcpCommand::Prompt(text.to_owned())) {
+                                tracing::warn!(%err, "ipc handler: failed to send prompt");
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "ipc handler: invalid JSON from webview");
+                }
+            }
+        })
         .build_as_child(handle)
     {
         Ok(view) => {

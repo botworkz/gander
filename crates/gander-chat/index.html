@@ -176,6 +176,16 @@
     (function () {
       "use strict";
 
+      // Only install the mock if the host hasn't already provided a real
+      // window.gander. In the gander binary, BRIDGE_SCRIPT runs via wry's
+      // initialization-script hook *before* page <script> tags, so
+      // window.gander is already populated by the time this runs and we
+      // bail out. In `trunk serve` / a plain browser, no host bridge
+      // exists and this mock takes over for dev convenience.
+      if (window.gander) {
+        return;
+      }
+
       var _subscriber = null;
 
       function fireEvent(event) {

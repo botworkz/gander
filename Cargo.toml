@@ -23,18 +23,20 @@ agent-client-protocol = "0.14.0"
 anyhow = "1.0"
 dirs = "6.0"
 geese = { git = "https://github.com/phlax/geese", branch = "main" }
+geese-client = { git = "https://github.com/phlax/geese", branch = "main" }
 i18n-embed = { version = "0.16", features = [
     "fluent-system",
     "desktop-requester",
 ] }
 i18n-embed-fl = "0.10"
-nix = { version = "0.30.1", features = ["signal"] }
 open = "5.3"
 rust-embed = "8.8"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.44", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.44", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -69,6 +71,9 @@ gtk = { version = "0.18", default-features = false }
 # raw-window-handle is a transitive dep via wry/winit; listed explicitly so
 # webview.rs can use HasWindowHandle in its function signature.
 raw-window-handle = "0.6"
+# slotmap is a transitive dep via libcosmic/segmented-button; listed explicitly
+# so webview.rs can use slotmap::Key to convert Entity to a stable u64 tab_id.
+slotmap = "1"
 
 # Uncomment to test a locally-cloned libcosmic
 # [patch.'https://github.com/pop-os/libcosmic']
