@@ -97,10 +97,10 @@ jobs:
         ! grep -rqE '_goose/unstable|_meta\.goose|goose' crates/gander-chat/src/acp_core/ \
           || (echo "ERROR: acp_core/ must not reference goose" && exit 1)
 
-    - name: host transport details do not leak into acp core
+    - name: pure-ACP host code is goose-free
       run: |
-        ! grep -rqE 'connect_profile|XDG_RUNTIME_DIR' src/acp/ \
-          || (echo "ERROR: src/acp/ must not reference geesed handshake details" && exit 1)
+        ! grep -rqE '_goose/unstable|_meta\.goose|connect_profile|geese' src/acp/ \
+          || (echo "ERROR: src/acp/ must not reference goose or geesed" && exit 1)
 
   build:
     name: build (release)

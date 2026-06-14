@@ -2318,6 +2318,7 @@ version = "0.0.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
+ "async-trait",
  "dirs",
  "geese",
  "geese-client",

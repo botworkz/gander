@@ -3,6 +3,7 @@
 mod acp;
 mod app;
 mod config;
+mod ext;
 mod i18n;
 mod state;
 mod tab;
