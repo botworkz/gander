@@ -18,6 +18,7 @@
 //! socket. Geesed detects the socket close and stops the goose process for
 //! that profile.
 
+use std::time::Duration;
 use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 
 use agent_client_protocol::{
@@ -30,7 +31,6 @@ use agent_client_protocol::{
     util::MatchDispatch,
 };
 use serde_json::Value;
-use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -38,6 +38,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -337,9 +338,24 @@ async fn run_worker(
         .builder()
         .name("gander")
         .connect_with(transport, async move |cx| {
-            let init_resp = cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+            let init_req = InitializeRequest::new(ProtocolVersion::V1);
+            debug!(
+                target: "gander::wire",
+                direction = "send",
+                method = "initialize",
+                payload = %serde_json::to_string(&init_req).unwrap_or_default(),
+                "INIT_REQUEST"
+            );
+            let init_resp = cx.send_request(init_req)
                 .block_task()
                 .await?;
+            debug!(
+                target: "gander::wire",
+                direction = "recv",
+                method = "initialize",
+                payload = %serde_json::to_string(&init_resp).unwrap_or_default(),
+                "INIT_RESPONSE"
+            );
 
             // Extract the agent name from the InitializeResponse to display in the footer.
             // This is typically the agent implementation name (e.g. "goose"), not the LLM
@@ -409,12 +425,29 @@ async fn run_worker(
 
                     AcpCommand::SessionSelect(id) => {
                         let sid = SessionId::new(id.clone());
+                        let load_req = LoadSessionRequest::new(sid.clone(), cwd.clone());
+                        debug!(
+                            target: "gander::wire",
+                            direction = "send",
+                            method = "session/load",
+                            payload = %serde_json::to_string(&load_req).unwrap_or_default(),
+                            "SESSION_LOAD_REQUEST"
+                        );
                         match cx
-                            .send_request(LoadSessionRequest::new(sid.clone(), cwd.clone()))
+                            .send_request(load_req)
                             .block_task()
                             .await
                         {
-                            Ok(_) => {
+                            Ok(resp) => {
+                                debug!(
+                                    target: "gander::wire",
+                                    direction = "recv",
+                                    method = "session/load",
+                                    session_id = %id,
+                                    cwd = %cwd.to_string_lossy(),
+                                    payload = %serde_json::to_string(&resp).unwrap_or_default(),
+                                    "SESSION_LOAD_RESPONSE"
+                                );
                                 match cx.attach_session(NewSessionResponse::new(sid), vec![]) {
                                     Ok(s) => {
                                         current_session = s;
@@ -455,9 +488,22 @@ async fn run_worker(
                     }
 
                     AcpCommand::SessionNew => {
+                        debug!(
+                            target: "gander::wire",
+                            direction = "send",
+                            method = "session/new",
+                            "SESSION_NEW_REQUEST"
+                        );
                         match cx.build_session_cwd()?.block_task().start_session().await {
                             Ok(s) => {
                                 active_id = s.session_id().to_string();
+                                debug!(
+                                    target: "gander::wire",
+                                    direction = "recv",
+                                    method = "session/new",
+                                    session_id = %active_id,
+                                    "SESSION_NEW_RESPONSE"
+                                );
                                 current_session = s;
                                 // Refresh the list so the new session appears.
                                 cached_listed = fetch_top_sessions(&cx).await;
@@ -656,26 +702,75 @@ async fn forward_update(
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             if let ContentBlock::Text(text) = chunk.content {
-                let _ = tx.send(AcpEvent::AgentText(text.text)).await;
+                let event = AcpEvent::AgentText(text.text);
+                debug!(target: "gander::wire", direction = "emit", event_kind = ?event, "ACP_EVENT_EMIT");
+                let _ = tx.send(event).await;
             }
         }
         SessionUpdate::UserMessageChunk(chunk) => {
             if let ContentBlock::Text(text) = chunk.content {
-                let _ = tx.send(AcpEvent::UserText(text.text)).await;
+                let event = AcpEvent::UserText(text.text);
+                debug!(target: "gander::wire", direction = "emit", event_kind = ?event, "ACP_EVENT_EMIT");
+                let _ = tx.send(event).await;
             }
         }
         SessionUpdate::ToolCall(tc) => {
+            debug!(
+                target: "gander::wire",
+                direction = "recv",
+                method = "session/update",
+                update_kind = "tool_call",
+                stage = "create",
+                snapshot = %serde_json::to_string(&tc).unwrap_or_default(),
+                "TOOL_CALL"
+            );
             let mut map = tool_calls.lock().await;
             map.insert(tc.tool_call_id.clone(), tc.clone());
-            let _ = tx.send(AcpEvent::ToolCall(Box::new(tc))).await;
+            let event = AcpEvent::ToolCall(Box::new(tc));
+            debug!(target: "gander::wire", direction = "emit", event_kind = ?event, "ACP_EVENT_EMIT");
+            let _ = tx.send(event).await;
         }
         SessionUpdate::ToolCallUpdate(update) => {
+            debug!(
+                target: "gander::wire",
+                direction = "recv",
+                method = "session/update",
+                update_kind = "tool_call_update",
+                stage = "delta",
+                delta = %serde_json::to_string(&update).unwrap_or_default(),
+                "TOOL_CALL_UPDATE_DELTA"
+            );
             let mut map = tool_calls.lock().await;
             if let Some(existing) = map.get_mut(&update.tool_call_id) {
+                // Propagate _meta from the update onto the merged ToolCall so
+                // the meta isolator log below sees it and the UI gets it too.
+                if let Some(meta) = update.meta {
+                    existing.meta = Some(meta);
+                }
                 apply_tool_call_update(existing, update.fields);
                 let merged = existing.clone();
                 drop(map);
-                let _ = tx.send(AcpEvent::ToolCall(Box::new(merged))).await;
+                debug!(
+                    target: "gander::wire",
+                    direction = "recv",
+                    method = "session/update",
+                    update_kind = "tool_call_update",
+                    stage = "merged",
+                    snapshot = %serde_json::to_string(&merged).unwrap_or_default(),
+                    "TOOL_CALL_UPDATE_MERGED"
+                );
+                if let Some(meta) = merged.meta.as_ref() {
+                    debug!(
+                        target: "gander::wire",
+                        update_kind = "tool_call_update",
+                        tool_call_id = %merged.tool_call_id,
+                        meta = %serde_json::to_string(meta).unwrap_or_default(),
+                        "META_PAYLOAD"
+                    );
+                }
+                let event = AcpEvent::ToolCall(Box::new(merged));
+                debug!(target: "gander::wire", direction = "emit", event_kind = ?event, "ACP_EVENT_EMIT");
+                let _ = tx.send(event).await;
             }
             // If no prior ToolCall was received for this id, silently ignore.
             // This can only happen when history is replayed out of order, which
@@ -883,6 +978,67 @@ mod tests {
         assert!(
             v.get("raw_output").is_none(),
             "snake_case 'raw_output' must not appear in JSON"
+        );
+    }
+
+    /// Smoke test: every `forward_update` path emits at least one log line
+    /// with `target = "gander::wire"`.
+    ///
+    /// Uses `tracing_subscriber` with a captured writer so the assertions run
+    /// in-process without relying on env-var filtering.  If the target string
+    /// is mistyped at any log site the captured output will lack it and this
+    /// test will fail.
+    #[tokio::test]
+    async fn wire_target_appears_in_forward_update_logs() {
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        // Shared buffer that the subscriber writes into.
+        let buf: StdArc<StdMutex<Vec<u8>>> = StdArc::new(StdMutex::new(Vec::new()));
+        let buf_clone = StdArc::clone(&buf);
+
+        // A MakeWriter that hands out a clone of the Arc<Mutex<Vec<u8>>>.
+        #[derive(Clone)]
+        struct BufWriter(StdArc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufWriter(buf_clone))
+            .with_target(true)
+            // Accept all levels so even a mistaken `trace!` site would be caught.
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Exercise a ToolCall path (the richest path: creates a ToolCall,
+        // then sends an update so both TOOL_CALL and TOOL_CALL_UPDATE_* fire).
+        let map = empty_map();
+        let tc = ToolCall::new(ToolCallId::new("tc-wire-test"), "smoke");
+        forwarded_with_map(SessionUpdate::ToolCall(tc), &map).await;
+
+        let fields = ToolCallUpdateFields::new().raw_output(serde_json::json!({"ok": true}));
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-wire-test"), fields);
+        forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        let output = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(
+            output.contains("gander::wire"),
+            "expected 'gander::wire' in tracing output; got:\n{output}"
         );
     }
 }
