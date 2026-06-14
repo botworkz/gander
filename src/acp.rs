@@ -117,12 +117,14 @@ pub enum AcpEvent {
         model: String,
         tool_count: Option<u32>,
     },
-    /// Pre-hydrated HTML panel from a goose MCP App tool call.
+    /// HTML panel fetched for a goose MCP App tool call.
     ///
-    /// Emitted after a `ToolCallUpdate` that carries a `Completed` status and
-    /// a `_meta.goose.mcpApp.resourceResult` payload.  The UI should render
-    /// the HTML in a sandboxed iframe alongside the tool-call card.
-    // goose-ext: emitted when goose pre-hydrates an MCP App attachment
+    /// Emitted by `process_pending_fetches` after a successful
+    /// `_goose/unstable/resources/read` RPC triggered by a `Completed`
+    /// `ToolCallUpdate` that carried both `rawOutput.resourceUri` and
+    /// `_meta.goose.toolCall.extensionName`.  The UI should render the HTML
+    /// in a sandboxed iframe alongside the tool-call card.
+    // goose-ext: emitted after fetching the MCP App HTML via _goose/unstable/resources/read
     ToolResource { tool_call_id: String, html: String },
 }
 
@@ -355,24 +357,7 @@ async fn run_worker(
         .builder()
         .name("gander")
         .connect_with(transport, async move |cx| {
-            // goose-ext: advertise support for goose's server-side MCP App hydration so
-            // goose flips host_supports_mcp_apps() to true and embeds the pre-fetched HTML
-            // in ToolCallUpdate._meta.goose.mcpApp on every MCP App tool completion.
-            let mut caps_meta: Meta = serde_json::Map::new();
-            caps_meta.insert(
-                "goose".to_string(),
-                serde_json::json!({
-                    "mcpHostCapabilities": {
-                        "extensions": {
-                            (GOOSE_MCP_UI_EXTENSION_ID): {
-                                "mimeTypes": [GOOSE_MCP_UI_MIME_TYPE]
-                            }
-                        }
-                    }
-                }),
-            );
-            let init_req = InitializeRequest::new(ProtocolVersion::V1)
-                .client_capabilities(ClientCapabilities::new().meta(caps_meta));
+            let init_req = InitializeRequest::new(ProtocolVersion::V1);
             debug!(
                 target: "gander::wire",
                 direction = "send",
@@ -835,48 +820,36 @@ async fn forward_update(
                 let event = AcpEvent::ToolCall(Box::new(merged.clone()));
                 debug!(target: "gander::wire", direction = "emit", event_kind = ?event, "ACP_EVENT_EMIT");
                 let _ = tx.send(event).await;
-                // goose-ext: extract pre-hydrated MCP App HTML from goose-private _meta path
+                // goose-ext: on Completed, queue a _goose/unstable/resources/read
+                // using rawOutput.resourceUri and _meta.goose.toolCall.extensionName.
+                // The actual RPC is made by process_pending_fetches() once we have cx.
                 if merged.status == ToolCallStatus::Completed {
-                    if let Some(html) = extract_mcp_app_html(merged.meta.as_ref()) {
-                        let _ = tx
-                            .send(AcpEvent::ToolResource {
-                                tool_call_id: merged.tool_call_id.to_string(),
-                                html,
-                            })
-                            .await;
-                    } else {
-                        // goose-ext: hydration didn't fire — queue an explicit
-                        // _goose/unstable/resources/read using the rawOutput.resourceUri
-                        // and the extensionName from _meta.goose.toolCall.  The actual
-                        // RPC is made by process_pending_fetches() once we have cx.
-                        let resource_uri = merged
-                            .raw_output
-                            .as_ref()
-                            .and_then(|o| o.get("resourceUri"))
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        let extension_name = merged
-                            .meta
-                            .as_ref()
-                            .and_then(|m| m.get("goose"))
-                            .and_then(|g| g.get("toolCall"))
-                            .and_then(|t| t.get("extensionName"))
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        if let (Some(uri), Some(ext)) = (resource_uri, extension_name) {
-                            debug!(
-                                target: "gander::wire",
-                                tool_call_id = %merged.tool_call_id,
-                                resource_uri = %uri,
-                                extension_name = %ext,
-                                "QUEUE_READ_RESOURCE"
-                            );
-                            pending_fetches.lock().await.push((
-                                merged.tool_call_id.clone(),
-                                uri,
-                                ext,
-                            ));
-                        }
+                    let resource_uri = merged
+                        .raw_output
+                        .as_ref()
+                        .and_then(|o| o.get("resourceUri"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let extension_name = merged
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.get("goose"))
+                        .and_then(|g| g.get("toolCall"))
+                        .and_then(|t| t.get("extensionName"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    if let (Some(uri), Some(ext)) = (resource_uri, extension_name) {
+                        debug!(
+                            target: "gander::wire",
+                            tool_call_id = %merged.tool_call_id,
+                            resource_uri = %uri,
+                            extension_name = %ext,
+                            "QUEUE_READ_RESOURCE"
+                        );
+                        pending_fetches
+                            .lock()
+                            .await
+                            .push((merged.tool_call_id.clone(), uri, ext));
                     }
                 }
             }
@@ -890,43 +863,34 @@ async fn forward_update(
 }
 
 // ---------------------------------------------------------------------------
-// goose-ext: MCP App HTML extraction
-// ---------------------------------------------------------------------------
-
-/// Walk `_meta.goose.mcpApp.resourceResult.contents[]` looking for an HTML item.
-///
-/// Accepts both bare `text/html` and the spec'd `text/html;profile=mcp-app`
-/// mime types so minor server-side variations don't break rendering.
-///
-/// Returns `None` when:
-/// - `meta` is absent
-/// - the goose-private `mcpApp` key is missing (non-MCP-App tool call)
-/// - `readError` is present instead of `resourceResult` (server-side fetch
-///   failed; the caller should log and skip rendering)
-// goose-ext: navigates goose-private _meta.goose.mcpApp.resourceResult.contents[]
-fn extract_mcp_app_html(meta: Option<&Meta>) -> Option<String> {
-    let meta = meta?;
-    let goose = meta.get("goose")?;
-    let mcp_app = goose.get("mcpApp")?;
-    if mcp_app.get("readError").is_some() {
-        tracing::warn!("goose MCP App readError present; skipping iframe render");
-        return None;
-    }
-    let contents = mcp_app.get("resourceResult")?.get("contents")?.as_array()?;
-    for item in contents {
-        let mime = item.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
-        if mime.starts_with("text/html") {
-            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                return Some(text.to_string());
-            }
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
 // goose-ext: explicit resource fetch via _goose/unstable/resources/read
 // ---------------------------------------------------------------------------
+
+/// Extract the first `text/html` item from a `_goose/unstable/resources/read` response.
+///
+/// Response shape (goose ≥ 1.37.0 `acp/server/resources.rs`):
+///   `{ result: { contents: [{ uri, mimeType, text }] } }`
+///
+/// Returns `None` when:
+/// - the `result` or `contents` keys are absent
+/// - no item carries a `text/html` (or `text/html;…`) mime type
+// goose-ext: navigates goose-private _goose/unstable/resources/read response shape
+fn extract_html_from_read_resource_response(response: &Value) -> Option<String> {
+    let items = response
+        .get("result")
+        .and_then(|r| r.get("contents"))
+        .and_then(|c| c.as_array())?;
+    items.iter().find_map(|item| {
+        let mime = item.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
+        if mime.starts_with("text/html") {
+            item.get("text")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        } else {
+            None
+        }
+    })
+}
 
 /// Drain `pending_fetches` and call `_goose/unstable/resources/read` for each.
 ///
@@ -980,26 +944,7 @@ async fn process_pending_fetches<R>(
             payload = %serde_json::to_string(&response).unwrap_or_default(),
             "READ_RESOURCE_RESPONSE"
         );
-        // Response shape (from goose v1.34.1 acp/server/resources.rs):
-        //   { result: ReadResourceResult }
-        // where ReadResourceResult is { contents: [{ uri, mimeType, text }] }.
-        let html = response
-            .get("result")
-            .and_then(|r| r.get("contents"))
-            .and_then(|c| c.as_array())
-            .and_then(|items| {
-                items.iter().find_map(|item| {
-                    let mime = item.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
-                    if mime.starts_with("text/html") {
-                        item.get("text")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    } else {
-                        None
-                    }
-                })
-            });
-        if let Some(html) = html {
+        if let Some(html) = extract_html_from_read_resource_response(&response) {
             let _ = tx
                 .send(AcpEvent::ToolResource {
                     tool_call_id: tool_call_id.to_string(),
@@ -1041,7 +986,7 @@ fn runtime_dir() -> PathBuf {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::{
-        ContentChunk, Meta, TextContent, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+        ContentChunk, TextContent, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
         ToolCallUpdateFields,
     };
 
@@ -1065,23 +1010,6 @@ mod tests {
         let pf = Arc::new(Mutex::new(Vec::new()));
         forward_update(update, &tx, map, &pf).await;
         rx.try_recv().ok()
-    }
-
-    // Helper: collect all events produced by one SessionUpdate. Some updates
-    // emit more than one event (e.g. a Completed ToolCallUpdate with mcpApp
-    // meta emits both a ToolCall snapshot and a ToolResource).
-    async fn all_forwarded_with_map(
-        update: SessionUpdate,
-        map: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
-    ) -> Vec<AcpEvent> {
-        let (tx, mut rx) = mpsc::channel(8);
-        let pf = Arc::new(Mutex::new(Vec::new()));
-        forward_update(update, &tx, map, &pf).await;
-        let mut events = Vec::new();
-        while let Ok(e) = rx.try_recv() {
-            events.push(e);
-        }
-        events
     }
 
     #[tokio::test]
@@ -1292,146 +1220,181 @@ mod tests {
         );
     }
 
-    // ── MCP App HTML extraction ───────────────────────────────────────────
+    // ── queue+fetch path ──────────────────────────────────────────────────
 
-    fn make_completed_update(tc_id: &str, mime: &str, html: &str) -> ToolCallUpdate {
-        let meta_map: Meta = serde_json::from_value(serde_json::json!({
-            "goose": {
-                "mcpApp": {
-                    "resourceResult": {
-                        "contents": [
-                            {
-                                "mimeType": mime,
-                                "text": html
-                            }
-                        ]
-                    }
-                }
-            }
-        }))
-        .unwrap();
-        ToolCallUpdate::new(
-            ToolCallId::new(tc_id),
-            ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
-        )
-        .meta(meta_map)
+    // Helper: send one SessionUpdate through forward_update with a given map
+    // and return what ended up in pending_fetches.
+    async fn queued_fetches_after(
+        update: SessionUpdate,
+        map: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+    ) -> Vec<(ToolCallId, String, String)> {
+        let (tx, _rx) = mpsc::channel(8);
+        let pf: PendingFetches = Arc::new(Mutex::new(Vec::new()));
+        forward_update(update, &tx, map, &pf).await;
+        pf.lock().await.clone()
     }
 
     #[tokio::test]
-    async fn completed_tool_with_mcp_app_meta_emits_tool_resource() {
-        let map = empty_map();
-        let tool = ToolCall::new(ToolCallId::new("tc-mcp-1"), "mcp_app_tool");
-        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
-
-        let update = make_completed_update("tc-mcp-1", "text/html", "<h1>Panel</h1>");
-        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
-
-        let resource = events
-            .iter()
-            .find(|e| matches!(e, AcpEvent::ToolResource { .. }));
-        match resource {
-            Some(AcpEvent::ToolResource { tool_call_id, html }) => {
-                assert_eq!(tool_call_id, "tc-mcp-1");
-                assert_eq!(html, "<h1>Panel</h1>");
-            }
-            _ => panic!("expected ToolResource event, got {events:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn completed_tool_with_text_html_profile_mime_emits_tool_resource() {
-        let map = empty_map();
-        let tool = ToolCall::new(ToolCallId::new("tc-mcp-2"), "mcp_app_tool");
-        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
-
-        let update = make_completed_update("tc-mcp-2", "text/html;profile=mcp-app", "<p>hello</p>");
-        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
-
-        let resource = events
-            .iter()
-            .find(|e| matches!(e, AcpEvent::ToolResource { .. }));
-        match resource {
-            Some(AcpEvent::ToolResource { tool_call_id, html }) => {
-                assert_eq!(tool_call_id, "tc-mcp-2");
-                assert_eq!(html, "<p>hello</p>");
-            }
-            _ => panic!("expected ToolResource for profile mime, got {events:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn completed_tool_without_mcp_app_meta_does_not_emit() {
+    async fn completed_tool_without_resource_uri_does_not_queue() {
         let map = empty_map();
         let tool = ToolCall::new(ToolCallId::new("tc-plain"), "plain_tool");
         forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
 
         let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
         let update = ToolCallUpdate::new(ToolCallId::new("tc-plain"), fields);
-        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+        let fetches = queued_fetches_after(SessionUpdate::ToolCallUpdate(update), &map).await;
 
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, AcpEvent::ToolResource { .. })),
-            "plain completed tool must not emit ToolResource; got {events:?}"
+            fetches.is_empty(),
+            "no resourceUri means nothing queued; got {fetches:?}"
         );
     }
 
     #[tokio::test]
-    async fn completed_tool_with_read_error_does_not_emit() {
+    async fn completed_tool_with_resource_uri_but_no_extension_does_not_queue() {
         let map = empty_map();
-        let tool = ToolCall::new(ToolCallId::new("tc-err"), "mcp_app_tool");
+        let tool = ToolCall::new(ToolCallId::new("tc-no-ext"), "mcp_tool");
         forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
 
-        // readError present, no resourceResult.
-        let meta_map: Meta = serde_json::from_value(serde_json::json!({
-            "goose": {
-                "mcpApp": {
-                    "readError": "resource not found"
-                }
-            }
-        }))
-        .unwrap();
-        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
-        let update = ToolCallUpdate::new(ToolCallId::new("tc-err"), fields).meta(meta_map);
-        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+        // rawOutput has resourceUri but _meta has no extensionName
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .raw_output(serde_json::json!({"resourceUri": "mcp://ext/resource"}));
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-no-ext"), fields);
+        let fetches = queued_fetches_after(SessionUpdate::ToolCallUpdate(update), &map).await;
 
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, AcpEvent::ToolResource { .. })),
-            "readError must not produce ToolResource; got {events:?}"
+            fetches.is_empty(),
+            "missing extensionName means nothing queued; got {fetches:?}"
         );
     }
 
     #[tokio::test]
-    async fn in_progress_tool_with_mcp_app_meta_does_not_emit() {
+    async fn completed_tool_with_resource_uri_and_extension_queues_fetch() {
         let map = empty_map();
-        let tool = ToolCall::new(ToolCallId::new("tc-inprog"), "mcp_app_tool");
+        // goose-ext: extensionName arrives on ToolCall creation in _meta.goose.toolCall
+        let meta_map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "goose": { "toolCall": { "extensionName": "my_ext" } }
+            }))
+            .unwrap();
+        let tool = ToolCall::new(ToolCallId::new("tc-queue"), "mcp_tool").meta(meta_map);
         forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
 
-        // Same mcpApp payload but status is InProgress — gate must hold.
-        let meta_map: Meta = serde_json::from_value(serde_json::json!({
-            "goose": {
-                "mcpApp": {
-                    "resourceResult": {
-                        "contents": [
-                            { "mimeType": "text/html", "text": "<p>early</p>" }
-                        ]
-                    }
-                }
-            }
-        }))
-        .unwrap();
-        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
-        let update = ToolCallUpdate::new(ToolCallId::new("tc-inprog"), fields).meta(meta_map);
-        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+        // Completed update merges rawOutput.resourceUri into the snapshot.
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .raw_output(serde_json::json!({"resourceUri": "mcp://my_ext/panel"}));
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-queue"), fields);
+        let fetches = queued_fetches_after(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        assert_eq!(fetches.len(), 1, "expected exactly one queued fetch");
+        let (tc_id, uri, ext) = &fetches[0];
+        assert_eq!(tc_id.to_string(), "tc-queue");
+        assert_eq!(uri, "mcp://my_ext/panel");
+        assert_eq!(ext, "my_ext");
+    }
+
+    #[tokio::test]
+    async fn in_progress_tool_with_resource_uri_does_not_queue() {
+        let map = empty_map();
+        let meta_map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "goose": { "toolCall": { "extensionName": "my_ext" } }
+            }))
+            .unwrap();
+        let tool = ToolCall::new(ToolCallId::new("tc-inprog"), "mcp_tool").meta(meta_map);
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        // Status is InProgress — queue gate must not fire.
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::InProgress)
+            .raw_output(serde_json::json!({"resourceUri": "mcp://my_ext/panel"}));
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-inprog"), fields);
+        let fetches = queued_fetches_after(SessionUpdate::ToolCallUpdate(update), &map).await;
 
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, AcpEvent::ToolResource { .. })),
-            "InProgress tool must not emit ToolResource; got {events:?}"
+            fetches.is_empty(),
+            "InProgress must not queue; got {fetches:?}"
         );
+    }
+
+    // goose-ext: meta merge test — extensionName is delivered on ToolCall creation
+    // and must survive a later ToolCallUpdate that carries rawOutput but no meta.
+    #[tokio::test]
+    async fn meta_merge_preserves_extension_name_across_updates() {
+        let map = empty_map();
+        let meta_map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "goose": { "toolCall": { "extensionName": "keep_me" } }
+            }))
+            .unwrap();
+        let tool = ToolCall::new(ToolCallId::new("tc-merge"), "mcp_tool").meta(meta_map);
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        // First update: no meta, no status change — extensionName must still be in map.
+        let fields1 = ToolCallUpdateFields::new().raw_output(serde_json::json!({"partial": true}));
+        let upd1 = ToolCallUpdate::new(ToolCallId::new("tc-merge"), fields1);
+        forwarded_with_map(SessionUpdate::ToolCallUpdate(upd1), &map).await;
+
+        // Second update: Completed + resourceUri — should queue because meta was preserved.
+        let fields2 = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .raw_output(serde_json::json!({"resourceUri": "mcp://keep_me/x"}));
+        let upd2 = ToolCallUpdate::new(ToolCallId::new("tc-merge"), fields2);
+        let fetches = queued_fetches_after(SessionUpdate::ToolCallUpdate(upd2), &map).await;
+
+        assert_eq!(fetches.len(), 1, "extensionName must survive meta merge");
+        assert_eq!(fetches[0].2, "keep_me");
+    }
+
+    // ── extract_html_from_read_resource_response ──────────────────────────
+
+    #[test]
+    fn extract_html_returns_text_for_text_html_mime() {
+        let resp = serde_json::json!({
+            "result": {
+                "contents": [{ "mimeType": "text/html", "text": "<p>hi</p>", "uri": "x" }]
+            }
+        });
+        assert_eq!(
+            extract_html_from_read_resource_response(&resp),
+            Some("<p>hi</p>".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_html_accepts_text_html_profile_variant() {
+        let resp = serde_json::json!({
+            "result": {
+                "contents": [{ "mimeType": "text/html;profile=mcp-app", "text": "<div/>", "uri": "x" }]
+            }
+        });
+        assert_eq!(
+            extract_html_from_read_resource_response(&resp),
+            Some("<div/>".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_html_returns_none_for_non_html_mime() {
+        let resp = serde_json::json!({
+            "result": {
+                "contents": [{ "mimeType": "application/json", "text": "{}", "uri": "x" }]
+            }
+        });
+        assert!(extract_html_from_read_resource_response(&resp).is_none());
+    }
+
+    #[test]
+    fn extract_html_returns_none_when_contents_empty() {
+        let resp = serde_json::json!({ "result": { "contents": [] } });
+        assert!(extract_html_from_read_resource_response(&resp).is_none());
+    }
+
+    #[test]
+    fn extract_html_returns_none_when_result_key_missing() {
+        let resp = serde_json::json!({ "other": {} });
+        assert!(extract_html_from_read_resource_response(&resp).is_none());
     }
 }
