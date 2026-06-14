@@ -17,6 +17,12 @@ Deferred (see [`DESIGN.md`](./DESIGN.md)):
 
 - ACP wiring (real `send` / `subscribe` backed by goosed)
 
+## Requirements
+
+- **goose ≥ 1.37.0** — gander uses the `_goose/unstable/resources/read` RPC to
+  fetch MCP App HTML panels.  Earlier versions ship an incompatible response
+  shape and will silently drop the panel.
+
 ## Build
 
 Requires Rust 2024 edition (stable Rust 1.85+) and the COSMIC dev deps.
