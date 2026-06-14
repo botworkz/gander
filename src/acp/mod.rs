@@ -5,12 +5,10 @@
 //! Each open tab gets one [`AcpConnection`], created when the tab opens and
 //! dropped when the tab closes. The connection:
 //!
-//! 1. Connects to `$XDG_RUNTIME_DIR/geese/acp.sock`.
-//! 2. Sends a `connect_profile` JSON-RPC handshake; geesed spawns goose and
-//!    returns success, or returns a typed error code.
-//! 3. After the handshake, the socket becomes a raw byte relay to goose's
+//! 1. Connects to the geesed ACP socket via the geesed transport.
+//! 2. After the handshake, the socket becomes a raw byte relay to goose's
 //!    stdio. We layer the ACP protocol SDK over it.
-//! 4. Exposes [`AcpConnection::send`] (for user prompts) and
+//! 3. Exposes [`AcpConnection::send`] (for user prompts) and
 //!    [`AcpConnection::recv`] (for streaming events) so the rest of gander
 //!    never touches the socket directly.
 //!
@@ -19,7 +17,7 @@
 //! that profile.
 
 use std::time::Duration;
-use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use agent_client_protocol::{
     ActiveSession, Agent, ByteStreams, SessionMessage, UntypedMessage,
@@ -32,13 +30,14 @@ use agent_client_protocol::{
 };
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::debug;
+
+use crate::transport::geesed::GeesedTransport;
 
 /// goose-ext: queue of (tool_call_id, resource_uri, extension_name) tuples
 /// pending a `_goose/unstable/resources/read` RPC.
@@ -47,6 +46,13 @@ type PendingFetches = Arc<Mutex<Vec<(ToolCallId, String, String)>>>;
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+/// Errors that can occur during handshake.
+///
+/// This is a re-export of [`crate::transport::geesed::GeesedError`] so that
+/// call sites continue to use `crate::acp::ConnectError` without referencing
+/// the transport layer directly.
+pub use crate::transport::geesed::GeesedError as ConnectError;
 
 /// A live ACP connection to goose for one profile tab.
 ///
@@ -144,29 +150,12 @@ pub enum AcpCommand {
     RequestSessionInfo,
 }
 
-/// Errors that can occur during handshake.
-#[derive(Debug, thiserror::Error)]
-pub enum ConnectError {
-    #[error("profile not found")]
-    ProfileNotFound,
-    #[error("profile already in use by another client")]
-    ProfileInUse,
-    #[error("goose binary not available: {0}")]
-    GooseBinaryUnavailable(String),
-    #[error("goose failed to spawn: {0}")]
-    SpawnFailed(String),
-    #[error("could not connect to geesed acp socket: {0}")]
-    SocketConnect(#[from] std::io::Error),
-    #[error("protocol error: {0}")]
-    Protocol(String),
-}
-
 // ---------------------------------------------------------------------------
 // AcpConnection impl
 // ---------------------------------------------------------------------------
 
 impl AcpConnection {
-    /// Connect to geesed's acp socket, handshake `connect_profile(name)`,
+    /// Connect to geesed's ACP socket and complete the handshake,
     /// then enter the streaming loop. Returns once the SDK has initialised
     /// and a session is ready. The background task is already running when
     /// this future resolves.
@@ -199,7 +188,7 @@ impl AcpConnection {
         profile: &str,
         cmd_rx: mpsc::Receiver<AcpCommand>,
     ) -> Result<Self, ConnectError> {
-        let stream = do_handshake(profile).await?;
+        let stream = GeesedTransport::connect(profile).await?;
 
         let (evt_tx, evt_rx) = mpsc::channel::<AcpEvent>(64);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
@@ -231,59 +220,6 @@ impl AcpConnection {
             _task: task,
         })
     }
-}
-
-// ---------------------------------------------------------------------------
-// Handshake helper
-// ---------------------------------------------------------------------------
-
-/// Connect to geesed's acp socket and complete the `connect_profile` handshake.
-///
-/// Returns the post-handshake socket, ready to be used as a raw byte relay.
-async fn do_handshake(profile: &str) -> Result<UnixStream, ConnectError> {
-    let socket_path = acp_socket_path();
-    let mut stream = UnixStream::connect(&socket_path).await?;
-
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "connect_profile",
-        "params": { "name": profile }
-    });
-    let mut line = request.to_string();
-    line.push('\n');
-    stream.write_all(line.as_bytes()).await?;
-
-    let mut reader = BufReader::new(&mut stream);
-    let mut response_line = String::new();
-    let bytes = reader.read_line(&mut response_line).await?;
-    if bytes == 0 {
-        return Err(ConnectError::Protocol(
-            "connection closed before handshake response".into(),
-        ));
-    }
-    drop(reader); // release the borrow so we can move stream below
-
-    let response: Value = serde_json::from_str(response_line.trim_end())
-        .map_err(|e| ConnectError::Protocol(e.to_string()))?;
-
-    if let Some(error) = response.get("error") {
-        let code = error.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
-        let message = error
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error")
-            .to_owned();
-        return Err(match code {
-            -32001 => ConnectError::ProfileNotFound,
-            -32020 => ConnectError::ProfileInUse,
-            -32010 => ConnectError::GooseBinaryUnavailable(message),
-            -32011 => ConnectError::SpawnFailed(message),
-            _ => ConnectError::Protocol(message),
-        });
-    }
-
-    Ok(stream)
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +257,7 @@ where
             label: s
                 .title
                 .filter(|t| !t.is_empty())
-                // Keep in sync with DEFAULT_SESSION_LABEL in crates/gander-chat/src/lib.rs.
+                // Keep in sync with DEFAULT_SESSION_LABEL in crates/gander-chat/src/acp_core/types.rs.
                 .unwrap_or_else(|| "Session".to_string()),
             id: s.session_id.to_string(),
             last_active: s.updated_at,
@@ -953,27 +889,6 @@ async fn process_pending_fetches<R>(
                 .await;
         } else {
             tracing::warn!(uri = %uri, "_goose/unstable/resources/read returned no text/html content");
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Path helpers — mirrors the runtime_dir logic in geese-client
-// ---------------------------------------------------------------------------
-
-fn acp_socket_path() -> PathBuf {
-    runtime_dir().join("acp.sock")
-}
-
-fn runtime_dir() -> PathBuf {
-    match env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) => PathBuf::from(dir).join("geese"),
-        None => {
-            // Defensive fallback for non-XDG environments (e.g. CI, minimal
-            // containers). On a real COSMIC desktop XDG_RUNTIME_DIR is always
-            // set, but we don't want a panic if it isn't.
-            let home = env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-            PathBuf::from(home).join(".cache").join("geese")
         }
     }
 }
