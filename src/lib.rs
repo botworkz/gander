@@ -8,3 +8,4 @@
 //! `AcpConnection` without depending on the GUI stack.
 
 pub mod acp;
+pub mod transport;

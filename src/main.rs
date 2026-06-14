@@ -6,6 +6,7 @@ mod config;
 mod i18n;
 mod state;
 mod tab;
+mod transport;
 #[cfg(target_os = "linux")]
 mod webview;
 

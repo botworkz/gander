@@ -44,11 +44,18 @@ do but is the escape hatch.
   - `app.rs` — top-level AppModel, tab strip, picker, drawers (existing)
   - `tab.rs` — tab body, currently placeholder, becomes wry webview host
   - `supervisor.rs` — per-profile goose process lifecycle (landed in #5)
-  - `acp.rs` — ACP client wrapping a supervisor-managed child (issue #15)
+  - `acp/` — ACP worker: session management, streaming, tool-call merging
+  - `transport/geesed.rs` — geesed-specific socket handshake (`GeesedTransport::connect`);
+    path helpers (`acp_socket_path`, `runtime_dir`) and geesed error variants live here,
+    keeping `acp/` free of geesed-private details
   - `webview.rs` — per-tab wry webview loading the gander-chat bundle (issue not yet open)
 - `crates/gander-chat` — Leptos chat UI (issue #16)
   - Talks to host via `window.gander.send()` / `subscribe()` bridge
   - Builds standalone via `trunk` so it can be developed in a browser
+  - `acp_core/` — pure-ACP components and event handling (no goose-private surfaces):
+    types, session sidebar, message list, tool-call cards, input row, footer
+  - `goose_ext/` — goose-specific extensions: Concertina (Extensions + Settings drawer),
+    MCP App iframe, and the `tool_resource` event handler that hydrates it
 
 ## Storage
 
