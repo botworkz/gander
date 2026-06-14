@@ -29,6 +29,8 @@ use std::{
 };
 
 use gander::acp::{AcpCommand, AcpConnection, AcpEvent};
+use gander::ext::goose::GooseExtHandler;
+use gander::transport::geesed::GeesedTransport;
 use geesed::{RunOpts, run};
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -174,9 +176,12 @@ async fn history_drain_completes_with_expected_events() {
     // XDG_RUNTIME_DIR concurrently.
     unsafe { std::env::set_var("XDG_RUNTIME_DIR", root.path()) };
 
-    let mut conn = AcpConnection::connect("test")
-        .await
-        .expect("AcpConnection::connect");
+    let mut conn = AcpConnection::connect(
+        Box::new(GeesedTransport::new("test")),
+        Box::new(GooseExtHandler),
+    )
+    .await
+    .expect("AcpConnection::connect");
 
     // Send SessionSelect with a session ID that has no existing ACP handler.
     // The mock emits notifications for this ID before sending the response, so
