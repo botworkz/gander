@@ -1,26 +1,30 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! ACP connection to geesed's acp socket.
+//! Pure-ACP worker — session management, streaming, and tool-call merging.
 //!
 //! Each open tab gets one [`AcpConnection`], created when the tab opens and
 //! dropped when the tab closes. The connection:
 //!
-//! 1. Connects to the geesed ACP socket via the geesed transport.
-//! 2. After the handshake, the socket becomes a raw byte relay to goose's
+//! 1. Opens a transport via [`crate::transport::Transport::connect`] and
+//!    receives a post-handshake [`tokio::net::UnixStream`].
+//! 2. After the handshake, the socket becomes a raw byte relay to the agent's
 //!    stdio. We layer the ACP protocol SDK over it.
 //! 3. Exposes [`AcpConnection::send`] (for user prompts) and
 //!    [`AcpConnection::recv`] (for streaming events) so the rest of gander
 //!    never touches the socket directly.
 //!
 //! Dropping an [`AcpConnection`] cancels the background task, closing the
-//! socket. Geesed detects the socket close and stops the goose process for
-//! that profile.
+//! socket. The transport layer detects the close and stops the agent process
+//! and stops the agent process for that profile.
+//!
+//! This module must remain free of goose-private and transport-private
+//! details — enforced by the CI grep guard on `src/acp/`.
 
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use agent_client_protocol::{
-    ActiveSession, Agent, ByteStreams, SessionMessage, UntypedMessage,
+    ActiveSession, Agent, ByteStreams, SessionMessage,
     schema::{
         ContentBlock, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
         NewSessionResponse, ProtocolVersion, SessionId, SessionNotification, SessionUpdate,
@@ -28,7 +32,6 @@ use agent_client_protocol::{
     },
     util::MatchDispatch,
 };
-use serde_json::Value;
 use tokio::{
     net::UnixStream,
     sync::{Mutex, mpsc, oneshot},
@@ -37,11 +40,9 @@ use tokio::{
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::debug;
 
-use crate::transport::geesed::GeesedTransport;
-
-/// goose-ext: queue of (tool_call_id, resource_uri, extension_name) tuples
-/// pending a `_goose/unstable/resources/read` RPC.
-type PendingFetches = Arc<Mutex<Vec<(ToolCallId, String, String)>>>;
+use crate::ext::goose::{PendingFetches, process_pending_fetches};
+use crate::ext::{ExtEvent, ExtHandler, ExtRequest};
+use crate::transport::Transport;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -49,10 +50,10 @@ type PendingFetches = Arc<Mutex<Vec<(ToolCallId, String, String)>>>;
 
 /// Errors that can occur during handshake.
 ///
-/// This is a re-export of [`crate::transport::geesed::GeesedError`] so that
+/// This is a re-export of [`crate::transport::TransportError`] so that
 /// call sites continue to use `crate::acp::ConnectError` without referencing
 /// the transport layer directly.
-pub use crate::transport::geesed::GeesedError as ConnectError;
+pub use crate::transport::TransportError as ConnectError;
 
 /// A live ACP connection to goose for one profile tab.
 ///
@@ -61,6 +62,8 @@ pub use crate::transport::geesed::GeesedError as ConnectError;
 pub struct AcpConnection {
     /// Receive ACP events produced by the background task.
     pub recv: mpsc::Receiver<AcpEvent>,
+    /// Receive extension events produced by the extension handler.
+    pub recv_ext: mpsc::Receiver<ExtEvent>,
     /// Send commands (user prompts, clean shutdown) to the background task.
     ///
     /// In the `connect_with_rx` path this is a stub sender (disconnected);
@@ -113,25 +116,6 @@ pub enum AcpEvent {
     /// `SessionSelect` — that path uses `SessionLoadStart`/`SessionLoadEnd`
     /// to replay history.
     SessionActive(String),
-    /// Session metadata for the footer bar.
-    ///
-    /// Emitted once on initial connect and again on `RequestSessionInfo`.
-    /// `model` is the agent name reported by `InitializeResponse.agent_info`.
-    /// `tool_count` is `None` when the count cannot be determined via ACP v1.
-    SessionInfo {
-        cwd: String,
-        model: String,
-        tool_count: Option<u32>,
-    },
-    /// HTML panel fetched for a goose MCP App tool call.
-    ///
-    /// Emitted by `process_pending_fetches` after a successful
-    /// `_goose/unstable/resources/read` RPC triggered by a `Completed`
-    /// `ToolCallUpdate` that carried both `rawOutput.resourceUri` and
-    /// `_meta.goose.toolCall.extensionName`.  The UI should render the HTML
-    /// in a sandboxed iframe alongside the tool-call card.
-    // goose-ext: emitted after fetching the MCP App HTML via _goose/unstable/resources/read
-    ToolResource { tool_call_id: String, html: String },
 }
 
 /// Commands sent from the UI/IPC handler to the ACP background task.
@@ -155,21 +139,24 @@ pub enum AcpCommand {
 // ---------------------------------------------------------------------------
 
 impl AcpConnection {
-    /// Connect to geesed's ACP socket and complete the handshake,
-    /// then enter the streaming loop. Returns once the SDK has initialised
-    /// and a session is ready. The background task is already running when
-    /// this future resolves.
+    /// Connect using `transport` and complete the handshake, then enter the
+    /// streaming loop.  Returns once the SDK has initialised and a session is
+    /// ready. The background task is already running when this future resolves.
     ///
     /// Use this when you want a self-contained connection that owns both ends
     /// of the command channel. Use [`connect_with_rx`](Self::connect_with_rx)
     /// when the command sender must be captured by a webview IPC handler before
     /// the ACP task starts.
     #[allow(dead_code)]
-    pub async fn connect(profile: &str) -> Result<Self, ConnectError> {
+    pub async fn connect(
+        transport: Box<dyn Transport>,
+        ext_handler: Box<dyn ExtHandler>,
+    ) -> Result<Self, ConnectError> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AcpCommand>(64);
-        let conn = Self::connect_with_rx(profile, cmd_rx).await?;
+        let conn = Self::connect_with_rx(transport, cmd_rx, ext_handler).await?;
         Ok(AcpConnection {
             recv: conn.recv,
+            recv_ext: conn.recv_ext,
             send: cmd_tx,
             _task: conn._task,
         })
@@ -185,18 +172,28 @@ impl AcpConnection {
     /// The returned connection's `send` field is a disconnected stub; callers
     /// should use the `cmd_tx` they created themselves.
     pub async fn connect_with_rx(
-        profile: &str,
+        transport: Box<dyn Transport>,
         cmd_rx: mpsc::Receiver<AcpCommand>,
+        ext_handler: Box<dyn ExtHandler>,
     ) -> Result<Self, ConnectError> {
-        let stream = GeesedTransport::connect(profile).await?;
+        let stream = transport.connect().await?;
 
         let (evt_tx, evt_rx) = mpsc::channel::<AcpEvent>(64);
+        let (ext_ui_tx, ext_ui_rx) = mpsc::channel::<ExtEvent>(64);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
         // A disconnected sender so the struct always has a valid `send` field.
         // The real command path goes through the caller-owned `cmd_tx`.
         let (stub_tx, _stub_rx) = mpsc::channel::<AcpCommand>(1);
 
-        let task = tokio::spawn(run_worker(stream, cmd_rx, evt_tx, ready_tx));
+        let ext_handler: Arc<dyn ExtHandler + Send + Sync> = Arc::from(ext_handler);
+        let task = tokio::spawn(run_worker(
+            stream,
+            cmd_rx,
+            evt_tx,
+            ready_tx,
+            ext_handler,
+            ext_ui_tx,
+        ));
 
         // Wait for the ACP SDK to initialise and start a session. This
         // typically completes in <100 ms.
@@ -204,11 +201,11 @@ impl AcpConnection {
             Ok(Ok(())) => {}
             Ok(Err(msg)) => {
                 task.abort();
-                return Err(ConnectError::Protocol(msg));
+                return Err(ConnectError::Other(msg.into()));
             }
             Err(_) => {
                 task.abort();
-                return Err(ConnectError::Protocol(
+                return Err(ConnectError::Other(
                     "acp worker stopped unexpectedly".into(),
                 ));
             }
@@ -216,6 +213,7 @@ impl AcpConnection {
 
         Ok(AcpConnection {
             recv: evt_rx,
+            recv_ext: ext_ui_rx,
             send: stub_tx,
             _task: task,
         })
@@ -270,11 +268,14 @@ async fn run_worker(
     mut cmd_rx: mpsc::Receiver<AcpCommand>,
     evt_tx: mpsc::Sender<AcpEvent>,
     ready_tx: oneshot::Sender<Result<(), String>>,
+    ext_handler: Arc<dyn ExtHandler + Send + Sync>,
+    ext_ui_tx: mpsc::Sender<ExtEvent>,
 ) {
     let (read_half, write_half) = stream.into_split();
     let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
 
     let evt_tx_clone = evt_tx.clone();
+    let ext_ui_tx_clone = ext_ui_tx.clone();
     let mut ready_tx_opt = Some(ready_tx);
 
     // Per-session tool-call map: receives ToolCall on creation and merges
@@ -283,11 +284,12 @@ async fn run_worker(
     let tool_calls: Arc<Mutex<HashMap<ToolCallId, ToolCall>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // goose-ext: queue of (tool_call_id, resource_uri, extension_name) tuples
-    // pushed by forward_update on Completed tool calls with rawOutput.resourceUri.
-    // run_worker drains after each session update batch and calls
-    // _goose/unstable/resources/read to fetch the HTML.
+    // Pending MCP App resource fetches populated by the ext handler.
     let pending_fetches: PendingFetches = Arc::new(Mutex::new(Vec::new()));
+
+    // Internal channel: ext handler writes ExtEvents here; the worker drains
+    // it after each drain_session_updates call and routes them appropriately.
+    let (handler_evt_tx, mut handler_evt_rx) = mpsc::channel::<ExtEvent>(64);
 
     let result = agent_client_protocol::Client
         .builder()
@@ -374,12 +376,35 @@ async fn run_worker(
                             &mut current_session,
                             &evt_tx_clone,
                             &tool_calls,
-                            &pending_fetches,
+                            &ext_handler,
+                            &handler_evt_tx,
                         )
                         .await;
+
+                        // Drain the ext handler event channel and route:
+                        // - ReadResource → pending_fetches for the RPC below
+                        // - SessionInfo / ToolResource → ext_ui_tx for the UI
+                        while let Ok(evt) = handler_evt_rx.try_recv() {
+                            match evt {
+                                ExtEvent::Request(ExtRequest::ReadResource {
+                                    tool_call_id,
+                                    uri,
+                                    extension_name,
+                                }) => {
+                                    pending_fetches
+                                        .lock()
+                                        .await
+                                        .push((tool_call_id, uri, extension_name));
+                                }
+                                other => {
+                                    let _ = ext_ui_tx_clone.send(other).await;
+                                }
+                            }
+                        }
+
                         process_pending_fetches(
                             &cx,
-                            &evt_tx_clone,
+                            &ext_ui_tx_clone,
                             &pending_fetches,
                             current_session.session_id().to_string(),
                         )
@@ -418,7 +443,7 @@ async fn run_worker(
                                         // Clear stale tool-call state before replaying the
                                         // new session's history.
                                         tool_calls.lock().await.clear();
-                                        // goose-ext: drop any fetches queued from the prior session.
+                                        // Drop any fetches queued from the prior session.
                                         pending_fetches.lock().await.clear();
                                         let _ = evt_tx_clone
                                             .send(AcpEvent::SessionLoadStart)
@@ -427,12 +452,11 @@ async fn run_worker(
                                             &mut current_session,
                                             &evt_tx_clone,
                                             &tool_calls,
-                                            &pending_fetches,
                                         )
                                         .await;
-                                        // goose-ext: discard fetches queued during history
-                                        // replay — we don't auto-fetch resources for historical
-                                        // tool calls (would re-trigger on every reconnect).
+                                        // Discard any fetches that might have been queued
+                                        // during history replay (there should be none, but
+                                        // clear for safety).
                                         pending_fetches.lock().await.clear();
                                         let _ = evt_tx_clone
                                             .send(AcpEvent::SessionLoadEnd)
@@ -499,8 +523,8 @@ async fn run_worker(
                         let _ = evt_tx_clone
                             .send(AcpEvent::SessionActive(active_id.clone()))
                             .await;
-                        let _ = evt_tx_clone
-                            .send(AcpEvent::SessionInfo {
+                        let _ = ext_ui_tx_clone
+                            .send(ExtEvent::SessionInfo {
                                 cwd: cwd_str.clone(),
                                 model: agent_model.clone(),
                                 tool_count: None,
@@ -533,7 +557,8 @@ async fn drain_session_updates(
     session: &mut ActiveSession<'_, Agent>,
     evt_tx: &mpsc::Sender<AcpEvent>,
     tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
-    pending_fetches: &PendingFetches,
+    ext_handler: &Arc<dyn ExtHandler + Send + Sync>,
+    handler_evt_tx: &mpsc::Sender<ExtEvent>,
 ) {
     loop {
         let update = match session.read_update().await {
@@ -548,10 +573,13 @@ async fn drain_session_updates(
             SessionMessage::SessionMessage(dispatch) => {
                 let tx = evt_tx.clone();
                 let tc_arc = Arc::clone(tool_calls);
-                let pf_arc = Arc::clone(pending_fetches);
+                let eh = Arc::clone(ext_handler);
+                let hev_tx = handler_evt_tx.clone();
                 let handled = MatchDispatch::new(dispatch)
                     .if_notification(async move |n: SessionNotification| {
-                        forward_update(n.update, &tx, &tc_arc, &pf_arc).await;
+                        if let Some(completed) = forward_update(n.update, &tx, &tc_arc).await {
+                            eh.on_tool_call_completed(&completed, &hev_tx).await;
+                        }
                         Ok(())
                     })
                     .await
@@ -595,7 +623,6 @@ async fn drain_history_replay(
     session: &mut ActiveSession<'_, Agent>,
     evt_tx: &mpsc::Sender<AcpEvent>,
     tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
-    pending_fetches: &PendingFetches,
 ) {
     loop {
         let next = tokio::time::timeout(Duration::ZERO, session.read_update()).await;
@@ -613,10 +640,12 @@ async fn drain_history_replay(
             SessionMessage::SessionMessage(dispatch) => {
                 let tx = evt_tx.clone();
                 let tc_arc = Arc::clone(tool_calls);
-                let pf_arc = Arc::clone(pending_fetches);
                 let handled = MatchDispatch::new(dispatch)
                     .if_notification(async move |n: SessionNotification| {
-                        forward_update(n.update, &tx, &tc_arc, &pf_arc).await;
+                        // History replay intentionally skips the ext handler —
+                        // we don't want to re-trigger resource fetches on every
+                        // reconnect.
+                        forward_update(n.update, &tx, &tc_arc).await;
                         Ok(())
                     })
                     .await
@@ -633,7 +662,7 @@ async fn drain_history_replay(
 }
 
 /// Apply the fields of a [`ToolCallUpdate`] onto an existing [`ToolCall`] in place.
-fn apply_tool_call_update(
+pub(crate) fn apply_tool_call_update(
     tc: &mut ToolCall,
     fields: agent_client_protocol::schema::ToolCallUpdateFields,
 ) {
@@ -668,12 +697,16 @@ fn apply_tool_call_update(
 /// updated and a **full snapshot** of the merged `ToolCall` is emitted.  This
 /// keeps the Leptos side dumb: it receives complete state and never needs to
 /// apply deltas itself.
+///
+/// Returns `Some(merged)` when a `ToolCallUpdate` with `Completed` status is
+/// processed.  Callers pass the snapshot to
+/// [`crate::ext::ExtHandler::on_tool_call_completed`] for extension-specific
+/// handling.
 async fn forward_update(
     update: SessionUpdate,
     tx: &mpsc::Sender<AcpEvent>,
     tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
-    pending_fetches: &PendingFetches,
-) {
+) -> Option<ToolCall> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             if let ContentBlock::Text(text) = chunk.content {
@@ -681,6 +714,7 @@ async fn forward_update(
                 debug!(target: "gander::wire", direction = "emit", event_kind = ?event, "ACP_EVENT_EMIT");
                 let _ = tx.send(event).await;
             }
+            None
         }
         SessionUpdate::UserMessageChunk(chunk) => {
             if let ContentBlock::Text(text) = chunk.content {
@@ -688,6 +722,7 @@ async fn forward_update(
                 debug!(target: "gander::wire", direction = "emit", event_kind = ?event, "ACP_EVENT_EMIT");
                 let _ = tx.send(event).await;
             }
+            None
         }
         SessionUpdate::ToolCall(tc) => {
             debug!(
@@ -704,6 +739,7 @@ async fn forward_update(
             let event = AcpEvent::ToolCall(Box::new(tc));
             debug!(target: "gander::wire", direction = "emit", event_kind = ?event, "ACP_EVENT_EMIT");
             let _ = tx.send(event).await;
+            None
         }
         SessionUpdate::ToolCallUpdate(update) => {
             debug!(
@@ -719,10 +755,10 @@ async fn forward_update(
             if let Some(existing) = map.get_mut(&update.tool_call_id) {
                 // Propagate _meta from the update onto the merged ToolCall so
                 // the meta isolator log below sees it and the UI gets it too.
-                // goose-ext: top-level merge — goose ships goose.toolCall on
-                // the create and a narrower goose.{created,messageId} on the
-                // update; a naive replace clobbers toolCall (and any future
-                // mcpApp payload that arrives in a different update).
+                // Top-level merge: goose ships goose.toolCall on the create and
+                // a narrower goose.{created,messageId} on the update; a naive
+                // replace clobbers toolCall (and any future mcpApp payload that
+                // arrives in a different update).
                 if let Some(update_meta) = update.meta {
                     if let Some(existing_meta) = existing.meta.as_mut() {
                         for (k, v) in update_meta {
@@ -756,140 +792,20 @@ async fn forward_update(
                 let event = AcpEvent::ToolCall(Box::new(merged.clone()));
                 debug!(target: "gander::wire", direction = "emit", event_kind = ?event, "ACP_EVENT_EMIT");
                 let _ = tx.send(event).await;
-                // goose-ext: on Completed, queue a _goose/unstable/resources/read
-                // using rawOutput.resourceUri and _meta.goose.toolCall.extensionName.
-                // The actual RPC is made by process_pending_fetches() once we have cx.
                 if merged.status == ToolCallStatus::Completed {
-                    let resource_uri = merged
-                        .raw_output
-                        .as_ref()
-                        .and_then(|o| o.get("resourceUri"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                    let extension_name = merged
-                        .meta
-                        .as_ref()
-                        .and_then(|m| m.get("goose"))
-                        .and_then(|g| g.get("toolCall"))
-                        .and_then(|t| t.get("extensionName"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                    if let (Some(uri), Some(ext)) = (resource_uri, extension_name) {
-                        debug!(
-                            target: "gander::wire",
-                            tool_call_id = %merged.tool_call_id,
-                            resource_uri = %uri,
-                            extension_name = %ext,
-                            "QUEUE_READ_RESOURCE"
-                        );
-                        pending_fetches
-                            .lock()
-                            .await
-                            .push((merged.tool_call_id.clone(), uri, ext));
-                    }
+                    Some(merged)
+                } else {
+                    None
                 }
+            } else {
+                // If no prior ToolCall was received for this id, silently ignore.
+                // This can only happen when history is replayed out of order, which
+                // ACP does not do in practice.
+                None
             }
-            // If no prior ToolCall was received for this id, silently ignore.
-            // This can only happen when history is replayed out of order, which
-            // ACP does not do in practice.
         }
         // AgentThoughtChunk and other variants are intentionally ignored in v1.
-        _ => {}
-    }
-}
-
-// ---------------------------------------------------------------------------
-// goose-ext: explicit resource fetch via _goose/unstable/resources/read
-// ---------------------------------------------------------------------------
-
-/// Extract the first `text/html` item from a `_goose/unstable/resources/read` response.
-///
-/// Response shape (goose ≥ 1.37.0 `acp/server/resources.rs`):
-///   `{ result: { contents: [{ uri, mimeType, text }] } }`
-///
-/// Returns `None` when:
-/// - the `result` or `contents` keys are absent
-/// - no item carries a `text/html` (or `text/html;…`) mime type
-// goose-ext: navigates goose-private _goose/unstable/resources/read response shape
-fn extract_html_from_read_resource_response(response: &Value) -> Option<String> {
-    let items = response
-        .get("result")
-        .and_then(|r| r.get("contents"))
-        .and_then(|c| c.as_array())?;
-    items.iter().find_map(|item| {
-        let mime = item.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
-        if mime.starts_with("text/html") {
-            item.get("text")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        } else {
-            None
-        }
-    })
-}
-
-/// Drain `pending_fetches` and call `_goose/unstable/resources/read` for each.
-///
-/// On a `text/html` response, emits `AcpEvent::ToolResource`.  Errors are
-/// logged and skipped — the tool-call card remains visible without an iframe.
-async fn process_pending_fetches<R>(
-    cx: &agent_client_protocol::ConnectionTo<R>,
-    tx: &mpsc::Sender<AcpEvent>,
-    pending_fetches: &PendingFetches,
-    session_id: String,
-) where
-    R: agent_client_protocol::role::Role,
-    R: agent_client_protocol::role::HasPeer<R>,
-{
-    let fetches: Vec<(ToolCallId, String, String)> = {
-        let mut guard = pending_fetches.lock().await;
-        std::mem::take(&mut *guard)
-    };
-
-    for (tool_call_id, uri, extension_name) in fetches {
-        let params = serde_json::json!({
-            "sessionId": session_id,
-            "uri": uri,
-            "extensionName": extension_name,
-        });
-        let msg = match UntypedMessage::new("_goose/unstable/resources/read", params.clone()) {
-            Ok(m) => m,
-            Err(err) => {
-                tracing::warn!(%err, "failed to build _goose/unstable/resources/read request");
-                continue;
-            }
-        };
-        debug!(
-            target: "gander::wire",
-            direction = "send",
-            method = "_goose/unstable/resources/read",
-            payload = %params,
-            "READ_RESOURCE_REQUEST"
-        );
-        let response: Value = match cx.send_request(msg).block_task().await {
-            Ok(v) => v,
-            Err(err) => {
-                tracing::warn!(%err, uri = %uri, "_goose/unstable/resources/read failed");
-                continue;
-            }
-        };
-        debug!(
-            target: "gander::wire",
-            direction = "recv",
-            method = "_goose/unstable/resources/read",
-            payload = %serde_json::to_string(&response).unwrap_or_default(),
-            "READ_RESOURCE_RESPONSE"
-        );
-        if let Some(html) = extract_html_from_read_resource_response(&response) {
-            let _ = tx
-                .send(AcpEvent::ToolResource {
-                    tool_call_id: tool_call_id.to_string(),
-                    html,
-                })
-                .await;
-        } else {
-            tracing::warn!(uri = %uri, "_goose/unstable/resources/read returned no text/html content");
-        }
+        _ => None,
     }
 }
 
@@ -922,8 +838,7 @@ mod tests {
         map: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
     ) -> Option<AcpEvent> {
         let (tx, mut rx) = mpsc::channel(4);
-        let pf = Arc::new(Mutex::new(Vec::new()));
-        forward_update(update, &tx, map, &pf).await;
+        forward_update(update, &tx, map).await;
         rx.try_recv().ok()
     }
 
@@ -1133,183 +1048,5 @@ mod tests {
             output.contains("gander::wire"),
             "expected 'gander::wire' in tracing output; got:\n{output}"
         );
-    }
-
-    // ── queue+fetch path ──────────────────────────────────────────────────
-
-    // Helper: send one SessionUpdate through forward_update with a given map
-    // and return what ended up in pending_fetches.
-    async fn queued_fetches_after(
-        update: SessionUpdate,
-        map: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
-    ) -> Vec<(ToolCallId, String, String)> {
-        let (tx, _rx) = mpsc::channel(8);
-        let pf: PendingFetches = Arc::new(Mutex::new(Vec::new()));
-        forward_update(update, &tx, map, &pf).await;
-        pf.lock().await.clone()
-    }
-
-    #[tokio::test]
-    async fn completed_tool_without_resource_uri_does_not_queue() {
-        let map = empty_map();
-        let tool = ToolCall::new(ToolCallId::new("tc-plain"), "plain_tool");
-        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
-
-        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
-        let update = ToolCallUpdate::new(ToolCallId::new("tc-plain"), fields);
-        let fetches = queued_fetches_after(SessionUpdate::ToolCallUpdate(update), &map).await;
-
-        assert!(
-            fetches.is_empty(),
-            "no resourceUri means nothing queued; got {fetches:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn completed_tool_with_resource_uri_but_no_extension_does_not_queue() {
-        let map = empty_map();
-        let tool = ToolCall::new(ToolCallId::new("tc-no-ext"), "mcp_tool");
-        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
-
-        // rawOutput has resourceUri but _meta has no extensionName
-        let fields = ToolCallUpdateFields::new()
-            .status(ToolCallStatus::Completed)
-            .raw_output(serde_json::json!({"resourceUri": "mcp://ext/resource"}));
-        let update = ToolCallUpdate::new(ToolCallId::new("tc-no-ext"), fields);
-        let fetches = queued_fetches_after(SessionUpdate::ToolCallUpdate(update), &map).await;
-
-        assert!(
-            fetches.is_empty(),
-            "missing extensionName means nothing queued; got {fetches:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn completed_tool_with_resource_uri_and_extension_queues_fetch() {
-        let map = empty_map();
-        // goose-ext: extensionName arrives on ToolCall creation in _meta.goose.toolCall
-        let meta_map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({
-                "goose": { "toolCall": { "extensionName": "my_ext" } }
-            }))
-            .unwrap();
-        let tool = ToolCall::new(ToolCallId::new("tc-queue"), "mcp_tool").meta(meta_map);
-        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
-
-        // Completed update merges rawOutput.resourceUri into the snapshot.
-        let fields = ToolCallUpdateFields::new()
-            .status(ToolCallStatus::Completed)
-            .raw_output(serde_json::json!({"resourceUri": "mcp://my_ext/panel"}));
-        let update = ToolCallUpdate::new(ToolCallId::new("tc-queue"), fields);
-        let fetches = queued_fetches_after(SessionUpdate::ToolCallUpdate(update), &map).await;
-
-        assert_eq!(fetches.len(), 1, "expected exactly one queued fetch");
-        let (tc_id, uri, ext) = &fetches[0];
-        assert_eq!(tc_id.to_string(), "tc-queue");
-        assert_eq!(uri, "mcp://my_ext/panel");
-        assert_eq!(ext, "my_ext");
-    }
-
-    #[tokio::test]
-    async fn in_progress_tool_with_resource_uri_does_not_queue() {
-        let map = empty_map();
-        let meta_map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({
-                "goose": { "toolCall": { "extensionName": "my_ext" } }
-            }))
-            .unwrap();
-        let tool = ToolCall::new(ToolCallId::new("tc-inprog"), "mcp_tool").meta(meta_map);
-        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
-
-        // Status is InProgress — queue gate must not fire.
-        let fields = ToolCallUpdateFields::new()
-            .status(ToolCallStatus::InProgress)
-            .raw_output(serde_json::json!({"resourceUri": "mcp://my_ext/panel"}));
-        let update = ToolCallUpdate::new(ToolCallId::new("tc-inprog"), fields);
-        let fetches = queued_fetches_after(SessionUpdate::ToolCallUpdate(update), &map).await;
-
-        assert!(
-            fetches.is_empty(),
-            "InProgress must not queue; got {fetches:?}"
-        );
-    }
-
-    // goose-ext: meta merge test — extensionName is delivered on ToolCall creation
-    // and must survive a later ToolCallUpdate that carries rawOutput but no meta.
-    #[tokio::test]
-    async fn meta_merge_preserves_extension_name_across_updates() {
-        let map = empty_map();
-        let meta_map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({
-                "goose": { "toolCall": { "extensionName": "keep_me" } }
-            }))
-            .unwrap();
-        let tool = ToolCall::new(ToolCallId::new("tc-merge"), "mcp_tool").meta(meta_map);
-        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
-
-        // First update: no meta, no status change — extensionName must still be in map.
-        let fields1 = ToolCallUpdateFields::new().raw_output(serde_json::json!({"partial": true}));
-        let upd1 = ToolCallUpdate::new(ToolCallId::new("tc-merge"), fields1);
-        forwarded_with_map(SessionUpdate::ToolCallUpdate(upd1), &map).await;
-
-        // Second update: Completed + resourceUri — should queue because meta was preserved.
-        let fields2 = ToolCallUpdateFields::new()
-            .status(ToolCallStatus::Completed)
-            .raw_output(serde_json::json!({"resourceUri": "mcp://keep_me/x"}));
-        let upd2 = ToolCallUpdate::new(ToolCallId::new("tc-merge"), fields2);
-        let fetches = queued_fetches_after(SessionUpdate::ToolCallUpdate(upd2), &map).await;
-
-        assert_eq!(fetches.len(), 1, "extensionName must survive meta merge");
-        assert_eq!(fetches[0].2, "keep_me");
-    }
-
-    // ── extract_html_from_read_resource_response ──────────────────────────
-
-    #[test]
-    fn extract_html_returns_text_for_text_html_mime() {
-        let resp = serde_json::json!({
-            "result": {
-                "contents": [{ "mimeType": "text/html", "text": "<p>hi</p>", "uri": "x" }]
-            }
-        });
-        assert_eq!(
-            extract_html_from_read_resource_response(&resp),
-            Some("<p>hi</p>".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_html_accepts_text_html_profile_variant() {
-        let resp = serde_json::json!({
-            "result": {
-                "contents": [{ "mimeType": "text/html;profile=mcp-app", "text": "<div/>", "uri": "x" }]
-            }
-        });
-        assert_eq!(
-            extract_html_from_read_resource_response(&resp),
-            Some("<div/>".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_html_returns_none_for_non_html_mime() {
-        let resp = serde_json::json!({
-            "result": {
-                "contents": [{ "mimeType": "application/json", "text": "{}", "uri": "x" }]
-            }
-        });
-        assert!(extract_html_from_read_resource_response(&resp).is_none());
-    }
-
-    #[test]
-    fn extract_html_returns_none_when_contents_empty() {
-        let resp = serde_json::json!({ "result": { "contents": [] } });
-        assert!(extract_html_from_read_resource_response(&resp).is_none());
-    }
-
-    #[test]
-    fn extract_html_returns_none_when_result_key_missing() {
-        let resp = serde_json::json!({ "other": {} });
-        assert!(extract_html_from_read_resource_response(&resp).is_none());
     }
 }

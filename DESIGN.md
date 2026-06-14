@@ -44,10 +44,22 @@ do but is the escape hatch.
   - `app.rs` — top-level AppModel, tab strip, picker, drawers (existing)
   - `tab.rs` — tab body, currently placeholder, becomes wry webview host
   - `supervisor.rs` — per-profile goose process lifecycle (landed in #5)
-  - `acp/` — ACP worker: session management, streaming, tool-call merging
-  - `transport/geesed.rs` — geesed-specific socket handshake (`GeesedTransport::connect`);
-    path helpers (`acp_socket_path`, `runtime_dir`) and geesed error variants live here,
-    keeping `acp/` free of geesed-private details
+  - `acp/` — pure-ACP worker: session management, streaming, tool-call merging.
+    Must not reference goose or geesed directly — enforced by the CI grep guard.
+  - `transport/` — transport abstraction
+    - `mod.rs` — `Transport` trait (`async fn connect(self: Box<Self>) -> Result<UnixStream, TransportError>`)
+      and `TransportError`; callers get an abstraction point without generics
+    - `geesed.rs` — `GeesedTransport` implements `Transport`; geesed-specific socket
+      handshake, path helpers (`acp_socket_path`, `runtime_dir`), and `GeesedError`
+      live here, keeping `acp/` free of geesed-private details
+  - `ext/` — extension handler abstraction
+    - `mod.rs` — `ExtHandler` trait (`async fn on_tool_call_completed`) plus `ExtEvent`
+      and `ExtRequest` enums; the structural boundary between pure-ACP and goose-specific code
+    - `goose.rs` — `GooseExtHandler` implements `ExtHandler`; inspects
+      `_meta.goose.toolCall.extensionName` and emits `ExtRequest::ReadResource` for completed
+      tool calls that carry a `rawOutput.resourceUri`.  `process_pending_fetches` and
+      `extract_html_from_read_resource_response` live here (the only place
+      `_goose/unstable/resources/read` is referenced).
   - `webview.rs` — per-tab wry webview loading the gander-chat bundle (issue not yet open)
 - `crates/gander-chat` — Leptos chat UI (issue #16)
   - Talks to host via `window.gander.send()` / `subscribe()` bridge
@@ -56,6 +68,40 @@ do but is the escape hatch.
     types, session sidebar, message list, tool-call cards, input row, footer
   - `goose_ext/` — goose-specific extensions: Concertina (Extensions + Settings drawer),
     MCP App iframe, and the `tool_resource` event handler that hydrates it
+
+## Transport + ExtHandler boundary
+
+`src/acp/` is kept strictly goose-free.  Two trait boundaries enforce this:
+
+**`Transport`** (`src/transport/mod.rs`) — abstracts the connection phase.
+`AcpConnection::connect_with_rx` takes `Box<dyn Transport>`.  Today only
+`GeesedTransport` exists; `app.rs` constructs it and boxes it.  Error
+downcasting (`downcast_ref::<GeesedError>()`) happens at the `app.rs` call
+site — the trait itself is unaware of geesed.
+
+**`ExtHandler`** (`src/ext/mod.rs`) — abstracts goose-specific side-effects.
+`run_worker` takes `Box<dyn ExtHandler>` (promoted to `Arc` internally for
+`Send` sharing).  After `drain_session_updates` the worker drains an internal
+`ExtEvent` channel: `ReadResource` entries go onto `pending_fetches` for the
+`process_pending_fetches` RPC; `SessionInfo` and `ToolResource` events go
+straight to the UI channel.  The handler is fire-and-forget — a panic or
+error logs at `warn!` and the ACP path continues uninterrupted.
+
+### Adding a new goose extension method
+
+1. Add a variant to `ExtRequest` in `src/ext/mod.rs` (e.g. `ListTools { ... }`).
+2. Add a variant to `ExtEvent` if the response needs to reach the UI.
+3. In `GooseExtHandler::on_tool_call_completed` (or a new `on_*` method if
+   warranted), detect the condition and emit the new `ExtRequest` variant.
+4. In `run_worker`'s handler-event drain loop (`src/acp/mod.rs`), add a match arm
+   that processes the new variant — either queuing a fetch or forwarding to `ext_ui_tx`.
+5. If the event reaches the UI, add a match arm in `ext_event_to_js` (`src/app.rs`)
+   and a handler in the relevant `gander-chat` bridge listener.
+
+When `_goose/unstable/resources/read` graduates to the ACP spec: drop
+`src/ext/goose/fetch.rs` (or the fetch section of `goose.rs`), add
+`read_resource` to `src/acp/`, and update `GooseExtHandler::on_tool_call_completed`
+to call it.  Nothing else changes.
 
 ## Storage
 

@@ -46,9 +46,11 @@ use geese_client::{GeesedClient, ProfileEntry};
 
 use crate::acp::{AcpCommand, AcpConnection, AcpEvent, ConnectError};
 use crate::config::Config;
+use crate::ext::{ExtEvent, goose::GooseExtHandler};
 use crate::fl;
 use crate::state::{self, State, TabState};
 use crate::tab::Tab;
+use crate::transport::geesed::{GeesedError, GeesedTransport};
 #[cfg(target_os = "linux")]
 use crate::webview;
 #[cfg(target_os = "linux")]
@@ -767,6 +769,10 @@ impl cosmic::Application for AppModel {
                             let js = acp_event_to_js(&event);
                             self.webview_store.evaluate_script(*entity, &js);
                         }
+                        while let Ok(event) = acp.recv_ext.try_recv() {
+                            let js = ext_event_to_js(&event);
+                            self.webview_store.evaluate_script(*entity, &js);
+                        }
                     }
                     // Forward tab-navigation keypresses that originated inside
                     // a webview (Ctrl+PageUp / Ctrl+PageDown posted via IPC).
@@ -981,7 +987,18 @@ fn acp_event_to_js(event: &AcpEvent) -> String {
                 json_str(id)
             )
         }
-        AcpEvent::SessionInfo {
+    }
+}
+
+/// Serialize extension events (goose-private: session_info, tool_resource)
+/// through the same `evaluate_script` path as ACP events.
+///
+/// JS event names are load-bearing — the bridge handler in gander-chat
+/// already matches on `session_info` and `tool_resource`.
+#[cfg(target_os = "linux")]
+fn ext_event_to_js(event: &ExtEvent) -> String {
+    match event {
+        ExtEvent::SessionInfo {
             cwd,
             model,
             tool_count,
@@ -997,13 +1014,17 @@ fn acp_event_to_js(event: &AcpEvent) -> String {
                 tool_count_js,
             )
         }
-        // goose-ext: publish pre-hydrated MCP App HTML to the webview
-        AcpEvent::ToolResource { tool_call_id, html } => {
+        ExtEvent::ToolResource { tool_call_id, html } => {
             format!(
                 "window.gander._publish({{type:'tool_resource',tool_call_id:{},html:{}}})",
                 json_str(tool_call_id),
                 json_str(html)
             )
+        }
+        ExtEvent::Request(_) => {
+            // Request events are consumed by the worker and never reach the UI;
+            // this arm exists only to satisfy exhaustiveness.
+            String::new()
         }
     }
 }
@@ -1047,7 +1068,9 @@ impl AppModel {
         let inbox = Arc::clone(&self.acp_inbox);
         let acp_task = Task::perform(
             async move {
-                match AcpConnection::connect_with_rx(&profile, cmd_rx).await {
+                let transport = Box::new(GeesedTransport::new(profile));
+                let ext_handler = Box::new(GooseExtHandler);
+                match AcpConnection::connect_with_rx(transport, cmd_rx, ext_handler).await {
                     Ok(conn) => {
                         inbox.lock().unwrap().insert(entity, conn);
                         Ok(())
@@ -1433,13 +1456,22 @@ impl AppModel {
 
 fn format_acp_error(error: &ConnectError) -> String {
     match error {
-        ConnectError::ProfileNotFound => "Profile not found".into(),
-        ConnectError::ProfileInUse => "Profile already in use by another client".into(),
-        ConnectError::GooseBinaryUnavailable(msg) => {
-            format!("Goose binary not found — set GEESE_GOOSE_BIN: {msg}")
+        ConnectError::Other(boxed) => {
+            if let Some(e) = boxed.downcast_ref::<GeesedError>() {
+                return match e {
+                    GeesedError::ProfileNotFound => "Profile not found".into(),
+                    GeesedError::ProfileInUse => "Profile already in use by another client".into(),
+                    GeesedError::GooseBinaryUnavailable(msg) => {
+                        format!("Goose binary not found — set GEESE_GOOSE_BIN: {msg}")
+                    }
+                    GeesedError::SpawnFailed(msg) => format!("Goose failed to spawn: {msg}"),
+                    GeesedError::SocketConnect(e) => {
+                        format!("Could not connect to geesed: {e}")
+                    }
+                    GeesedError::Protocol(msg) => format!("ACP protocol error: {msg}"),
+                };
+            }
+            format!("Connection error: {boxed}")
         }
-        ConnectError::SpawnFailed(msg) => format!("Goose failed to spawn: {msg}"),
-        ConnectError::SocketConnect(e) => format!("Could not connect to geesed: {e}"),
-        ConnectError::Protocol(msg) => format!("ACP protocol error: {msg}"),
     }
 }
