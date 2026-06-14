@@ -26,21 +26,23 @@ fn parse_tool_title(json: &str) -> String {
         .unwrap_or_else(|| "(tool)".to_string())
 }
 
-/// Return a short status badge string for the card header.
-fn tool_status_badge(json: &str, streaming: bool) -> &'static str {
-    if streaming {
-        return "running…";
-    }
+/// Return the CSS state class suffix for a tool-call card.
+///
+/// Reads only the JSON `status` field — the `streaming` signal is
+/// intentionally ignored here so that history replay of a snapshot
+/// saved mid-flight reflects its actual saved state rather than
+/// throbbing indefinitely.
+fn tool_status_class(json: &str) -> &'static str {
     let status = js_sys::JSON::parse(json)
         .ok()
         .and_then(|obj| js_sys::Reflect::get(&obj, &JsValue::from_str("status")).ok())
         .and_then(|v| v.as_string())
         .unwrap_or_default();
     match status.as_str() {
-        s if is_terminal_status(s) && s == "completed" => "✓",
-        s if is_terminal_status(s) => "✗",
-        "in_progress" => "running…",
-        _ => "",
+        "in_progress" => "running",
+        "completed" => "success",
+        "failed" => "failure",
+        _ => "pending",
     }
 }
 
@@ -139,18 +141,23 @@ pub fn ToolCallCard(message: ChatMessage) -> impl IntoView {
 
     view! {
         <div class="message message--tool tool-call-card">
+            // ── state-coloured spine (absolute positioned, full card height) ──
+            <div class=move || {
+                let json = message.content.get();
+                format!("tool-call-spine tool-call-spine--{}", tool_status_class(&json))
+            } />
             // ── header ───────────────────────────────────────────────────
             <button class="tool-call-header" on:click=toggle>
+                <span class=move || {
+                    let json = message.content.get();
+                    format!("tool-call-gear tool-call-gear--{}", tool_status_class(&json))
+                }>
+                    <Icon icon=icondata::LuCog width="14px" height="14px" />
+                </span>
                 <span class="tool-call-title">
                     {move || {
                         let json = message.content.get();
                         parse_tool_title(&json)
-                    }}
-                </span>
-                <span class="tool-call-status">
-                    {move || {
-                        let json = message.content.get();
-                        tool_status_badge(&json, message.streaming.get())
                     }}
                 </span>
                 <span class=move || {
