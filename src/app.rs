@@ -1022,9 +1022,9 @@ fn ext_event_to_js(event: &ExtEvent) -> String {
             )
         }
         ExtEvent::Request(_) => {
-            // Request events are consumed by the worker and never reach the UI;
-            // this arm exists only to satisfy exhaustiveness.
-            String::new()
+            // Request events are consumed by the worker and never forwarded to
+            // ext_event_to_js — this arm should never be reached.
+            unreachable!("ExtEvent::Request must be consumed by the worker, not forwarded to UI")
         }
     }
 }

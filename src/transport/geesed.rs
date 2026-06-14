@@ -11,13 +11,12 @@
 
 use std::{env, path::PathBuf};
 
+use crate::transport::{Transport, TransportError};
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
-
-use crate::transport::{Transport, TransportError};
 
 /// Errors that can occur when connecting to geesed's ACP socket.
 ///

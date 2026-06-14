@@ -15,7 +15,7 @@
 //!
 //! Dropping an [`AcpConnection`] cancels the background task, closing the
 //! socket. The transport layer detects the close and stops the agent process
-//! and stops the agent process for that profile.
+//! for that profile.
 //!
 //! This module must remain free of goose-private and transport-private
 //! details — enforced by the CI grep guard on `src/acp/`.
