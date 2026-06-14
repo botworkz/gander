@@ -445,7 +445,23 @@
       border-radius: 8px;
       background: #16162a;
       border: 1px solid #282838;
+      position: relative;
+      overflow: hidden;
     }
+
+    /* State-coloured left-edge spine — absolutely positioned, full card height */
+    .tool-call-spine {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+    }
+
+    .tool-call-spine--pending  { background: #6a6a85; }
+    .tool-call-spine--running  { background: #e89244; animation: tool-throb 1.2s ease-in-out infinite; }
+    .tool-call-spine--success  { background: #4caf72; }
+    .tool-call-spine--failure  { background: #cc6666; }
 
     /* Full-width clickable header — no browser button chrome */
     .tool-call-header {
@@ -479,16 +495,22 @@
       text-overflow: ellipsis;
     }
 
-    /* Status badge: small, muted; ✓ and ✗ get their own tint */
-    .tool-call-status {
+    /* Gear icon in card header — colour and animation vary by state */
+    .tool-call-gear {
+      display: flex;
+      align-items: center;
       flex-shrink: 0;
-      font-size: 0.78rem;
-      color: #8888a8;
     }
 
-    /* ✓ completed */
-    .tool-call-status:not(:empty) {
-      color: #8888a8;
+    .tool-call-gear--pending { color: #6a6a85; }
+    .tool-call-gear--running { color: #e89244; animation: tool-throb 1.2s ease-in-out infinite; }
+    .tool-call-gear--success { color: #4caf72; }
+    .tool-call-gear--failure { color: #cc6666; }
+
+    @keyframes tool-throb {
+      0%   { opacity: 1; }
+      50%  { opacity: 0.45; }
+      100% { opacity: 1; }
     }
 
     /* Chevron rotates when the body is open */
@@ -601,13 +623,17 @@
         // can be exercised in dev without a live goose process.
         var toolSequence = [
           // Tool A: pending
-          { delay: 100, call: { toolCallId: "tc-mock-1", title: "list_dir",   status: "pending" } },
+          { delay: 100, call: { toolCallId: "tc-mock-1", title: "list_dir",    status: "pending" } },
           // Tool B: pending
-          { delay: 200, call: { toolCallId: "tc-mock-2", title: "show_panel", status: "pending" } },
+          { delay: 200, call: { toolCallId: "tc-mock-2", title: "show_panel",  status: "pending" } },
+          // Tool C: pending (will end in failure)
+          { delay: 250, call: { toolCallId: "tc-mock-3", title: "broken_thing", status: "pending" } },
           // Tool A: in_progress
-          { delay: 400, call: { toolCallId: "tc-mock-1", title: "list_dir",   status: "in_progress" } },
+          { delay: 400, call: { toolCallId: "tc-mock-1", title: "list_dir",    status: "in_progress" } },
           // Tool B: in_progress
-          { delay: 500, call: { toolCallId: "tc-mock-2", title: "show_panel", status: "in_progress" } },
+          { delay: 500, call: { toolCallId: "tc-mock-2", title: "show_panel",  status: "in_progress" } },
+          // Tool C: in_progress
+          { delay: 520, call: { toolCallId: "tc-mock-3", title: "broken_thing", status: "in_progress" } },
           // Tool A: completed with I/O
           { delay: 700, call: {
               toolCallId: "tc-mock-1", title: "list_dir", status: "completed",
@@ -619,6 +645,12 @@
               toolCallId: "tc-mock-2", title: "show_panel", status: "completed",
               rawInput:  {},
               rawOutput: { resourceUri: "ui://demo/panel" }
+          }},
+          // Tool C: failed
+          { delay: 850, call: {
+              toolCallId: "tc-mock-3", title: "broken_thing", status: "failed",
+              rawInput:  {},
+              rawOutput: { error: "demo" }
           }},
         ];
 
