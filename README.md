@@ -63,14 +63,12 @@ By default `gander` reads profiles from the same `$GEESE_ROOT` your `geese` CLI 
 All wire-level ACP traffic is logged at `debug!` level under the **`gander::wire`** target — every JSON-RPC frame sent to or received from goose, plus the `AcpEvent`s emitted from the worker. Off by default; enable with:
 
 ```bash
-# no_run
 RUST_LOG=gander::wire=debug cargo run --bin gander
 ```
 
 Combine with general gander debug output:
 
 ```bash
-# no_run
 RUST_LOG=gander=debug,gander::wire=debug cargo run --bin gander
 ```
 
