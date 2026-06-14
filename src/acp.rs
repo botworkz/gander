@@ -24,16 +24,12 @@ use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 use agent_client_protocol::{
     ActiveSession, Agent, ByteStreams, SessionMessage, UntypedMessage,
     schema::{
-        ClientCapabilities, ContentBlock, InitializeRequest, ListSessionsRequest,
-        LoadSessionRequest, Meta, NewSessionResponse, ProtocolVersion, SessionId,
-        SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallId, ToolCallStatus,
+        ContentBlock, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
+        NewSessionResponse, ProtocolVersion, SessionId, SessionNotification, SessionUpdate,
+        StopReason, ToolCall, ToolCallId, ToolCallStatus,
     },
     util::MatchDispatch,
 };
-
-// goose-ext: opt into goose's server-side MCP App hydration
-const GOOSE_MCP_UI_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
-const GOOSE_MCP_UI_MIME_TYPE: &str = "text/html;profile=mcp-app";
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
