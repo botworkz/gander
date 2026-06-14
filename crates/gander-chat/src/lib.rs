@@ -252,6 +252,11 @@ fn handle_bridge_event(
                 .and_then(|v| v.as_string())
                 .unwrap_or_default();
             let is_done = is_terminal_status(&status);
+            // During history replay, all tool calls are frozen historical state.
+            // The `streaming` flag means "actively receiving tokens right now," so
+            // it must be false during replay even if the stored status is
+            // "in_progress" or "pending" (those are stale snapshots, not live work).
+            let is_live = !replaying.get_untracked();
 
             // Find an existing card for this tool call id, or create one.
             let existing = messages
@@ -263,11 +268,11 @@ fn handle_bridge_event(
             match existing {
                 Some(msg) => {
                     msg.content.set(call_json);
-                    msg.streaming.set(!is_done);
+                    msg.streaming.set(is_live && !is_done);
                 }
                 None => {
                     let m = ChatMessage::new_tool(take_id(next_id), tool_call_id, call_json);
-                    m.streaming.set(!is_done);
+                    m.streaming.set(is_live && !is_done);
                     messages.update(|v| v.push(m));
                 }
             }
@@ -853,7 +858,7 @@ fn ToolCallCard(message: ChatMessage) -> impl IntoView {
                     let json = message.content.get();
                     format!("tool-call-gear tool-call-gear--{}", tool_status_class(&json, message.streaming.get()))
                 }>
-                    <Icon icon=icondata::LuSettings2 width="14px" height="14px" />
+                    <Icon icon=icondata::LuCog width="14px" height="14px" />
                 </span>
                 <span class="tool-call-title">
                     {move || {
@@ -955,9 +960,12 @@ fn tool_status_class(json: &str, streaming: bool) -> &'static str {
         .and_then(|v| v.as_string())
         .unwrap_or_default();
     match status.as_str() {
-        "in_progress" => "running",
         "completed" => "success",
         "failed" => "failure",
+        // "in_progress" only reaches here during history replay (live work
+        // sets `streaming=true` which short-circuits above). A historical
+        // in_progress snapshot means "we don't know the final state," so
+        // render it grey-pending rather than throbbing.
         _ => "pending",
     }
 }
