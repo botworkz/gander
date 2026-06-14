@@ -22,14 +22,18 @@ use std::time::Duration;
 use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 
 use agent_client_protocol::{
-    ActiveSession, Agent, ByteStreams, SessionMessage,
+    ActiveSession, Agent, ByteStreams, SessionMessage, UntypedMessage,
     schema::{
-        ContentBlock, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
-        NewSessionResponse, ProtocolVersion, SessionId, SessionNotification, SessionUpdate,
-        StopReason, ToolCall, ToolCallId,
+        ClientCapabilities, ContentBlock, InitializeRequest, ListSessionsRequest,
+        LoadSessionRequest, Meta, NewSessionResponse, ProtocolVersion, SessionId,
+        SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallId, ToolCallStatus,
     },
     util::MatchDispatch,
 };
+
+// goose-ext: opt into goose's server-side MCP App hydration
+const GOOSE_MCP_UI_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
+const GOOSE_MCP_UI_MIME_TYPE: &str = "text/html;profile=mcp-app";
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -39,6 +43,10 @@ use tokio::{
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::debug;
+
+/// goose-ext: queue of (tool_call_id, resource_uri, extension_name) tuples
+/// pending a `_goose/unstable/resources/read` RPC.
+type PendingFetches = Arc<Mutex<Vec<(ToolCallId, String, String)>>>;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -113,6 +121,13 @@ pub enum AcpEvent {
         model: String,
         tool_count: Option<u32>,
     },
+    /// Pre-hydrated HTML panel from a goose MCP App tool call.
+    ///
+    /// Emitted after a `ToolCallUpdate` that carries a `Completed` status and
+    /// a `_meta.goose.mcpApp.resourceResult` payload.  The UI should render
+    /// the HTML in a sandboxed iframe alongside the tool-call card.
+    // goose-ext: emitted when goose pre-hydrates an MCP App attachment
+    ToolResource { tool_call_id: String, html: String },
 }
 
 /// Commands sent from the UI/IPC handler to the ACP background task.
@@ -334,11 +349,34 @@ async fn run_worker(
     let tool_calls: Arc<Mutex<HashMap<ToolCallId, ToolCall>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    // goose-ext: queue of (tool_call_id, resource_uri, extension_name) tuples
+    // pushed by forward_update on Completed tool calls with rawOutput.resourceUri.
+    // run_worker drains after each session update batch and calls
+    // _goose/unstable/resources/read to fetch the HTML.
+    let pending_fetches: PendingFetches = Arc::new(Mutex::new(Vec::new()));
+
     let result = agent_client_protocol::Client
         .builder()
         .name("gander")
         .connect_with(transport, async move |cx| {
-            let init_req = InitializeRequest::new(ProtocolVersion::V1);
+            // goose-ext: advertise support for goose's server-side MCP App hydration so
+            // goose flips host_supports_mcp_apps() to true and embeds the pre-fetched HTML
+            // in ToolCallUpdate._meta.goose.mcpApp on every MCP App tool completion.
+            let mut caps_meta: Meta = serde_json::Map::new();
+            caps_meta.insert(
+                "goose".to_string(),
+                serde_json::json!({
+                    "mcpHostCapabilities": {
+                        "extensions": {
+                            (GOOSE_MCP_UI_EXTENSION_ID): {
+                                "mimeTypes": [GOOSE_MCP_UI_MIME_TYPE]
+                            }
+                        }
+                    }
+                }),
+            );
+            let init_req = InitializeRequest::new(ProtocolVersion::V1)
+                .client_capabilities(ClientCapabilities::new().meta(caps_meta));
             debug!(
                 target: "gander::wire",
                 direction = "send",
@@ -419,6 +457,14 @@ async fn run_worker(
                             &mut current_session,
                             &evt_tx_clone,
                             &tool_calls,
+                            &pending_fetches,
+                        )
+                        .await;
+                        process_pending_fetches(
+                            &cx,
+                            &evt_tx_clone,
+                            &pending_fetches,
+                            current_session.session_id().to_string(),
                         )
                         .await;
                     }
@@ -455,6 +501,8 @@ async fn run_worker(
                                         // Clear stale tool-call state before replaying the
                                         // new session's history.
                                         tool_calls.lock().await.clear();
+                                        // goose-ext: drop any fetches queued from the prior session.
+                                        pending_fetches.lock().await.clear();
                                         let _ = evt_tx_clone
                                             .send(AcpEvent::SessionLoadStart)
                                             .await;
@@ -462,8 +510,13 @@ async fn run_worker(
                                             &mut current_session,
                                             &evt_tx_clone,
                                             &tool_calls,
+                                            &pending_fetches,
                                         )
                                         .await;
+                                        // goose-ext: discard fetches queued during history
+                                        // replay — we don't auto-fetch resources for historical
+                                        // tool calls (would re-trigger on every reconnect).
+                                        pending_fetches.lock().await.clear();
                                         let _ = evt_tx_clone
                                             .send(AcpEvent::SessionLoadEnd)
                                             .await;
@@ -563,6 +616,7 @@ async fn drain_session_updates(
     session: &mut ActiveSession<'_, Agent>,
     evt_tx: &mpsc::Sender<AcpEvent>,
     tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+    pending_fetches: &PendingFetches,
 ) {
     loop {
         let update = match session.read_update().await {
@@ -577,9 +631,10 @@ async fn drain_session_updates(
             SessionMessage::SessionMessage(dispatch) => {
                 let tx = evt_tx.clone();
                 let tc_arc = Arc::clone(tool_calls);
+                let pf_arc = Arc::clone(pending_fetches);
                 let handled = MatchDispatch::new(dispatch)
                     .if_notification(async move |n: SessionNotification| {
-                        forward_update(n.update, &tx, &tc_arc).await;
+                        forward_update(n.update, &tx, &tc_arc, &pf_arc).await;
                         Ok(())
                     })
                     .await
@@ -623,6 +678,7 @@ async fn drain_history_replay(
     session: &mut ActiveSession<'_, Agent>,
     evt_tx: &mpsc::Sender<AcpEvent>,
     tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+    pending_fetches: &PendingFetches,
 ) {
     loop {
         let next = tokio::time::timeout(Duration::ZERO, session.read_update()).await;
@@ -640,9 +696,10 @@ async fn drain_history_replay(
             SessionMessage::SessionMessage(dispatch) => {
                 let tx = evt_tx.clone();
                 let tc_arc = Arc::clone(tool_calls);
+                let pf_arc = Arc::clone(pending_fetches);
                 let handled = MatchDispatch::new(dispatch)
                     .if_notification(async move |n: SessionNotification| {
-                        forward_update(n.update, &tx, &tc_arc).await;
+                        forward_update(n.update, &tx, &tc_arc, &pf_arc).await;
                         Ok(())
                     })
                     .await
@@ -698,6 +755,7 @@ async fn forward_update(
     update: SessionUpdate,
     tx: &mpsc::Sender<AcpEvent>,
     tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+    pending_fetches: &PendingFetches,
 ) {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
@@ -744,8 +802,18 @@ async fn forward_update(
             if let Some(existing) = map.get_mut(&update.tool_call_id) {
                 // Propagate _meta from the update onto the merged ToolCall so
                 // the meta isolator log below sees it and the UI gets it too.
-                if let Some(meta) = update.meta {
-                    existing.meta = Some(meta);
+                // goose-ext: top-level merge — goose ships goose.toolCall on
+                // the create and a narrower goose.{created,messageId} on the
+                // update; a naive replace clobbers toolCall (and any future
+                // mcpApp payload that arrives in a different update).
+                if let Some(update_meta) = update.meta {
+                    if let Some(existing_meta) = existing.meta.as_mut() {
+                        for (k, v) in update_meta {
+                            existing_meta.insert(k, v);
+                        }
+                    } else {
+                        existing.meta = Some(update_meta);
+                    }
                 }
                 apply_tool_call_update(existing, update.fields);
                 let merged = existing.clone();
@@ -768,9 +836,53 @@ async fn forward_update(
                         "META_PAYLOAD"
                     );
                 }
-                let event = AcpEvent::ToolCall(Box::new(merged));
+                let event = AcpEvent::ToolCall(Box::new(merged.clone()));
                 debug!(target: "gander::wire", direction = "emit", event_kind = ?event, "ACP_EVENT_EMIT");
                 let _ = tx.send(event).await;
+                // goose-ext: extract pre-hydrated MCP App HTML from goose-private _meta path
+                if merged.status == ToolCallStatus::Completed {
+                    if let Some(html) = extract_mcp_app_html(merged.meta.as_ref()) {
+                        let _ = tx
+                            .send(AcpEvent::ToolResource {
+                                tool_call_id: merged.tool_call_id.to_string(),
+                                html,
+                            })
+                            .await;
+                    } else {
+                        // goose-ext: hydration didn't fire — queue an explicit
+                        // _goose/unstable/resources/read using the rawOutput.resourceUri
+                        // and the extensionName from _meta.goose.toolCall.  The actual
+                        // RPC is made by process_pending_fetches() once we have cx.
+                        let resource_uri = merged
+                            .raw_output
+                            .as_ref()
+                            .and_then(|o| o.get("resourceUri"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let extension_name = merged
+                            .meta
+                            .as_ref()
+                            .and_then(|m| m.get("goose"))
+                            .and_then(|g| g.get("toolCall"))
+                            .and_then(|t| t.get("extensionName"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        if let (Some(uri), Some(ext)) = (resource_uri, extension_name) {
+                            debug!(
+                                target: "gander::wire",
+                                tool_call_id = %merged.tool_call_id,
+                                resource_uri = %uri,
+                                extension_name = %ext,
+                                "QUEUE_READ_RESOURCE"
+                            );
+                            pending_fetches.lock().await.push((
+                                merged.tool_call_id.clone(),
+                                uri,
+                                ext,
+                            ));
+                        }
+                    }
+                }
             }
             // If no prior ToolCall was received for this id, silently ignore.
             // This can only happen when history is replayed out of order, which
@@ -778,6 +890,129 @@ async fn forward_update(
         }
         // AgentThoughtChunk and other variants are intentionally ignored in v1.
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// goose-ext: MCP App HTML extraction
+// ---------------------------------------------------------------------------
+
+/// Walk `_meta.goose.mcpApp.resourceResult.contents[]` looking for an HTML item.
+///
+/// Accepts both bare `text/html` and the spec'd `text/html;profile=mcp-app`
+/// mime types so minor server-side variations don't break rendering.
+///
+/// Returns `None` when:
+/// - `meta` is absent
+/// - the goose-private `mcpApp` key is missing (non-MCP-App tool call)
+/// - `readError` is present instead of `resourceResult` (server-side fetch
+///   failed; the caller should log and skip rendering)
+// goose-ext: navigates goose-private _meta.goose.mcpApp.resourceResult.contents[]
+fn extract_mcp_app_html(meta: Option<&Meta>) -> Option<String> {
+    let meta = meta?;
+    let goose = meta.get("goose")?;
+    let mcp_app = goose.get("mcpApp")?;
+    if mcp_app.get("readError").is_some() {
+        tracing::warn!("goose MCP App readError present; skipping iframe render");
+        return None;
+    }
+    let contents = mcp_app.get("resourceResult")?.get("contents")?.as_array()?;
+    for item in contents {
+        let mime = item.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
+        if mime.starts_with("text/html") {
+            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// goose-ext: explicit resource fetch via _goose/unstable/resources/read
+// ---------------------------------------------------------------------------
+
+/// Drain `pending_fetches` and call `_goose/unstable/resources/read` for each.
+///
+/// On a `text/html` response, emits `AcpEvent::ToolResource`.  Errors are
+/// logged and skipped — the tool-call card remains visible without an iframe.
+async fn process_pending_fetches<R>(
+    cx: &agent_client_protocol::ConnectionTo<R>,
+    tx: &mpsc::Sender<AcpEvent>,
+    pending_fetches: &PendingFetches,
+    session_id: String,
+) where
+    R: agent_client_protocol::role::Role,
+    R: agent_client_protocol::role::HasPeer<R>,
+{
+    let fetches: Vec<(ToolCallId, String, String)> = {
+        let mut guard = pending_fetches.lock().await;
+        std::mem::take(&mut *guard)
+    };
+
+    for (tool_call_id, uri, extension_name) in fetches {
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "uri": uri,
+            "extensionName": extension_name,
+        });
+        let msg = match UntypedMessage::new("_goose/unstable/resources/read", params.clone()) {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::warn!(%err, "failed to build _goose/unstable/resources/read request");
+                continue;
+            }
+        };
+        debug!(
+            target: "gander::wire",
+            direction = "send",
+            method = "_goose/unstable/resources/read",
+            payload = %params,
+            "READ_RESOURCE_REQUEST"
+        );
+        let response: Value = match cx.send_request(msg).block_task().await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(%err, uri = %uri, "_goose/unstable/resources/read failed");
+                continue;
+            }
+        };
+        debug!(
+            target: "gander::wire",
+            direction = "recv",
+            method = "_goose/unstable/resources/read",
+            payload = %serde_json::to_string(&response).unwrap_or_default(),
+            "READ_RESOURCE_RESPONSE"
+        );
+        // Response shape (from goose v1.34.1 acp/server/resources.rs):
+        //   { result: ReadResourceResult }
+        // where ReadResourceResult is { contents: [{ uri, mimeType, text }] }.
+        let html = response
+            .get("result")
+            .and_then(|r| r.get("contents"))
+            .and_then(|c| c.as_array())
+            .and_then(|items| {
+                items.iter().find_map(|item| {
+                    let mime = item.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
+                    if mime.starts_with("text/html") {
+                        item.get("text")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            });
+        if let Some(html) = html {
+            let _ = tx
+                .send(AcpEvent::ToolResource {
+                    tool_call_id: tool_call_id.to_string(),
+                    html,
+                })
+                .await;
+        } else {
+            tracing::warn!(uri = %uri, "_goose/unstable/resources/read returned no text/html content");
+        }
     }
 }
 
@@ -810,7 +1045,8 @@ fn runtime_dir() -> PathBuf {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::{
-        ContentChunk, TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        ContentChunk, Meta, TextContent, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+        ToolCallUpdateFields,
     };
 
     /// Build a fresh shared tool-call map for use in tests.
@@ -830,8 +1066,26 @@ mod tests {
         map: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
     ) -> Option<AcpEvent> {
         let (tx, mut rx) = mpsc::channel(4);
-        forward_update(update, &tx, map).await;
+        let pf = Arc::new(Mutex::new(Vec::new()));
+        forward_update(update, &tx, map, &pf).await;
         rx.try_recv().ok()
+    }
+
+    // Helper: collect all events produced by one SessionUpdate. Some updates
+    // emit more than one event (e.g. a Completed ToolCallUpdate with mcpApp
+    // meta emits both a ToolCall snapshot and a ToolResource).
+    async fn all_forwarded_with_map(
+        update: SessionUpdate,
+        map: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+    ) -> Vec<AcpEvent> {
+        let (tx, mut rx) = mpsc::channel(8);
+        let pf = Arc::new(Mutex::new(Vec::new()));
+        forward_update(update, &tx, map, &pf).await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
     }
 
     #[tokio::test]
@@ -1039,6 +1293,149 @@ mod tests {
         assert!(
             output.contains("gander::wire"),
             "expected 'gander::wire' in tracing output; got:\n{output}"
+        );
+    }
+
+    // ── MCP App HTML extraction ───────────────────────────────────────────
+
+    fn make_completed_update(tc_id: &str, mime: &str, html: &str) -> ToolCallUpdate {
+        let meta_map: Meta = serde_json::from_value(serde_json::json!({
+            "goose": {
+                "mcpApp": {
+                    "resourceResult": {
+                        "contents": [
+                            {
+                                "mimeType": mime,
+                                "text": html
+                            }
+                        ]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        ToolCallUpdate::new(
+            ToolCallId::new(tc_id),
+            ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+        )
+        .meta(meta_map)
+    }
+
+    #[tokio::test]
+    async fn completed_tool_with_mcp_app_meta_emits_tool_resource() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-mcp-1"), "mcp_app_tool");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        let update = make_completed_update("tc-mcp-1", "text/html", "<h1>Panel</h1>");
+        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        let resource = events
+            .iter()
+            .find(|e| matches!(e, AcpEvent::ToolResource { .. }));
+        match resource {
+            Some(AcpEvent::ToolResource { tool_call_id, html }) => {
+                assert_eq!(tool_call_id, "tc-mcp-1");
+                assert_eq!(html, "<h1>Panel</h1>");
+            }
+            _ => panic!("expected ToolResource event, got {events:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_tool_with_text_html_profile_mime_emits_tool_resource() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-mcp-2"), "mcp_app_tool");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        let update = make_completed_update("tc-mcp-2", "text/html;profile=mcp-app", "<p>hello</p>");
+        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        let resource = events
+            .iter()
+            .find(|e| matches!(e, AcpEvent::ToolResource { .. }));
+        match resource {
+            Some(AcpEvent::ToolResource { tool_call_id, html }) => {
+                assert_eq!(tool_call_id, "tc-mcp-2");
+                assert_eq!(html, "<p>hello</p>");
+            }
+            _ => panic!("expected ToolResource for profile mime, got {events:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_tool_without_mcp_app_meta_does_not_emit() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-plain"), "plain_tool");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-plain"), fields);
+        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AcpEvent::ToolResource { .. })),
+            "plain completed tool must not emit ToolResource; got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_tool_with_read_error_does_not_emit() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-err"), "mcp_app_tool");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        // readError present, no resourceResult.
+        let meta_map: Meta = serde_json::from_value(serde_json::json!({
+            "goose": {
+                "mcpApp": {
+                    "readError": "resource not found"
+                }
+            }
+        }))
+        .unwrap();
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-err"), fields).meta(meta_map);
+        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AcpEvent::ToolResource { .. })),
+            "readError must not produce ToolResource; got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_progress_tool_with_mcp_app_meta_does_not_emit() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-inprog"), "mcp_app_tool");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        // Same mcpApp payload but status is InProgress — gate must hold.
+        let meta_map: Meta = serde_json::from_value(serde_json::json!({
+            "goose": {
+                "mcpApp": {
+                    "resourceResult": {
+                        "contents": [
+                            { "mimeType": "text/html", "text": "<p>early</p>" }
+                        ]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-inprog"), fields).meta(meta_map);
+        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AcpEvent::ToolResource { .. })),
+            "InProgress tool must not emit ToolResource; got {events:?}"
         );
     }
 }
