@@ -105,7 +105,9 @@ pub fn App() -> impl IntoView {
 
     // Register the event callback once for the lifetime of the app.
     // The Closure is leaked intentionally — it must outlive the app.
-    // Order: acp_core first, goose_ext second.
+    // Both handlers receive every event; they process disjoint event types
+    // (acp_core: standard ACP events; goose_ext: tool_resource only).
+    // Convention: acp_core first, goose_ext second.
     {
         let cb = Closure::wrap(Box::new(move |event: JsValue| {
             acp_core::events::handle_acp_core_bridge_event(
