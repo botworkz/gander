@@ -107,6 +107,11 @@ pub struct ChatMessage {
     /// match subsequent update snapshots to the right card.  `None` for
     /// user and assistant messages.
     pub tool_call_id: RwSignal<Option<String>>,
+    /// For `Role::Tool` messages: pre-hydrated HTML from a goose MCP App
+    /// attachment.  `None` until the host fires a `tool_resource` event for
+    /// this tool call.  When `Some`, the card renders a sandboxed iframe.
+    // goose-ext: populated by the tool_resource bridge event
+    pub ui_html: RwSignal<Option<String>>,
 }
 
 impl ChatMessage {
@@ -118,6 +123,7 @@ impl ChatMessage {
             streaming: RwSignal::new(false),
             error: RwSignal::new(None),
             tool_call_id: RwSignal::new(None),
+            ui_html: RwSignal::new(None),
         }
     }
 
@@ -129,6 +135,7 @@ impl ChatMessage {
             streaming: RwSignal::new(true),
             error: RwSignal::new(None),
             tool_call_id: RwSignal::new(None),
+            ui_html: RwSignal::new(None),
         }
     }
 
@@ -141,6 +148,7 @@ impl ChatMessage {
             streaming: RwSignal::new(true),
             error: RwSignal::new(None),
             tool_call_id: RwSignal::new(Some(tool_call_id)),
+            ui_html: RwSignal::new(None),
         }
     }
 }
@@ -372,6 +380,28 @@ fn handle_bridge_event(
                 footer_model.set(Some(m));
             }
             footer_tool_count.set(tool_count);
+        }
+
+        // ── goose-ext: pre-hydrated MCP App HTML ───────────────────────────
+        // goose-ext: sets ui_html on the matching tool-call card
+        Some("tool_resource") => {
+            let tool_call_id = js_sys::Reflect::get(&event, &JsValue::from_str("tool_call_id"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            let html = js_sys::Reflect::get(&event, &JsValue::from_str("html"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+
+            if let Some(msg) = messages
+                .get_untracked()
+                .iter()
+                .find(|m| m.tool_call_id.get_untracked().as_deref() == Some(tool_call_id.as_str()))
+                .copied()
+            {
+                msg.ui_html.set(Some(html));
+            }
         }
 
         _ => {
@@ -871,6 +901,25 @@ fn ToolCallCard(message: ChatMessage) -> impl IntoView {
                             </div>
                         }
                     })
+            }}
+            // ── goose-ext: MCP App HTML panel (sandboxed iframe) ──────────
+            // goose-ext: rendered when the host emits tool_resource for this call
+            // Sandbox is intentionally minimal: allow-scripts only.
+            // allow-same-origin, allow-forms, and allow-top-navigation are
+            // deliberately excluded to prevent the iframe content from
+            // accessing cookies/storage, submitting forms, or escaping the
+            // sandbox.  This matches the security posture required by the
+            // issue spec.
+            {move || {
+                message.ui_html.get().map(|html| {
+                    view! {
+                        <iframe
+                            class="tool-call-iframe"
+                            sandbox="allow-scripts"
+                            srcdoc=html
+                        />
+                    }
+                })
             }}
         </div>
     }
