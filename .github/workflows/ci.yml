@@ -92,6 +92,16 @@ jobs:
         RUSTDOCFLAGS: "-D warnings"
       run: cargo doc -p gander --no-deps --all-features
 
+    - name: pure-ACP UI code is goose-free
+      run: |
+        ! grep -rqE '_goose/unstable|_meta\.goose|goose' crates/gander-chat/src/acp_core/ \
+          || (echo "ERROR: acp_core/ must not reference goose" && exit 1)
+
+    - name: host transport details do not leak into acp core
+      run: |
+        ! grep -rqE 'connect_profile|XDG_RUNTIME_DIR' src/acp/ \
+          || (echo "ERROR: src/acp/ must not reference geesed handshake details" && exit 1)
+
   build:
     name: build (release)
     runs-on: ubuntu-latest
