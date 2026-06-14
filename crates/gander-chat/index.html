@@ -273,13 +273,19 @@
       min-width: 0;
     }
 
-    /* tool call / result: gray, narrower, monospace feel */
+    /* tool call / result: gray, monospace feel.
+       Aligned to where the assistant's text bubble begins (past the avatar
+       gutter) and stretched to the message-list right padding so it has
+       breathing room for tool output and embedded MCP App iframes.
+
+       margin-left = .message-avatar width (32px) + .message--assistant gap (8px). */
     .message--tool {
       background: #1e2030;
-      align-self: flex-start;
+      align-self: stretch;
+      margin-left: 40px;
+      max-width: none;
       border: 1px solid #2e3050;
       font-size: 0.88em;
-      max-width: 90%;
     }
 
     /* pulldown-cmark wraps everything in <p>; strip the outer margin */
@@ -445,6 +451,8 @@
       border-radius: 8px;
       background: #16162a;
       border: 1px solid #282838;
+      position: relative;
+      overflow: hidden;
     }
 
     /* Full-width clickable header — no browser button chrome */
@@ -479,16 +487,35 @@
       text-overflow: ellipsis;
     }
 
-    /* Status badge: small, muted; ✓ and ✗ get their own tint */
-    .tool-call-status {
-      flex-shrink: 0;
-      font-size: 0.78rem;
-      color: #8888a8;
+    /* State-coloured left-edge spine — absolute, full card height */
+    .tool-call-spine {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
     }
+    .tool-call-spine--pending  { background: #6a6a85; }
+    .tool-call-spine--running  { background: #e89244; animation: tool-throb 1.2s ease-in-out infinite; }
+    .tool-call-spine--success  { background: #4caf72; }
+    .tool-call-spine--failure  { background: #cc6666; }
 
-    /* ✓ completed */
-    .tool-call-status:not(:empty) {
-      color: #8888a8;
+    /* Gear icon in header — colour and animation vary by state */
+    .tool-call-gear {
+      display: flex;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    .tool-call-gear--pending { color: #6a6a85; }
+    .tool-call-gear--running { color: #e89244; animation: tool-throb 1.2s ease-in-out infinite; }
+    .tool-call-gear--success { color: #4caf72; }
+    .tool-call-gear--failure { color: #cc6666; }
+
+    /* One keyframe shared by spine and gear so they stay in phase */
+    @keyframes tool-throb {
+      0%   { opacity: 1; }
+      50%  { opacity: 0.45; }
+      100% { opacity: 1; }
     }
 
     /* Chevron rotates when the body is open */
@@ -619,6 +646,15 @@
               toolCallId: "tc-mock-2", title: "show_panel", status: "completed",
               rawInput:  {},
               rawOutput: { resourceUri: "ui://demo/panel" }
+          }},
+          // Tool C: pending
+          { delay: 250, call: { toolCallId: "tc-mock-3", title: "broken_thing", status: "pending" } },
+          // Tool C: in_progress
+          { delay: 520, call: { toolCallId: "tc-mock-3", title: "broken_thing", status: "in_progress" } },
+          // Tool C: failed
+          { delay: 850, call: {
+              toolCallId: "tc-mock-3", title: "broken_thing", status: "failed",
+              rawInput: {}, rawOutput: { error: "demo" }
           }},
         ];
 
