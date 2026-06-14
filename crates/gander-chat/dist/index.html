@@ -11,8 +11,8 @@
   -->
   
 <script type="module">
-import init, * as bindings from '/gander-chat-8e9a70020601a43b.js';
-const wasm = await init({ module_or_path: '/gander-chat-8e9a70020601a43b_bg.wasm' });
+import init, * as bindings from '/gander-chat-ed65cde98ae25a53.js';
+const wasm = await init({ module_or_path: '/gander-chat-ed65cde98ae25a53_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -21,6 +21,9 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
+
+  <!-- Static assets (icons, images) copied verbatim to dist/assets/. -->
+  
 
   <style>
     *, *::before, *::after { box-sizing: border-box; }
@@ -57,9 +60,10 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     }
 
     .new-session-btn {
-      background: #2d5be3;
-      color: #fff;
+      background: #1e1e38;
+      color: #b0b0c8;
       border: none;
+      border-bottom: 1px solid #2a2a3e;
       border-radius: 0;
       padding: 12px 14px;
       font-family: inherit;
@@ -72,7 +76,8 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     }
 
     .new-session-btn:hover {
-      background: #3d6bf3;
+      background: #28284a;
+      color: #e0e0e0;
     }
 
     .session-list {
@@ -91,8 +96,9 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       text-align: left;
       cursor: pointer;
       display: flex;
-      flex-direction: column;
-      gap: 3px;
+      flex-direction: row;
+      align-items: center;
+      gap: 8px;
       border-bottom: 1px solid #1e1e32;
       font-family: inherit;
       font-size: 0.85rem;
@@ -104,13 +110,13 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     }
 
     .session-item--active {
-      background: #1e2e54;
-      color: #e0e0ff;
-      border-left: 3px solid #2d5be3;
+      background: #2d5be3;
+      color: #ffffff;
+      border-left: 3px solid #5d8bff;
     }
 
     .session-item--active:hover {
-      background: #1e3060;
+      background: #3d6bf3;
     }
 
     .session-label {
@@ -120,9 +126,11 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       white-space: nowrap;
     }
 
-    .session-ago {
-      font-size: 0.78rem;
-      opacity: 0.65;
+    .session-icon {
+      display: flex;
+      align-items: center;
+      flex-shrink: 0;
+      opacity: 0.75;
     }
 
     /* ── concertina menu ─────────────────────────────────────── */
@@ -222,6 +230,21 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       display: flex;
       flex-direction: column;
       gap: 10px;
+    }
+
+    .empty-state {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .empty-state-logo {
+      width: 160px;
+      height: 160px;
+      opacity: 0.18;
+      border-radius: 50%;
+      object-fit: cover;
     }
 
     .message {
@@ -735,7 +758,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       };
     })();
   </script>
-<link rel="modulepreload" href="/gander-chat-8e9a70020601a43b.js" crossorigin="anonymous" integrity="sha384-hIlwBRmdswUN4NLwGqlQjpu56gu42R4rtSKtAhodAV/CUKP8HrssoHU1+qZg1edn"><link rel="preload" href="/gander-chat-8e9a70020601a43b_bg.wasm" crossorigin="anonymous" integrity="sha384-VZBbeXHbqnYGa1VcYcl38jZBBc1ZwSDBl/u51WR1muaFWSmR3xheEXFXpGLl6Ur2" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/gander-chat-ed65cde98ae25a53.js" crossorigin="anonymous" integrity="sha384-1jYM+ShaUEHHVa1retjUDDwB9hu757CC5d7RzFU5tO+pNY2QGympz8llwRG7xD6v"><link rel="preload" href="/gander-chat-ed65cde98ae25a53_bg.wasm" crossorigin="anonymous" integrity="sha384-Ew3cppIBgfRpFtvOgWRRRPlHHZyGryyPjnrQ9SQ40qJz0VaNPycjoo6lIrAgD5k+" as="fetch" type="application/wasm"></head>
 <body>
   <!--
     Trunk injects the WASM loader at the end of <body>.
