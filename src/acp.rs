@@ -706,6 +706,10 @@ async fn forward_update(
             if let Some(existing) = map.get_mut(&update.tool_call_id) {
                 // goose-ext: propagate the update's _meta so the mcpApp attachment
                 // lands on the ToolCall and is visible to extract_mcp_app_html.
+                // Full replacement is correct: ACP v1 does not send partial _meta
+                // updates — each ToolCallUpdate carries the complete attachment for
+                // that update.  The mcpApp payload arrives exactly once, on the
+                // terminal Completed update, and is authoritative at that point.
                 if let Some(meta) = update.meta {
                     existing.meta = Some(meta);
                 }

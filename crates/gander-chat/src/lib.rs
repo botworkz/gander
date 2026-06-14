@@ -895,6 +895,12 @@ fn ToolCallCard(message: ChatMessage) -> impl IntoView {
             }}
             // ── goose-ext: MCP App HTML panel (sandboxed iframe) ──────────
             // goose-ext: rendered when the host emits tool_resource for this call
+            // Sandbox is intentionally minimal: allow-scripts only.
+            // allow-same-origin, allow-forms, and allow-top-navigation are
+            // deliberately excluded to prevent the iframe content from
+            // accessing cookies/storage, submitting forms, or escaping the
+            // sandbox.  This matches the security posture required by the
+            // issue spec.
             {move || {
                 message.ui_html.get().map(|html| {
                     view! {
