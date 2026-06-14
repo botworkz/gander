@@ -273,13 +273,19 @@
       min-width: 0;
     }
 
-    /* tool call / result: gray, narrower, monospace feel */
+    /* tool call / result: gray, monospace feel.
+       Aligned to where the assistant's text bubble begins (past the avatar
+       gutter) and stretched to the message-list right padding so it has
+       breathing room for tool output and embedded MCP App iframes.
+
+       margin-left = .message-avatar width (32px) + .message--assistant gap (8px). */
     .message--tool {
       background: #1e2030;
-      align-self: flex-start;
+      align-self: stretch;
+      margin-left: 40px;
+      max-width: none;
       border: 1px solid #2e3050;
       font-size: 0.88em;
-      max-width: 90%;
     }
 
     /* pulldown-cmark wraps everything in <p>; strip the outer margin */
