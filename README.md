@@ -58,6 +58,22 @@ cargo run --release
 
 By default `gander` reads profiles from the same `$GEESE_ROOT` your `geese` CLI uses (`$XDG_DATA_HOME/geese` by default).
 
+## Diagnostics
+
+All wire-level ACP traffic is logged at `debug!` level under the **`gander::wire`** target — every JSON-RPC frame sent to or received from goose, plus the `AcpEvent`s emitted from the worker. Off by default; enable with:
+
+```bash
+RUST_LOG=gander::wire=debug cargo run --bin gander
+```
+
+Combine with general gander debug output:
+
+```bash
+RUST_LOG=gander=debug,gander::wire=debug cargo run --bin gander
+```
+
+Log lines are structured (`field=value`) with JSON-stringified payloads so they survive copy-paste and pipe straight into `jq`. Message strings like `INIT_REQUEST`, `TOOL_CALL_UPDATE_DELTA`, and `META_PAYLOAD` are stable and greppable.
+
 ## Why "gander"?
 
 You have a *gander* at the *geese*. It chimes.
