@@ -23,12 +23,16 @@ use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 use agent_client_protocol::{
     ActiveSession, Agent, ByteStreams, SessionMessage,
     schema::{
-        ContentBlock, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
-        NewSessionResponse, ProtocolVersion, SessionId, SessionNotification, SessionUpdate,
-        StopReason, ToolCall, ToolCallId,
+        ClientCapabilities, ContentBlock, InitializeRequest, ListSessionsRequest,
+        LoadSessionRequest, Meta, NewSessionResponse, ProtocolVersion, SessionId,
+        SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallId, ToolCallStatus,
     },
     util::MatchDispatch,
 };
+
+// goose-ext: opt into goose's server-side MCP App hydration
+const GOOSE_MCP_UI_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
+const GOOSE_MCP_UI_MIME_TYPE: &str = "text/html;profile=mcp-app";
 use serde_json::Value;
 use std::time::Duration;
 use tokio::{
@@ -111,6 +115,16 @@ pub enum AcpEvent {
         cwd: String,
         model: String,
         tool_count: Option<u32>,
+    },
+    /// Pre-hydrated HTML panel from a goose MCP App tool call.
+    ///
+    /// Emitted after a `ToolCallUpdate` that carries a `Completed` status and
+    /// a `_meta.goose.mcpApp.resourceResult` payload.  The UI should render
+    /// the HTML in a sandboxed iframe alongside the tool-call card.
+    // goose-ext: emitted when goose pre-hydrates an MCP App attachment
+    ToolResource {
+        tool_call_id: String,
+        html: String,
     },
 }
 
@@ -337,7 +351,25 @@ async fn run_worker(
         .builder()
         .name("gander")
         .connect_with(transport, async move |cx| {
-            let init_resp = cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+            // goose-ext: advertise support for goose's server-side MCP App hydration so
+            // goose flips host_supports_mcp_apps() to true and embeds the pre-fetched HTML
+            // in ToolCallUpdate._meta.goose.mcpApp on every MCP App tool completion.
+            let mut caps_meta: Meta = serde_json::Map::new();
+            caps_meta.insert(
+                "goose".to_string(),
+                serde_json::json!({
+                    "mcpHostCapabilities": {
+                        "extensions": {
+                            GOOSE_MCP_UI_EXTENSION_ID: {
+                                "mimeTypes": [GOOSE_MCP_UI_MIME_TYPE]
+                            }
+                        }
+                    }
+                }),
+            );
+            let init_req = InitializeRequest::new(ProtocolVersion::V1)
+                .client_capabilities(ClientCapabilities::new().meta(caps_meta));
+            let init_resp = cx.send_request(init_req)
                 .block_task()
                 .await?;
 
@@ -672,10 +704,26 @@ async fn forward_update(
         SessionUpdate::ToolCallUpdate(update) => {
             let mut map = tool_calls.lock().await;
             if let Some(existing) = map.get_mut(&update.tool_call_id) {
+                // goose-ext: propagate the update's _meta so the mcpApp attachment
+                // lands on the ToolCall and is visible to extract_mcp_app_html.
+                if let Some(meta) = update.meta {
+                    existing.meta = Some(meta);
+                }
                 apply_tool_call_update(existing, update.fields);
                 let merged = existing.clone();
                 drop(map);
-                let _ = tx.send(AcpEvent::ToolCall(Box::new(merged))).await;
+                let _ = tx.send(AcpEvent::ToolCall(Box::new(merged.clone()))).await;
+                // goose-ext: extract pre-hydrated MCP App HTML from goose-private _meta path
+                if merged.status == ToolCallStatus::Completed {
+                    if let Some(html) = extract_mcp_app_html(merged.meta.as_ref()) {
+                        let _ = tx
+                            .send(AcpEvent::ToolResource {
+                                tool_call_id: merged.tool_call_id.to_string(),
+                                html,
+                            })
+                            .await;
+                    }
+                }
             }
             // If no prior ToolCall was received for this id, silently ignore.
             // This can only happen when history is replayed out of order, which
@@ -684,6 +732,47 @@ async fn forward_update(
         // AgentThoughtChunk and other variants are intentionally ignored in v1.
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// goose-ext: MCP App HTML extraction
+// ---------------------------------------------------------------------------
+
+/// Walk `_meta.goose.mcpApp.resourceResult.contents[]` looking for an HTML item.
+///
+/// Accepts both bare `text/html` and the spec'd `text/html;profile=mcp-app`
+/// mime types so minor server-side variations don't break rendering.
+///
+/// Returns `None` when:
+/// - `meta` is absent
+/// - the goose-private `mcpApp` key is missing (non-MCP-App tool call)
+/// - `readError` is present instead of `resourceResult` (server-side fetch
+///   failed; the caller should log and skip rendering)
+// goose-ext: navigates goose-private _meta.goose.mcpApp.resourceResult.contents[]
+fn extract_mcp_app_html(meta: Option<&Meta>) -> Option<String> {
+    let meta = meta?;
+    let goose = meta.get("goose")?;
+    let mcp_app = goose.get("mcpApp")?;
+    if mcp_app.get("readError").is_some() {
+        tracing::warn!("goose MCP App readError present; skipping iframe render");
+        return None;
+    }
+    let contents = mcp_app
+        .get("resourceResult")?
+        .get("contents")?
+        .as_array()?;
+    for item in contents {
+        let mime = item
+            .get("mimeType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if mime.starts_with("text/html") {
+            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -715,7 +804,8 @@ fn runtime_dir() -> PathBuf {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::{
-        ContentChunk, TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        ContentChunk, Meta, TextContent, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+        ToolCallUpdateFields,
     };
 
     /// Build a fresh shared tool-call map for use in tests.
@@ -737,6 +827,22 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         forward_update(update, &tx, map).await;
         rx.try_recv().ok()
+    }
+
+    // Helper: collect all events produced by one SessionUpdate. Some updates
+    // emit more than one event (e.g. a Completed ToolCallUpdate with mcpApp
+    // meta emits both a ToolCall snapshot and a ToolResource).
+    async fn all_forwarded_with_map(
+        update: SessionUpdate,
+        map: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+    ) -> Vec<AcpEvent> {
+        let (tx, mut rx) = mpsc::channel(8);
+        forward_update(update, &tx, map).await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
     }
 
     #[tokio::test]
@@ -883,6 +989,146 @@ mod tests {
         assert!(
             v.get("raw_output").is_none(),
             "snake_case 'raw_output' must not appear in JSON"
+        );
+    }
+
+    // ── MCP App HTML extraction ───────────────────────────────────────────
+
+    fn make_completed_update(tc_id: &str, mime: &str, html: &str) -> ToolCallUpdate {
+        let meta_map: Meta = serde_json::from_value(serde_json::json!({
+            "goose": {
+                "mcpApp": {
+                    "resourceResult": {
+                        "contents": [
+                            {
+                                "mimeType": mime,
+                                "text": html
+                            }
+                        ]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        ToolCallUpdate::new(
+            ToolCallId::new(tc_id),
+            ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+        )
+        .meta(meta_map)
+    }
+
+    #[tokio::test]
+    async fn completed_tool_with_mcp_app_meta_emits_tool_resource() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-mcp-1"), "mcp_app_tool");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        let update = make_completed_update("tc-mcp-1", "text/html", "<h1>Panel</h1>");
+        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        let resource = events.iter().find(|e| matches!(e, AcpEvent::ToolResource { .. }));
+        match resource {
+            Some(AcpEvent::ToolResource { tool_call_id, html }) => {
+                assert_eq!(tool_call_id, "tc-mcp-1");
+                assert_eq!(html, "<h1>Panel</h1>");
+            }
+            _ => panic!("expected ToolResource event, got {events:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_tool_with_text_html_profile_mime_emits_tool_resource() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-mcp-2"), "mcp_app_tool");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        let update =
+            make_completed_update("tc-mcp-2", "text/html;profile=mcp-app", "<p>hello</p>");
+        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        let resource = events.iter().find(|e| matches!(e, AcpEvent::ToolResource { .. }));
+        match resource {
+            Some(AcpEvent::ToolResource { tool_call_id, html }) => {
+                assert_eq!(tool_call_id, "tc-mcp-2");
+                assert_eq!(html, "<p>hello</p>");
+            }
+            _ => panic!("expected ToolResource for profile mime, got {events:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_tool_without_mcp_app_meta_does_not_emit() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-plain"), "plain_tool");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-plain"), fields);
+        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AcpEvent::ToolResource { .. })),
+            "plain completed tool must not emit ToolResource; got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_tool_with_read_error_does_not_emit() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-err"), "mcp_app_tool");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        // readError present, no resourceResult.
+        let meta_map: Meta = serde_json::from_value(serde_json::json!({
+            "goose": {
+                "mcpApp": {
+                    "readError": "resource not found"
+                }
+            }
+        }))
+        .unwrap();
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-err"), fields).meta(meta_map);
+        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AcpEvent::ToolResource { .. })),
+            "readError must not produce ToolResource; got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_progress_tool_with_mcp_app_meta_does_not_emit() {
+        let map = empty_map();
+        let tool = ToolCall::new(ToolCallId::new("tc-inprog"), "mcp_app_tool");
+        forwarded_with_map(SessionUpdate::ToolCall(tool), &map).await;
+
+        // Same mcpApp payload but status is InProgress — gate must hold.
+        let meta_map: Meta = serde_json::from_value(serde_json::json!({
+            "goose": {
+                "mcpApp": {
+                    "resourceResult": {
+                        "contents": [
+                            { "mimeType": "text/html", "text": "<p>early</p>" }
+                        ]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-inprog"), fields).meta(meta_map);
+        let events = all_forwarded_with_map(SessionUpdate::ToolCallUpdate(update), &map).await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AcpEvent::ToolResource { .. })),
+            "InProgress tool must not emit ToolResource; got {events:?}"
         );
     }
 }
