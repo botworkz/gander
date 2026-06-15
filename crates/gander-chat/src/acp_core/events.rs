@@ -83,12 +83,11 @@ pub fn handle_acp_core_bridge_event(
 
         // ── tool call (merged snapshot) ────────────────────────────────────
         Some("tool_call") => {
+            // Parse the snapshot.
             let call_json = js_sys::Reflect::get(event, &JsValue::from_str("call"))
                 .ok()
                 .and_then(|v| v.as_string())
                 .unwrap_or_default();
-
-            // Parse the JSON string to extract tool_call_id and status.
             let parsed = js_sys::JSON::parse(&call_json).ok();
             let tool_call_id = parsed
                 .as_ref()
@@ -102,24 +101,112 @@ pub fn handle_acp_core_bridge_event(
                 .unwrap_or_default();
             let is_done = crate::acp_core::components::message_view::is_terminal_status(&status);
 
-            // Find an existing card for this tool call id, or create one.
+            // A completed tool call with rawOutput.resourceUri means a UI
+            // resource fetch is in flight.  Set ui_pending so the card can
+            // show a loading placeholder immediately — before tool_resource
+            // arrives — preventing the visible pop-in gap described in #100.
+            let has_resource_uri = parsed
+                .as_ref()
+                .and_then(|obj| js_sys::Reflect::get(obj, &JsValue::from_str("rawOutput")).ok())
+                .and_then(|ro| js_sys::Reflect::get(&ro, &JsValue::from_str("resourceUri")).ok())
+                .map(|v| !v.is_null() && !v.is_undefined())
+                .unwrap_or(false);
+            let ui_pending = is_done && has_resource_uri;
+
+            // Close any in-flight assistant bubble before touching the tool
+            // card.
+            //
+            // A typical tool turn streams as
+            //   [agent_text*, tool_call, tool_resource, agent_text*]
+            // The pre-tool `agent_text` chunks accumulate into one bubble;
+            // the post-tool chunks should land in a *new* bubble so the
+            // visible order is `[pre-text, card, post-text]` rather than
+            // `[pre-text + post-text concatenated, card]`.  This mirrors
+            // the same close-on-boundary behaviour already in `user_text`.
+            //
+            // Once `in_flight` is `None`, the next `agent_text` arm creates
+            // a fresh bubble and pushes it onto `messages`, landing after
+            // the card we add below.
+            let pre_tool_bubble = in_flight.get_untracked();
+            if let Some(bubble) = pre_tool_bubble {
+                bubble.streaming.set(false);
+                in_flight.set(None);
+            }
+
+            // Find an existing card for this tool call id (status update
+            // path) or signal we need to create a new one.
             let existing = messages
                 .get_untracked()
                 .iter()
                 .find(|m| m.tool_call_id.get_untracked().as_deref() == Some(tool_call_id.as_str()))
                 .copied();
 
-            match existing {
-                Some(msg) => {
-                    msg.content.set(call_json);
-                    msg.streaming.set(!is_done);
-                }
-                None => {
-                    let m = ChatMessage::new_tool(take_id(next_id), tool_call_id, call_json);
-                    m.streaming.set(!is_done);
-                    messages.update(|v| v.push(m));
+            // Existing-card field updates are independent of Vec layout —
+            // do them up-front so the Vec mutation below is the single
+            // point that may re-order the messages list.
+            if let Some(msg) = existing {
+                msg.content.set(call_json.clone());
+                msg.streaming.set(!is_done);
+                if ui_pending {
+                    msg.ui_pending.set(true);
                 }
             }
+
+            // For panel-bearing tools, splice the pre-tool prose bubble
+            // out of `messages` and re-append it after the card.
+            //
+            // Why panel-only: when the tool has a UI panel the LLM
+            // typically commits to prose like "There you go — the panel is
+            // mounted above…" *before* firing the tool, so the bubble
+            // naturally lands at `messages.last()` by the time `tool_call`
+            // arrives.  Without splicing the user sees:
+            //
+            //   [user: question]
+            //   [assistant: There you go — the panel is above…]
+            //   [tool card with iframe panel]
+            //
+            // — which contradicts the prose's "above".  Re-appending after
+            // the card gives:
+            //
+            //   [user: question]
+            //   [tool card with iframe panel]
+            //   [assistant: There you go — the panel is above…]
+            //
+            // For action tools with no panel, the natural
+            // `[pre-text, card, post-text]` close-on-boundary layout (above)
+            // is correct as-is, so splicing would only create the wart of
+            // pre-text-after-card.  Hence the `ui_pending` gate.
+            //
+            // Symptom this fixes: gander#100 follow-up "panel still
+            // appears after dialog" — the iframe pop-in gap was closed by
+            // the ui_pending placeholder in #106, but the bubble sitting
+            // above the card was a separate ordering bug.
+            let bubble_to_reorder = if ui_pending { pre_tool_bubble } else { None };
+
+            let new_card = if existing.is_none() {
+                let m = ChatMessage::new_tool(take_id(next_id), tool_call_id, call_json);
+                m.streaming.set(!is_done);
+                if ui_pending {
+                    m.ui_pending.set(true);
+                }
+                Some(m)
+            } else {
+                None
+            };
+
+            messages.update(|v| {
+                if let Some(bubble) = bubble_to_reorder {
+                    if let Some(idx) = v.iter().position(|m| m.id == bubble.id) {
+                        v.remove(idx);
+                    }
+                }
+                if let Some(card) = new_card {
+                    v.push(card);
+                }
+                if let Some(bubble) = bubble_to_reorder {
+                    v.push(bubble);
+                }
+            });
         }
 
         // ── session load start: clear UI, enter replay mode ────────────────

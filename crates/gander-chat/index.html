@@ -568,7 +568,85 @@
       color: #c0c0d8;
       overflow-x: auto;
     }
+
+    /* MCP App iframe — full width, content-sized.
+
+       Height defaults to `min-height` and is raised to the panel's measured
+       scrollHeight by the parent listener defined in the inline
+       `gander.iframe.height` script below.  Capped at `max-height: 80vh` so
+       a single panel cannot consume the whole viewport.  A 200px floor keeps
+       small panels (e.g. a single notice line) visually substantial and
+       avoids the cramped browser-default ~150px iframe size. */
+    .tool-call-iframe {
+      display: block;
+      width: 100%;
+      min-height: 200px;
+      max-height: 80vh;
+      border: none;
+      border-top: 1px solid #282838;
+    }
+
+    /* Loading placeholder shown while the resource fetch is in flight.
+       Matches the iframe's `min-height` exactly so the card does not shift
+       vertically when `srcdoc` resolves and replaces the placeholder. */
+    .tool-call-iframe-pending {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 200px;
+      border-top: 1px solid #282838;
+      color: #8888a8;
+      font-size: 0.82rem;
+    }
+
+    .tool-call-iframe-pending-label {
+      animation: tool-throb 1.2s ease-in-out infinite;
+    }
   </style>
+
+  <script>
+    // -----------------------------------------------------------------------
+    // gander.iframe.height — parent side of the iframe-sizing protocol
+    //
+    // Each MCP App iframe srcdoc embeds a small helper script (see
+    // crates/gander-chat/src/goose_ext/components/mcp_app_iframe.rs) that
+    // posts `{ type: "gander.iframe.height", id, height }` whenever its
+    // document grows or shrinks.  We look up the iframe by `name=id` and
+    // resize it directly via `style.height`.
+    //
+    // Why direct style:
+    //   - sandboxed iframes can't see their content height from CSS
+    //   - we already trust the panel author (extension layer); the cap
+    //     in `.tool-call-iframe { max-height }` keeps a runaway panel from
+    //     eating the viewport
+    //
+    // Defensive: silently ignores malformed messages, unknown ids, and
+    // non-finite numbers so an extension can't crash the chat shell.
+    // -----------------------------------------------------------------------
+    (function () {
+      "use strict";
+      var MIN_PX = 200;
+      window.addEventListener("message", function (event) {
+        var data = event && event.data;
+        if (!data || data.type !== "gander.iframe.height") return;
+        var id = typeof data.id === "string" ? data.id : "";
+        var h = Number(data.height);
+        if (!id || !isFinite(h) || h <= 0) return;
+        // Floor at MIN_PX so a transient zero-height during a re-layout
+        // doesn't make the panel collapse and re-expand visibly.
+        if (h < MIN_PX) h = MIN_PX;
+        // CSS selector escapes are awkward for arbitrary tool-call ids;
+        // iterate iframes (there will only ever be a handful).
+        var frames = document.querySelectorAll("iframe.tool-call-iframe");
+        for (var i = 0; i < frames.length; i++) {
+          if (frames[i].name === id) {
+            frames[i].style.height = h + "px";
+            break;
+          }
+        }
+      });
+    })();
+  </script>
 
   <script>
     // -----------------------------------------------------------------------
@@ -647,6 +725,23 @@
               rawInput:  {},
               rawOutput: { resourceUri: "ui://demo/panel" }
           }},
+          // Tool B: panel HTML arrives shortly after (simulates the
+          // _goose/unstable/resources/read RPC).  Lets dev runs of
+          // `trunk serve` exercise the iframe sizing protocol without
+          // needing a live goose.
+          { delay: 950, resource: {
+              tool_call_id: "tc-mock-2",
+              html: "<!doctype html><html><head><style>" +
+                    "body{margin:0;font:14px system-ui;background:#0e0e1f;color:#e0e0e0;padding:12px}" +
+                    "h3{margin:0 0 8px 0;color:#5d8bff}" +
+                    "ul{margin:0;padding-left:20px}" +
+                    "</style></head><body>" +
+                    "<h3>Mock panel</h3>" +
+                    "<p>Compact content — the parent should size the iframe " +
+                    "to fit this with no scroll bar.</p>" +
+                    "<ul><li>tmp/</li><li>toolshed/</li><li>fixtures/</li></ul>" +
+                    "</body></html>"
+          }},
           // Tool C: pending
           { delay: 250, call: { toolCallId: "tc-mock-3", title: "broken_thing", status: "pending" } },
           // Tool C: in_progress
@@ -660,7 +755,17 @@
 
         toolSequence.forEach(function(item) {
           setTimeout(function() {
-            fireEvent({ type: "tool_call", call: JSON.stringify(item.call) });
+            if (item.resource) {
+              // Mock the goose-ext tool_resource event (which the host
+              // normally emits after fetching `_goose/unstable/resources/read`).
+              fireEvent({
+                type: "tool_resource",
+                tool_call_id: item.resource.tool_call_id,
+                html: item.resource.html,
+              });
+            } else {
+              fireEvent({ type: "tool_call", call: JSON.stringify(item.call) });
+            }
           }, item.delay);
         });
 

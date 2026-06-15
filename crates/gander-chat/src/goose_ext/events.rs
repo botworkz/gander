@@ -40,6 +40,7 @@ pub fn handle_goose_ext_bridge_event(event: &JsValue, messages: RwSignal<Vec<Cha
                 .find(|m| m.tool_call_id.get_untracked().as_deref() == Some(tool_call_id.as_str()))
                 .copied()
             {
+                msg.ui_pending.set(false);
                 msg.ui_html.set(Some(html));
             }
         }

@@ -52,6 +52,11 @@ pub struct ChatMessage {
     // Field is populated exclusively by the extension layer; kept inline
     // until the ExtHandler trait provides a generic ext-slot (sibling PR #85).
     pub ui_html: RwSignal<Option<String>>,
+    /// `true` while a UI resource fetch is in flight (i.e. `rawOutput.resourceUri`
+    /// was detected on the completed tool call but `tool_resource` has not yet
+    /// arrived).  Drives a loading placeholder in the iframe slot so the card
+    /// layout does not shift when the HTML arrives.
+    pub ui_pending: RwSignal<bool>,
 }
 
 impl ChatMessage {
@@ -64,6 +69,7 @@ impl ChatMessage {
             error: RwSignal::new(None),
             tool_call_id: RwSignal::new(None),
             ui_html: RwSignal::new(None),
+            ui_pending: RwSignal::new(false),
         }
     }
 
@@ -76,6 +82,7 @@ impl ChatMessage {
             error: RwSignal::new(None),
             tool_call_id: RwSignal::new(None),
             ui_html: RwSignal::new(None),
+            ui_pending: RwSignal::new(false),
         }
     }
 
@@ -89,6 +96,7 @@ impl ChatMessage {
             error: RwSignal::new(None),
             tool_call_id: RwSignal::new(Some(tool_call_id)),
             ui_html: RwSignal::new(None),
+            ui_pending: RwSignal::new(false),
         }
     }
 }
