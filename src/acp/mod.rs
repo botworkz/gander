@@ -452,12 +452,37 @@ async fn run_worker(
                                             &mut current_session,
                                             &evt_tx_clone,
                                             &tool_calls,
+                                            &ext_handler,
+                                            &handler_evt_tx,
                                         )
                                         .await;
-                                        // Discard any fetches that might have been queued
-                                        // during history replay (there should be none, but
-                                        // clear for safety).
-                                        pending_fetches.lock().await.clear();
+                                        // Drain ext handler events queued during
+                                        // history replay and route to pending_fetches
+                                        // so MCP App iframes are re-hydrated on load.
+                                        while let Ok(evt) = handler_evt_rx.try_recv() {
+                                            match evt {
+                                                ExtEvent::Request(ExtRequest::ReadResource {
+                                                    tool_call_id,
+                                                    uri,
+                                                    extension_name,
+                                                }) => {
+                                                    pending_fetches
+                                                        .lock()
+                                                        .await
+                                                        .push((tool_call_id, uri, extension_name));
+                                                }
+                                                other => {
+                                                    let _ = ext_ui_tx_clone.send(other).await;
+                                                }
+                                            }
+                                        }
+                                        process_pending_fetches(
+                                            &cx,
+                                            &ext_ui_tx_clone,
+                                            &pending_fetches,
+                                            active_id.clone(),
+                                        )
+                                        .await;
                                         let _ = evt_tx_clone
                                             .send(AcpEvent::SessionLoadEnd)
                                             .await;
@@ -619,10 +644,17 @@ async fn drain_session_updates(
 /// no timing heuristics.
 ///
 /// Replaces the previous 500 ms idle-period heuristic (gander#48).
+///
+/// The ext handler is called for each completed tool call so that MCP App
+/// iframes are re-fetched during history replay (gander#100).  Callers must
+/// drain `handler_evt_tx` and call [`process_pending_fetches`] after this
+/// function returns.
 async fn drain_history_replay(
     session: &mut ActiveSession<'_, Agent>,
     evt_tx: &mpsc::Sender<AcpEvent>,
     tool_calls: &Arc<Mutex<HashMap<ToolCallId, ToolCall>>>,
+    ext_handler: &Arc<dyn ExtHandler + Send + Sync>,
+    handler_evt_tx: &mpsc::Sender<ExtEvent>,
 ) {
     loop {
         let next = tokio::time::timeout(Duration::ZERO, session.read_update()).await;
@@ -640,12 +672,13 @@ async fn drain_history_replay(
             SessionMessage::SessionMessage(dispatch) => {
                 let tx = evt_tx.clone();
                 let tc_arc = Arc::clone(tool_calls);
+                let eh = Arc::clone(ext_handler);
+                let hev_tx = handler_evt_tx.clone();
                 let handled = MatchDispatch::new(dispatch)
                     .if_notification(async move |n: SessionNotification| {
-                        // History replay intentionally skips the ext handler —
-                        // we don't want to re-trigger resource fetches on every
-                        // reconnect.
-                        forward_update(n.update, &tx, &tc_arc).await;
+                        if let Some(completed) = forward_update(n.update, &tx, &tc_arc).await {
+                            eh.on_tool_call_completed(&completed, &hev_tx).await;
+                        }
                         Ok(())
                     })
                     .await

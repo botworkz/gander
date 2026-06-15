@@ -102,6 +102,18 @@ pub fn handle_acp_core_bridge_event(
                 .unwrap_or_default();
             let is_done = crate::acp_core::components::message_view::is_terminal_status(&status);
 
+            // A completed tool call with rawOutput.resourceUri means a UI
+            // resource fetch is in flight.  Set ui_pending so the card can
+            // show a loading placeholder immediately — before tool_resource
+            // arrives — preventing the visible pop-in gap described in #100.
+            let has_resource_uri = parsed
+                .as_ref()
+                .and_then(|obj| js_sys::Reflect::get(obj, &JsValue::from_str("rawOutput")).ok())
+                .and_then(|ro| js_sys::Reflect::get(&ro, &JsValue::from_str("resourceUri")).ok())
+                .map(|v| !v.is_null() && !v.is_undefined())
+                .unwrap_or(false);
+            let ui_pending = is_done && has_resource_uri;
+
             // Find an existing card for this tool call id, or create one.
             let existing = messages
                 .get_untracked()
@@ -113,10 +125,16 @@ pub fn handle_acp_core_bridge_event(
                 Some(msg) => {
                     msg.content.set(call_json);
                     msg.streaming.set(!is_done);
+                    if ui_pending {
+                        msg.ui_pending.set(true);
+                    }
                 }
                 None => {
                     let m = ChatMessage::new_tool(take_id(next_id), tool_call_id, call_json);
                     m.streaming.set(!is_done);
+                    if ui_pending {
+                        m.ui_pending.set(true);
+                    }
                     messages.update(|v| v.push(m));
                 }
             }

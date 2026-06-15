@@ -568,6 +568,32 @@
       color: #c0c0d8;
       overflow-x: auto;
     }
+
+    /* MCP App iframe — full-width, proportionate height, no border */
+    .tool-call-iframe {
+      display: block;
+      width: 100%;
+      height: 45vh;
+      min-height: 320px;
+      border: none;
+      border-top: 1px solid #282838;
+    }
+
+    /* Loading placeholder shown while the resource fetch is in flight */
+    .tool-call-iframe-pending {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 45vh;
+      min-height: 320px;
+      border-top: 1px solid #282838;
+      color: #8888a8;
+      font-size: 0.82rem;
+    }
+
+    .tool-call-iframe-pending-label {
+      animation: tool-throb 1.2s ease-in-out infinite;
+    }
   </style>
 
   <script>
