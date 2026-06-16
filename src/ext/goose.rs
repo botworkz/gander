@@ -14,6 +14,20 @@
 //! [`process_pending_fetches`] which fires the actual RPC and emits
 //! [`ExtEvent::ToolResource`] to the UI channel.
 //!
+//! ## Per-process resource cache
+//!
+//! [`process_pending_fetches`] consults a [`ResourceCache`] (keyed by
+//! `(session_id, uri)`) before issuing each RPC.  Cache hits are emitted
+//! directly as [`ExtEvent::ToolResource`] without a network round-trip; cache
+//! misses populate the cache after a successful fetch.
+//!
+//! The cache is owned by the per-tab ACP worker and lives for the tab's
+//! lifetime.  It exists to satisfy gander#101: re-opening the same session
+//! within one gander run must not issue redundant
+//! `_goose/unstable/resources/read` calls.  Cache invalidation across panel
+//! changes on the goose side is intentionally out of scope (panels are
+//! deterministic given `(session_id, uri)` in current goose versions).
+//!
 //! ## Migration note
 //!
 //! When `_goose/unstable/resources/read` graduates to the ACP spec:
@@ -23,6 +37,7 @@
 //!
 //! That's the entire migration; nothing else needs to change.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_client_protocol::{
@@ -40,6 +55,22 @@ use crate::ext::{ExtEvent, ExtHandler, ExtRequest};
 /// Populated by the worker when it drains an [`ExtRequest::ReadResource`] from
 /// the handler event channel; drained by [`process_pending_fetches`].
 pub type PendingFetches = Arc<Mutex<Vec<(ToolCallId, String, String)>>>;
+
+/// Per-process resource cache: `(session_id, uri) → html`.
+///
+/// Owned by the ACP worker, lives for the tab's lifetime.  Populated by
+/// [`process_pending_fetches`] after a successful fetch; consulted at the top
+/// of the same function on subsequent fetches.
+///
+/// See the module docs for the design rationale (gander#101).
+pub type ResourceCache = Arc<Mutex<HashMap<(String, String), String>>>;
+
+/// Build an empty [`ResourceCache`].
+///
+/// Provided so the worker doesn't have to spell out the inner type.
+pub fn new_resource_cache() -> ResourceCache {
+    Arc::new(Mutex::new(HashMap::new()))
+}
 
 // ---------------------------------------------------------------------------
 // GooseExtHandler
@@ -124,7 +155,46 @@ pub fn extract_html_from_read_resource_response(response: &Value) -> Option<Stri
     })
 }
 
+/// Pluck cache-hit entries out of `fetches`, emit `ToolResource` for each, and
+/// return only the entries that still need an RPC.
+///
+/// Extracted from [`process_pending_fetches`] so the cache logic is unit
+/// testable without spinning up a mock `ConnectionTo`.
+async fn pluck_cached(
+    fetches: Vec<(ToolCallId, String, String)>,
+    cache: &ResourceCache,
+    ext_ui_tx: &mpsc::Sender<ExtEvent>,
+    session_id: &str,
+) -> Vec<(ToolCallId, String, String)> {
+    let mut remaining = Vec::with_capacity(fetches.len());
+    let cache_guard = cache.lock().await;
+    for (tool_call_id, uri, extension_name) in fetches {
+        let key = (session_id.to_string(), uri.clone());
+        if let Some(html) = cache_guard.get(&key) {
+            debug!(
+                target: "gander::wire",
+                tool_call_id = %tool_call_id,
+                uri = %uri,
+                "READ_RESOURCE_CACHE_HIT"
+            );
+            let _ = ext_ui_tx
+                .send(ExtEvent::ToolResource {
+                    tool_call_id: tool_call_id.to_string(),
+                    html: html.clone(),
+                })
+                .await;
+        } else {
+            remaining.push((tool_call_id, uri, extension_name));
+        }
+    }
+    remaining
+}
+
 /// Drain `pending_fetches` and call `_goose/unstable/resources/read` for each.
+///
+/// Cache-hit entries (already in `cache` for the same `(session_id, uri)`) are
+/// emitted as [`ExtEvent::ToolResource`] directly, with no RPC.  Cache misses
+/// fire the RPC and, on success, populate the cache before emitting.
 ///
 /// On a `text/html` response, emits [`ExtEvent::ToolResource`] via `ext_ui_tx`.
 /// Errors are logged and skipped — the tool-call card remains visible without
@@ -133,15 +203,19 @@ pub async fn process_pending_fetches<R>(
     cx: &agent_client_protocol::ConnectionTo<R>,
     ext_ui_tx: &mpsc::Sender<ExtEvent>,
     pending_fetches: &PendingFetches,
+    cache: &ResourceCache,
     session_id: String,
 ) where
     R: agent_client_protocol::role::Role,
     R: agent_client_protocol::role::HasPeer<R>,
 {
-    let fetches: Vec<(ToolCallId, String, String)> = {
+    let drained: Vec<(ToolCallId, String, String)> = {
         let mut guard = pending_fetches.lock().await;
         std::mem::take(&mut *guard)
     };
+
+    // Serve cache hits without a network round-trip.
+    let fetches = pluck_cached(drained, cache, ext_ui_tx, &session_id).await;
 
     for (tool_call_id, uri, extension_name) in fetches {
         let params = serde_json::json!({
@@ -178,6 +252,13 @@ pub async fn process_pending_fetches<R>(
             "READ_RESOURCE_RESPONSE"
         );
         if let Some(html) = extract_html_from_read_resource_response(&response) {
+            // Populate the cache before emitting so a racy second drain on the
+            // same key — which can happen during fast reconnects — sees the
+            // entry and short-circuits.
+            cache
+                .lock()
+                .await
+                .insert((session_id.clone(), uri.clone()), html.clone());
             let _ = ext_ui_tx
                 .send(ExtEvent::ToolResource {
                     tool_call_id: tool_call_id.to_string(),
@@ -357,5 +438,93 @@ mod tests {
     fn extract_html_returns_none_when_result_key_missing() {
         let resp = serde_json::json!({ "other": {} });
         assert!(extract_html_from_read_resource_response(&resp).is_none());
+    }
+
+    // ── pluck_cached ──────────────────────────────────────────────────────
+
+    /// Drain a channel into a Vec without waiting.
+    async fn drain<T>(rx: &mut mpsc::Receiver<T>) -> Vec<T> {
+        let mut out = Vec::new();
+        while let Ok(v) = rx.try_recv() {
+            out.push(v);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn pluck_cached_returns_all_when_cache_empty() {
+        let cache = new_resource_cache();
+        let (tx, mut rx) = mpsc::channel(8);
+        let fetches = vec![
+            (ToolCallId::new("tc-a"), "uri-a".into(), "ext".into()),
+            (ToolCallId::new("tc-b"), "uri-b".into(), "ext".into()),
+        ];
+
+        let remaining = pluck_cached(fetches, &cache, &tx, "session-1").await;
+
+        assert_eq!(
+            remaining.len(),
+            2,
+            "empty cache → all entries should require RPC"
+        );
+        assert!(
+            drain(&mut rx).await.is_empty(),
+            "empty cache → no ToolResource events should be emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn pluck_cached_emits_and_filters_cache_hits() {
+        let cache = new_resource_cache();
+        cache
+            .lock()
+            .await
+            .insert(("session-1".into(), "uri-a".into()), "<p>a</p>".into());
+        let (tx, mut rx) = mpsc::channel(8);
+        let fetches = vec![
+            (ToolCallId::new("tc-a"), "uri-a".into(), "ext".into()),
+            (ToolCallId::new("tc-b"), "uri-b".into(), "ext".into()),
+        ];
+
+        let remaining = pluck_cached(fetches, &cache, &tx, "session-1").await;
+
+        assert_eq!(remaining.len(), 1, "uri-b should remain (cache miss)");
+        assert_eq!(
+            remaining[0].1, "uri-b",
+            "the remaining entry should be the cache miss"
+        );
+        let emitted = drain(&mut rx).await;
+        assert_eq!(emitted.len(), 1, "exactly one cache hit should be emitted");
+        match &emitted[0] {
+            ExtEvent::ToolResource { tool_call_id, html } => {
+                assert_eq!(tool_call_id, "tc-a");
+                assert_eq!(html, "<p>a</p>");
+            }
+            other => panic!("expected ToolResource for cache hit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pluck_cached_keys_on_session_id() {
+        // The same uri cached under a different session id must miss.
+        let cache = new_resource_cache();
+        cache
+            .lock()
+            .await
+            .insert(("other-session".into(), "uri-a".into()), "<p>a</p>".into());
+        let (tx, mut rx) = mpsc::channel(8);
+        let fetches = vec![(ToolCallId::new("tc-a"), "uri-a".into(), "ext".into())];
+
+        let remaining = pluck_cached(fetches, &cache, &tx, "session-1").await;
+
+        assert_eq!(
+            remaining.len(),
+            1,
+            "different session must not hit a foreign-session cache entry"
+        );
+        assert!(
+            drain(&mut rx).await.is_empty(),
+            "no emit expected on session-keyed cache miss"
+        );
     }
 }

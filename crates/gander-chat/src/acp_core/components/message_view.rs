@@ -206,7 +206,7 @@ pub fn ToolCallCard(message: ChatMessage) -> impl IntoView {
                     })
             }}
             // ── MCP App HTML panel (sandboxed iframe, extension layer) ──────
-            <McpAppIframe ui_html=message.ui_html ui_pending=message.ui_pending />
+            <McpAppIframe ui_html=message.ui_html ui_pending=message.ui_pending tool_call_id=message.tool_call_id />
         </div>
     }
 }

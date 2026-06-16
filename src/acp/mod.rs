@@ -40,7 +40,9 @@ use tokio::{
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::debug;
 
-use crate::ext::goose::{PendingFetches, process_pending_fetches};
+use crate::ext::goose::{
+    PendingFetches, ResourceCache, new_resource_cache, process_pending_fetches,
+};
 use crate::ext::{ExtEvent, ExtHandler, ExtRequest};
 use crate::transport::Transport;
 
@@ -287,6 +289,12 @@ async fn run_worker(
     // Pending MCP App resource fetches populated by the ext handler.
     let pending_fetches: PendingFetches = Arc::new(Mutex::new(Vec::new()));
 
+    // Per-tab extension-resource cache: `(session_id, uri) → html`.  Lives
+    // for the tab's lifetime.  Prevents redundant ext-handler resource fetches
+    // when the user re-opens the same session (gander#101).  The cache is
+    // opaque to this module; the extension owns the protocol details.
+    let resource_cache: ResourceCache = new_resource_cache();
+
     // Internal channel: ext handler writes ExtEvents here; the worker drains
     // it after each drain_session_updates call and routes them appropriately.
     let (handler_evt_tx, mut handler_evt_rx) = mpsc::channel::<ExtEvent>(64);
@@ -406,6 +414,7 @@ async fn run_worker(
                             &cx,
                             &ext_ui_tx_clone,
                             &pending_fetches,
+                            &resource_cache,
                             current_session.session_id().to_string(),
                         )
                         .await;
@@ -480,6 +489,7 @@ async fn run_worker(
                                             &cx,
                                             &ext_ui_tx_clone,
                                             &pending_fetches,
+                                            &resource_cache,
                                             active_id.clone(),
                                         )
                                         .await;
