@@ -84,43 +84,63 @@ pub fn MessageView(message: ChatMessage) -> impl IntoView {
                 Role::Assistant => "message message--assistant",
                 Role::Tool => unreachable!(),
             };
-            view! {
-                <div class=role_class>
-                    // Avatar gutter — only present for assistant messages.
-                    {matches!(message.role, Role::Assistant).then(|| {
-                        view! {
-                            <img
-                                class="message-avatar"
-                                src="/assets/gander.png"
-                                alt="gander"
-                            />
-                        }
-                    })}
-                    // Bubble body: content, streaming cursor, and error notice.
-                    <div class="message-bubble">
-                        // Reactive inner HTML: re-evaluates only when `content` changes.
-                        <div
-                            class="message-content"
-                            inner_html=move || crate::markdown::render(&message.content.get())
-                        />
-                        // Blinking cursor while the host is still streaming tokens.
-                        {move || {
-                            message
-                                .streaming
-                                .get()
-                                .then(|| view! { <span class="streaming-cursor">"▋"</span> })
-                        }}
-                        // Error notice, shown only on failure.
-                        {move || {
-                            message
-                                .error
-                                .get()
-                                .map(|e| view! { <div class="error-notice">{e}</div> })
-                        }}
-                    </div>
+            // Bubble body shared by both speakers.  Defined once so the
+            // user / assistant arms below differ only in avatar order.
+            let bubble = view! {
+                <div class="message-bubble">
+                    // Reactive inner HTML: re-evaluates only when `content` changes.
+                    <div
+                        class="message-content"
+                        inner_html=move || crate::markdown::render(&message.content.get())
+                    />
+                    // Blinking cursor while the host is still streaming tokens.
+                    {move || {
+                        message
+                            .streaming
+                            .get()
+                            .then(|| view! { <span class="streaming-cursor">"▋"</span> })
+                    }}
+                    // Error notice, shown only on failure.
+                    {move || {
+                        message
+                            .error
+                            .get()
+                            .map(|e| view! { <div class="error-notice">{e}</div> })
+                    }}
                 </div>
+            };
+
+            // Avatars: gander on the assistant side (image), stock user
+            // glyph on the user side.  Both sit in the same 32x32 lane
+            // declared in CSS — gander leads, user trails (DOM order
+            // mirrors visual order in each bubble).
+            match message.role {
+                Role::Assistant => view! {
+                    <div class=role_class>
+                        <img
+                            class="message-avatar"
+                            src="/assets/gander.png"
+                            alt="gander"
+                        />
+                        {bubble}
+                    </div>
+                }
+                .into_any(),
+                Role::User => view! {
+                    <div class=role_class>
+                        {bubble}
+                        <span
+                            class="message-avatar message-avatar--user"
+                            aria-label="you"
+                            role="img"
+                        >
+                            <Icon icon=icondata::LuUser width="18px" height="18px" />
+                        </span>
+                    </div>
+                }
+                .into_any(),
+                Role::Tool => unreachable!(),
             }
-            .into_any()
         }
     }
 }
