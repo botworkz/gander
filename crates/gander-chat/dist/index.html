@@ -322,9 +322,12 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       align-self: stretch;
       margin-left:  calc(var(--rim) + var(--avatar-lane));
       margin-right: var(--rim);
-      /* The bubble itself still hugs the right within its lane: short
-         messages don't stretch to fill the lane, they just sit on the
-         right of it. */
+      /* Mirrors .message--assistant's flex layout but with the avatar on
+         the trailing edge: bubble body first, user avatar second.  The
+         DOM order in message_view.rs reflects this. */
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
       text-align: left;
     }
 
@@ -349,6 +352,22 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       object-fit: cover;
       margin-top: 4px;             /* visual alignment with first text baseline */
       background: #1a1a2e;         /* falls back nicely if image fails */
+    }
+
+    /* User-side avatar — same size and shape as the gander avatar so
+       the two sides feel balanced.  Stock placeholder from
+       leptos_icons (icondata::LuUser); future iteration will let the
+       user configure their own image (gander#TBD). */
+    .message-avatar--user {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: #c8d4ff;              /* a hair brighter than the bubble bg */
+      background: #1d3aa1;         /* darker shade of the user-bubble blue */
+    }
+    .message-avatar--user svg {
+      width: 18px;
+      height: 18px;
     }
 
     /* bubble body: takes remaining space so content word-wraps correctly */
