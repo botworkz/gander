@@ -281,6 +281,24 @@ async fn history_drain_completes_with_expected_events() {
         "SessionLoadStart must precede SessionLoadEnd; positions: {start_pos}, {end_pos}"
     );
 
+    // SessionActive(history_id) must arrive *before* SessionLoadStart so the
+    // sidebar's active highlight can flip immediately on click rather than
+    // waiting for history replay to finish.  Regression guard: without this
+    // ordering the user has no visual confirmation of which session they
+    // selected until the entire load completes.
+    let active_pos = events
+        .iter()
+        .position(|e| matches!(e, AcpEvent::SessionActive(id) if id == HISTORY_SESSION_ID));
+    assert!(
+        active_pos.is_some(),
+        "expected SessionActive({HISTORY_SESSION_ID}) in events; got: {events:?}"
+    );
+    assert!(
+        active_pos.unwrap() < start_pos,
+        "SessionActive must precede SessionLoadStart; positions: {}, {start_pos}",
+        active_pos.unwrap()
+    );
+
     // All history events must fall between start and end.
     let history_indices: Vec<usize> = events
         .iter()
