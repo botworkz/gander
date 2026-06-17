@@ -981,6 +981,15 @@ fn acp_event_to_js(event: &AcpEvent) -> String {
                 sessions_json
             )
         }
+        AcpEvent::AllSessionsList(sessions) => {
+            // Same `ListedSession` schema as SessionList; the UI distinguishes
+            // sidebar vs all-sessions purely by event type, not field shape.
+            let sessions_json = serde_json::to_string(sessions).unwrap_or_else(|_| "[]".into());
+            format!(
+                "window.gander._publish({{type:'all_sessions_list',sessions:{}}})",
+                sessions_json
+            )
+        }
         AcpEvent::SessionActive(id) => {
             format!(
                 "window.gander._publish({{type:'session_active',id:{},history:[]}})",
