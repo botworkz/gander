@@ -109,3 +109,18 @@ pub struct SessionEntry {
     /// ISO 8601 `updated_at` from the host, if available.
     pub last_active: Option<String>,
 }
+
+/// Which view the right-hand pane is currently rendering.
+///
+/// The sidebar is always visible; this only affects what fills the
+/// pane to its right.  Driven by an [`RwSignal`] in `App` so any
+/// component can flip it (sidebar's "View all" link, the back button
+/// on the all-sessions page, the `session_active` event handler).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatPaneView {
+    /// The chat conversation (MessageList + InputRow + Footer) — default.
+    Chat,
+    /// The full sessions listing (currently a placeholder; eventually
+    /// the host will fetch the unbounded list and we'll render it here).
+    AllSessions,
+}

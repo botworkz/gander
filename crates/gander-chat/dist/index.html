@@ -99,6 +99,23 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       background: #3d6bf3;
     }
 
+    /* "View all sessions →" footer.  Lives in the same flex column as the
+       per-session items so the link reads as part of the list rather
+       than chrome bolted on; lighter colour and italic to distinguish it
+       from a real session row.  Picks up the .session-item border-bottom
+       so it visually separates from the next concertina row. */
+    .session-item--all {
+      color: #8a8aa8;
+      font-style: italic;
+      justify-content: flex-end;
+      padding-right: 18px;
+    }
+
+    .session-item--all:hover {
+      background: #1e1e38;
+      color: #c8c8e0;
+    }
+
     .session-label {
       font-weight: 500;
       overflow: hidden;
@@ -223,6 +240,131 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     .concertina-action:hover {
       background: rgba(255, 255, 255, 0.07);
       opacity: 1;
+    }
+
+    /* ── all-sessions page ───────────────────────────────────── */
+
+    /* Right-pane variant that replaces the chat conversation with a
+       full-width vertical list of every session goose knows about for
+       this profile.  Sits inside .gander-chat (the existing right-pane
+       container) so it inherits its flex column layout and the
+       --rim/--avatar-lane CSS vars, even though it ignores the
+       per-message gutters and just centres a list. */
+    .all-sessions {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      padding: 24px var(--rim, 16px);
+      gap: 16px;
+    }
+
+    .all-sessions-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
+    /* Back button — square, same visual weight as the concertina
+       action button so the two feel like siblings. */
+    .all-sessions-back {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      background: none;
+      border: 1px solid #2a2a3e;
+      border-radius: 6px;
+      color: #b0b0c8;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .all-sessions-back:hover {
+      background: #1e1e38;
+      color: #e0e0e0;
+    }
+
+    .all-sessions-title {
+      margin: 0;
+      font-size: 1.25rem;
+      font-weight: 600;
+      color: #e0e0e0;
+    }
+
+    /* Honest banner that this is a placeholder — surfaced in the UI so
+       the limitation is obvious during dev rather than hidden in a
+       code comment.  Will go away once the unbounded list path lands. */
+    .all-sessions-placeholder {
+      padding: 10px 14px;
+      background: #1e1e38;
+      border: 1px solid #2a2a3e;
+      border-radius: 6px;
+      color: #a0a0c0;
+      font-size: 0.88rem;
+      flex-shrink: 0;
+    }
+
+    .all-sessions-list {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      background: #2a2a3e;
+      border: 1px solid #2a2a3e;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .all-sessions-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      background: #1a1a2e;
+      border: none;
+      color: #c0c0d8;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.92rem;
+      text-align: left;
+    }
+    .all-sessions-row:hover {
+      background: #232342;
+      color: #e0e0e0;
+    }
+
+    .all-sessions-row--active {
+      background: #2d5be3;
+      color: #ffffff;
+    }
+    .all-sessions-row--active:hover {
+      background: #3d6bf3;
+    }
+
+    .all-sessions-row-icon {
+      display: flex;
+      align-items: center;
+      flex-shrink: 0;
+      opacity: 0.75;
+    }
+
+    .all-sessions-row-label {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 500;
+    }
+
+    .all-sessions-row-ago {
+      flex-shrink: 0;
+      color: #7a7a98;
+      font-size: 0.82rem;
+    }
+    .all-sessions-row--active .all-sessions-row-ago {
+      color: #c8d4ff;
     }
 
     /* ── chat pane ───────────────────────────────────────────── */
@@ -814,10 +956,19 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       var _subscriber = null;
       var _activeSessionId = "mock-session-1";
 
+      // More mock sessions than the 5-cap the host enforces in production
+      // so dev runs of `trunk serve` exercise the "View all sessions"
+      // page with a meaningful list.  The first 5 still feed the sidebar
+      // (matching production behaviour); the rest only show up on the
+      // all-sessions page.
       var MOCK_SESSIONS = [
         { id: "mock-session-1", label: "Session 1", last_active: new Date(Date.now() - 5 * 60 * 1000).toISOString() },
         { id: "mock-session-2", label: "Session 2", last_active: new Date(Date.now() - 2 * 3600 * 1000).toISOString() },
         { id: "mock-session-3", label: "Session 3", last_active: new Date(Date.now() - 48 * 3600 * 1000).toISOString() },
+        { id: "mock-session-4", label: "Older session 4", last_active: new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString() },
+        { id: "mock-session-5", label: "Older session 5", last_active: new Date(Date.now() - 9 * 24 * 3600 * 1000).toISOString() },
+        { id: "mock-session-6", label: "Older session 6", last_active: new Date(Date.now() - 21 * 24 * 3600 * 1000).toISOString() },
+        { id: "mock-session-7", label: "Old session 7",   last_active: new Date(Date.now() - 60 * 24 * 3600 * 1000).toISOString() },
       ];
 
       function fireEvent(event) {
@@ -957,7 +1108,13 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         if (type === "ready") {
           // Respond to the WASM startup handshake with mock session data.
           setTimeout(function () {
-            fireEvent({ type: "session_list", sessions: MOCK_SESSIONS });
+            // Match production: the host truncates `session/list` to the
+            // top 5 most-recent before forwarding to the chat UI.  The
+            // `View all sessions` page will eventually pull the full
+            // list via a separate event; for now both sidebar and
+            // all-sessions render against the same truncated `sessions`
+            // signal, so the placeholder also shows 5.
+            fireEvent({ type: "session_list", sessions: MOCK_SESSIONS.slice(0, 5) });
             fireEvent({ type: "session_active", id: _activeSessionId, history: [] });
             // Footer metadata: cwd and model are real fields; tool_count is a
             // placeholder until ACP v1 exposes it.

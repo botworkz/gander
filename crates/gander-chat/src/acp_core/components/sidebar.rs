@@ -10,6 +10,10 @@
 //! - clicking the **`+` action** posts `session_new` and force-opens the
 //!   section so the new session lands visibly at the top of the list
 //!
+//! The body shows the top N (currently 5) most-recently-active sessions
+//! followed by a `View all sessions →` link that flips the chat pane over
+//! to the full-listing view ([`super::all_sessions::AllSessions`]).
+//!
 //! The CSS reuses `.concertina-*` from the extension-side accordion
 //! below so the three sections (Sessions, Extensions, Settings) feel
 //! like one menu even though the Sessions section is owned by
@@ -26,7 +30,7 @@ use leptos_icons::Icon;
 use wasm_bindgen::JsValue;
 
 use crate::acp_core::components::time_ago::time_ago;
-use crate::acp_core::types::SessionEntry;
+use crate::acp_core::types::{ChatPaneView, SessionEntry};
 
 /// Left-edge session sidebar content.
 ///
@@ -37,6 +41,7 @@ use crate::acp_core::types::SessionEntry;
 pub fn Sidebar(
     sessions: RwSignal<Vec<SessionEntry>>,
     active_session_id: RwSignal<Option<String>>,
+    pane_view: RwSignal<ChatPaneView>,
 ) -> impl IntoView {
     // Sessions default to open: this is the primary navigation surface,
     // unlike Extensions/Settings which start collapsed because they hold
@@ -64,6 +69,13 @@ pub fn Sidebar(
         // the top of the list, even if they'd previously collapsed it.
         open.set(true);
     };
+
+    // "View all sessions" link at the bottom of the body.  Flips the
+    // shared pane-view signal; the chat pane swaps itself out for the
+    // full sessions listing.  No host round-trip — the pane already has
+    // the truncated `sessions` Vec to render against until the unbounded
+    // list path is wired up.
+    let on_view_all = move |_| pane_view.set(ChatPaneView::AllSessions);
 
     view! {
         <div class="concertina-section">
@@ -152,6 +164,11 @@ pub fn Sidebar(
                                                     &JsValue::from_str(&id_for_click),
                                                 );
                                                 crate::bridge::post_value(obj.into());
+                                                // If the user was on the all-sessions
+                                                // page when they clicked an item in the
+                                                // sidebar, flip back to chat so the
+                                                // selected session is the visible one.
+                                                pane_view.set(ChatPaneView::Chat);
                                             };
                                             view! {
                                                 <button
@@ -177,6 +194,18 @@ pub fn Sidebar(
                                             }
                                         }
                                     />
+                                    // "View all sessions" footer — same vertical
+                                    // rhythm as the items above so it reads as
+                                    // part of the list, not chrome bolted on.
+                                    <button
+                                        class="session-item session-item--all"
+                                        title="View all sessions"
+                                        on:click=on_view_all
+                                    >
+                                        <span class="session-label">
+                                            "View all sessions →"
+                                        </span>
+                                    </button>
                                 </div>
                             </div>
                         }
