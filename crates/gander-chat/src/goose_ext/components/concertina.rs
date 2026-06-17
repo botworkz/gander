@@ -27,19 +27,26 @@ const CONCERTINA_SECTIONS: &[ConcertinaSection] = &[
     },
 ];
 
-/// Collapsible accordion menu placed below the sessions list in the sidebar.
+/// Collapsible accordion of goose-private sidebar sections (Extensions,
+/// Settings).
 ///
-/// One section open at a time; all sections start collapsed.  Clicking an
-/// open section collapses it; clicking a closed section opens it and closes
-/// whichever was previously open.
+/// Renders the section rows directly (no `.concertina` wrapper) because
+/// the sidebar already contains a shared `.concertina` scroll container
+/// that also holds `acp_core::Sidebar`'s Sessions section above us.
+///
+/// One section open at a time within this group; all sections start
+/// collapsed.  The Sessions section above us has its own independent
+/// open state because it's the primary navigation surface — collapsing
+/// Sessions just to open Settings would be hostile.
 // goose-ext: Extensions + Settings manage goose-private state
 #[component]
 pub fn Concertina() -> impl IntoView {
-    // Index of the currently open section, or `None` when all are collapsed.
+    // Index of the currently open section within this group, or `None`
+    // when all are collapsed.
     let open: RwSignal<Option<usize>> = RwSignal::new(None);
 
     view! {
-        <div class="concertina">
+        <>
             {CONCERTINA_SECTIONS
                 .iter()
                 .enumerate()
@@ -98,6 +105,6 @@ pub fn Concertina() -> impl IntoView {
                     }
                 })
                 .collect::<Vec<_>>()}
-        </div>
+        </>
     }
 }
