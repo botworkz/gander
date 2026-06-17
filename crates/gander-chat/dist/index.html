@@ -216,18 +216,56 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       flex-direction: column;
       flex: 1;
       min-width: 0;
-      max-width: 860px;
+      /* Use the full width.  Asymmetric per-message gutters declared
+         immediately below carry the "gander on the left, me on the
+         right" presence model, so the chat pane itself no longer needs
+         a centering cap.  The old `max-width: 860px` left huge dead
+         gutters on wide screens. */
       width: 100%;
-      margin: 0 auto;
+
+      /* ─ gutter vocabulary used by every child of .message-list ─
+
+         The conversational model:
+           • gander is on the LEFT and has an explicit avatar
+           • the user is on the RIGHT and is implicitly present
+             (no avatar today — we treat the rightmost --avatar-lane
+              of pixels as the user's "phantom avatar" gutter so that
+              gander's tool views / iframes "respect my space" the
+              way gander's avatar lane defines his)
+           • --rim is a small breathing strip between content and the
+             pane edge so nothing rams the chrome
+
+         Encoding:
+           • assistant bubble : rim (left)        → avatar-lane (right)
+           • tool card        : rim + avatar-lane → avatar-lane
+                                (left edge aligned with assistant text,
+                                 right edge leaves room for the phantom
+                                 user avatar — gander respects my space)
+           • user bubble      : rim + avatar-lane → rim
+                                (left bound matches tool card so long
+                                 pastes wrap at the same x; right is the
+                                 rim because that's "my edge of the pane")
+
+         Both vars clamp() so they breathe with viewport. */
+      --rim: clamp(12px, 1.5vw, 24px);
+      /* .message-avatar width (32px) + .message--assistant gap (8px) */
+      --avatar-lane: 40px;
     }
 
     /* ── message list ────────────────────────────────────────── */
 
     .message-list {
       flex: 1;
+      /* min-height: 0 — without this the column flex item defaults to
+         min-content (= every message stacked at natural height), which
+         pushes the input row and footer off-screen on short windows. */
       min-height: 0;
       overflow-y: auto;
-      padding: 16px;
+      /* No horizontal padding: each .message--{user,assistant,tool}
+         declares its own margin-left/right against the --rim and
+         --avatar-lane vars on .gander-chat above.  The vertical
+         padding keeps the first/last message off the chrome. */
+      padding: 16px 0;
       display: flex;
       flex-direction: column;
       gap: 10px;
@@ -251,20 +289,53 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     .message {
       padding: 10px 14px;
       border-radius: 12px;
-      max-width: 80%;
       line-height: 1.55;
       word-break: break-word;
+      /* Flex children default to `flex-shrink: 1`; pinning to 0 stops
+         a tall list from squashing each bubble vertically to a few
+         pixels — let .message-list's overflow-y handle the height. */
       flex-shrink: 0;
     }
 
+    /* ── conversational gutters ───────────────────────────────────
+
+       See the var declarations on .gander-chat for the model.  In
+       short:
+         • assistant bubble : --rim          → --avatar-lane
+         • tool card        : --avatar-lane  → --avatar-lane (under
+                              the avatar-lane offset from the rim)
+         • user bubble      : tool-card left → --rim
+                              (so long user pastes wrap at the same
+                              x as a tool card, "respecting gander")
+
+       align-self places each bubble on its side; max-width is removed
+       so long content fills the lane. */
+
     .message--user {
       background: #2d5be3;
-      align-self: flex-end;
+      /* Stretch the user bubble across its own lane so long pastes
+         wrap, but keep the bubble visually anchored to the right
+         (gander's icon lives on the left and gets the same --avatar-lane
+         the tool cards use, so my speech respects his space).  The left
+         bound matches .message--tool's left edge — long pastes wrap at
+         the same x as a tool card. */
+      align-self: stretch;
+      margin-left:  calc(var(--rim) + var(--avatar-lane));
+      margin-right: var(--rim);
+      /* The bubble itself still hugs the right within its lane: short
+         messages don't stretch to fill the lane, they just sit on the
+         right of it. */
+      text-align: left;
     }
 
     .message--assistant {
       background: #2a2a3e;
-      align-self: flex-start;
+      /* Stretch so long assistant prose can fill the gander lane.
+         The right gutter is --avatar-lane (gander respecting *my*
+         implicit-avatar gutter on the right edge of the pane). */
+      align-self: stretch;
+      margin-left:  var(--rim);
+      margin-right: calc(var(--rim) + var(--avatar-lane));
       display: flex;
       align-items: flex-start;
       gap: 8px;
@@ -286,16 +357,21 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       min-width: 0;
     }
 
-    /* tool call / result: gray, monospace feel.
-       Aligned to where the assistant's text bubble begins (past the avatar
-       gutter) and stretched to the message-list right padding so it has
-       breathing room for tool output and embedded MCP App iframes.
+    /* Tool call card: gray, monospace feel.
 
-       margin-left = .message-avatar width (32px) + .message--assistant gap (8px). */
+       Left edge sits at --rim + --avatar-lane so the card aligns under
+       the assistant's text bubble (past gander's avatar gutter).
+
+       Right edge keeps a --avatar-lane gap from the pane edge so the
+       card *respects the user's space* — the same way the assistant
+       bubble respects mine on the right.  Think of the rightmost
+       --avatar-lane pixels as a "phantom user avatar" gutter that
+       gander's tool views must not run into. */
     .message--tool {
       background: #1e2030;
       align-self: stretch;
-      margin-left: 40px;
+      margin-left:  calc(var(--rim) + var(--avatar-lane));
+      margin-right: calc(var(--rim) + var(--avatar-lane));
       max-width: none;
       border: 1px solid #2e3050;
       font-size: 0.88em;
@@ -349,8 +425,18 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     .input-row {
       display: flex;
       gap: 8px;
-      padding: 12px 16px;
+      /* Mirror the user bubble's lane so the textarea sits between
+         the same x bounds as my speech bubble — long pastes wrap at
+         the tool-card left edge, short messages still hug the right.
+         The vars fall back to a fixed 16px if .input-row ever lives
+         outside .gander-chat. */
+      padding-top: 12px;
+      padding-bottom: 12px;
+      padding-left:  calc(var(--rim, 16px) + var(--avatar-lane, 0px));
+      padding-right: var(--rim, 16px);
       border-top: 1px solid #333;
+      /* Pin against compression — without this, a tall message list
+         eats into the textarea height (the footer pins itself too). */
       flex-shrink: 0;
     }
 
