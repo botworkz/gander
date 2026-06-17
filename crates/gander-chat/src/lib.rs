@@ -7,8 +7,9 @@
 //! ```text
 //! App
 //! ├── .sidebar (div)
-//! │   ├── Sidebar      (session list, "+ New session" button)
-//! │   └── Concertina   (Extensions / Settings — goose_ext)
+//! │   └── .concertina (shared scroll container)
+//! │       ├── Sidebar      (Sessions section + list — acp_core)
+//! │       └── Concertina   (Extensions / Settings — goose_ext)
 //! └── ChatPane
 //!     ├── MessageList   (scrollable, one MessageView per message)
 //!     ├── InputRow      (textarea + Send button)
@@ -53,6 +54,14 @@
 //! The host fires `{type:"session_info", cwd:"…", model:"…", tool_count:N}`
 //! (or `tool_count:null` when unavailable) after the bridge `ready` handshake.
 //! Each field drives its own signal so only the changed span re-renders.
+//!
+//! ## Sidebar layout
+//!
+//! All three sidebar sections (Sessions, Extensions, Settings) are
+//! concertina-style: a header that toggles a body open/closed.  The
+//! Sessions section is owned by `acp_core` and the other two by
+//! `goose_ext`; they share the `.concertina` scroll wrapper so a long
+//! session list doesn't push the goose-side rows off the bottom.
 //!
 //! # Entry point
 //!
@@ -137,8 +146,15 @@ pub fn App() -> impl IntoView {
     view! {
         <div class="gander-root">
             <div class="sidebar">
-                <Sidebar sessions active_session_id />
-                <Concertina />
+                // Single `.concertina` scroll container holding every
+                // sidebar section.  Sessions (acp_core) is the primary
+                // navigation row; Extensions / Settings (goose_ext)
+                // live below it and share the same scroll viewport so
+                // a long session list doesn't push them off-screen.
+                <div class="concertina">
+                    <Sidebar sessions active_session_id />
+                    <Concertina />
+                </div>
             </div>
             <div class="gander-chat">
                 <MessageList messages />
