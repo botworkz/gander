@@ -10,13 +10,53 @@ use js_sys;
 use leptos::prelude::*;
 use wasm_bindgen::JsValue;
 
-use crate::acp_core::types::{ChatMessage, SessionEntry, DEFAULT_SESSION_LABEL};
+use crate::acp_core::types::{AllSessionsState, ChatMessage, SessionEntry, DEFAULT_SESSION_LABEL};
 
 /// Consume and return the next message ID.
 pub(crate) fn take_id(next_id: RwSignal<u32>) -> u32 {
     let id = next_id.get_untracked();
     next_id.set(id + 1);
     id
+}
+
+/// Parse the `sessions` array from a `session_list` / `all_sessions_list`
+/// event into `Vec<SessionEntry>`.
+///
+/// Tolerant of missing / malformed fields: any entry without a non-empty
+/// `id` is silently skipped (an empty id can't drive `session_select`),
+/// `label` falls back to `DEFAULT_SESSION_LABEL`, and `last_active` is
+/// optional.  Both bridge events use the same `ListedSession` schema so
+/// they share this parser.
+fn parse_session_entries(event: &JsValue) -> Vec<SessionEntry> {
+    let raw_sessions = js_sys::Reflect::get(event, &JsValue::from_str("sessions"))
+        .ok()
+        .filter(|v| v.is_array())
+        .map(|v| js_sys::Array::from(&v))
+        .unwrap_or_default();
+
+    let mut entries: Vec<SessionEntry> = Vec::with_capacity(raw_sessions.length() as usize);
+    for i in 0..raw_sessions.length() {
+        let item = raw_sessions.get(i);
+        let id = js_sys::Reflect::get(&item, &JsValue::from_str("id"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        let label = js_sys::Reflect::get(&item, &JsValue::from_str("label"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| DEFAULT_SESSION_LABEL.to_string());
+        let last_active = js_sys::Reflect::get(&item, &JsValue::from_str("last_active"))
+            .ok()
+            .and_then(|v| v.as_string());
+        if !id.is_empty() {
+            entries.push(SessionEntry {
+                id,
+                label,
+                last_active,
+            });
+        }
+    }
+    entries
 }
 
 /// Dispatch a raw JS bridge event to the appropriate signal update.
@@ -37,6 +77,7 @@ pub fn handle_acp_core_bridge_event(
     footer_cwd: RwSignal<Option<String>>,
     footer_model: RwSignal<Option<String>>,
     footer_tool_count: RwSignal<Option<u32>>,
+    all_sessions: RwSignal<AllSessionsState>,
 ) {
     let event_type = js_sys::Reflect::get(event, &JsValue::from_str("type"))
         .ok()
@@ -251,35 +292,31 @@ pub fn handle_acp_core_bridge_event(
         }
 
         Some("session_list") => {
-            let raw_sessions = js_sys::Reflect::get(event, &JsValue::from_str("sessions"))
-                .ok()
-                .filter(|v| v.is_array())
-                .map(|v| js_sys::Array::from(&v))
-                .unwrap_or_default();
+            sessions.set(parse_session_entries(event));
+        }
 
-            let mut entries: Vec<SessionEntry> = Vec::new();
-            for i in 0..raw_sessions.length() {
-                let item = raw_sessions.get(i);
-                let id = js_sys::Reflect::get(&item, &JsValue::from_str("id"))
-                    .ok()
-                    .and_then(|v| v.as_string())
-                    .unwrap_or_default();
-                let label = js_sys::Reflect::get(&item, &JsValue::from_str("label"))
-                    .ok()
-                    .and_then(|v| v.as_string())
-                    .unwrap_or_else(|| DEFAULT_SESSION_LABEL.to_string());
-                let last_active = js_sys::Reflect::get(&item, &JsValue::from_str("last_active"))
-                    .ok()
-                    .and_then(|v| v.as_string());
-                if !id.is_empty() {
-                    entries.push(SessionEntry {
-                        id,
-                        label,
-                        last_active,
-                    });
-                }
-            }
-            sessions.set(entries);
+        // ── unbounded session list (View all sessions page) ────────────────
+        //
+        // Emitted by the host in response to the `list_all_sessions`
+        // bridge command.  Drives `AllSessionsState::Loaded` so the
+        // page re-renders with the full list.  We do *not* update the
+        // `sessions` signal here — that's reserved for the truncated
+        // sidebar list, which has its own update cadence.
+        Some("all_sessions_list") => {
+            all_sessions.set(AllSessionsState::Loaded(parse_session_entries(event)));
+        }
+
+        // Hosts may emit this to surface a human-readable failure when
+        // the list fetch fails (e.g. transport closed mid-walk).  The
+        // current host doesn't yet, but defining the variant up-front
+        // means the UI works as soon as wiring lands without another
+        // chat-UI release.
+        Some("all_sessions_error") => {
+            let message = js_sys::Reflect::get(event, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "Failed to load sessions".to_string());
+            all_sessions.set(AllSessionsState::Failed(message));
         }
 
         Some("session_active") => {
