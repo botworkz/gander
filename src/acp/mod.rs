@@ -110,8 +110,17 @@ pub enum AcpEvent {
     /// Up to 5 most-recently-active sessions for this profile.
     ///
     /// Sent once on connect (after the initial session is established) and
-    /// again after a `session_new` command creates a fresh session.
+    /// again after a `session_new` command creates a fresh session.  Drives
+    /// the sidebar's short list; the unbounded list goes via
+    /// [`AcpEvent::AllSessionsList`].
     SessionList(Vec<ListedSession>),
+    /// The complete `session/list` for this profile (paginated through to
+    /// completion, no `truncate(5)` cap).
+    ///
+    /// Emitted in response to [`AcpCommand::ListAllSessions`].  Drives the
+    /// "View all sessions" page.  Never sent unsolicited — the chat UI
+    /// fetches on demand because the list can be large.
+    AllSessionsList(Vec<ListedSession>),
     /// The active session has been established or switched.
     ///
     /// Emitted:
@@ -140,6 +149,13 @@ pub enum AcpCommand {
     SessionNew,
     /// The webview bridge is ready; re-emit the session list and active ID.
     RequestSessionInfo,
+    /// Fetch the unbounded `session/list` for this profile and emit a single
+    /// [`AcpEvent::AllSessionsList`] when done.
+    ///
+    /// Triggered by the chat UI when the user opens "View all sessions".
+    /// Paginates through all available pages so the UI gets one snapshot
+    /// rather than having to drive cursor state itself.
+    ListAllSessions,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +248,15 @@ impl AcpConnection {
 // Worker task
 // ---------------------------------------------------------------------------
 
-/// Retrieve up to 5 most-recently-active sessions from `session/list`.
+/// Maximum number of sessions to keep in the sidebar's short list.
+///
+/// The `session/list` cap exists for screen real-estate, not protocol —
+/// goose itself returns whatever the page size allows.  The "View all
+/// sessions" page bypasses this via [`fetch_all_sessions`].
+const SIDEBAR_SESSION_LIMIT: usize = 5;
+
+/// Retrieve up to [`SIDEBAR_SESSION_LIMIT`] most-recently-active sessions
+/// from `session/list`.
 ///
 /// Errors from the call are swallowed — an empty list is the safe fallback.
 async fn fetch_top_sessions<R>(cx: &agent_client_protocol::ConnectionTo<R>) -> Vec<ListedSession>
@@ -240,25 +264,61 @@ where
     R: agent_client_protocol::role::Role,
     R: agent_client_protocol::role::HasPeer<R>,
 {
-    let response = match cx
-        .send_request(ListSessionsRequest::new())
-        .block_task()
-        .await
-    {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::warn!(%err, "session/list failed; starting fresh");
-            return Vec::new();
-        }
-    };
-
-    let mut sessions = response.sessions;
-    // Sort most-recently-active first (ISO 8601 sorts lexicographically).
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    sessions.truncate(5);
-
+    let mut sessions = fetch_all_sessions(cx).await;
+    // Already sorted most-recent-first by `fetch_all_sessions`; just trim.
+    sessions.truncate(SIDEBAR_SESSION_LIMIT);
     sessions
-        .into_iter()
+}
+
+/// Retrieve every session from `session/list`, walking the cursor until
+/// the agent reports `next_cursor == None`.
+///
+/// Returns most-recently-active first (ISO 8601 lexicographic sort across
+/// all pages — re-sorting after concat keeps the contract independent of
+/// per-page ordering, which the schema doesn't guarantee).
+///
+/// A failure on any page short-circuits and returns whatever pages
+/// completed so far; the warning is logged at `warn!` level so a partial
+/// list still reaches the UI rather than collapsing the page entirely.
+///
+/// Hard upper bound: [`MAX_LIST_PAGES`] pages.  Defends against an
+/// agent that returns the same cursor forever — at the default page
+/// size that's still tens of thousands of sessions, more than enough
+/// for any realistic profile, and breaks the runaway loop without
+/// silently dropping legitimate data.
+async fn fetch_all_sessions<R>(cx: &agent_client_protocol::ConnectionTo<R>) -> Vec<ListedSession>
+where
+    R: agent_client_protocol::role::Role,
+    R: agent_client_protocol::role::HasPeer<R>,
+{
+    /// Soft ceiling on cursor walk iterations to avoid wedging the worker
+    /// task if an agent (or a bug) emits a non-terminating cursor chain.
+    const MAX_LIST_PAGES: usize = 100;
+
+    let mut all = Vec::new();
+    let mut cursor: Option<String> = None;
+    for page in 0..MAX_LIST_PAGES {
+        let req = ListSessionsRequest::new().cursor(cursor.clone());
+        let response = match cx.send_request(req).block_task().await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(%err, page, "session/list failed; returning partial list");
+                break;
+            }
+        };
+        all.extend(response.sessions);
+        match response.next_cursor {
+            Some(next) if !next.is_empty() => cursor = Some(next),
+            _ => break,
+        }
+    }
+
+    // Sort most-recently-active first (ISO 8601 sorts lexicographically).
+    // `Option<String>::cmp` puts `None` before `Some`, so reversing gives
+    // us "newest first, undated last", which is the order we want.
+    all.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    all.into_iter()
         .map(|s| ListedSession {
             label: s
                 .title
@@ -579,6 +639,30 @@ async fn run_worker(
                                 model: agent_model.clone(),
                                 tool_count: None,
                             })
+                            .await;
+                    }
+
+                    AcpCommand::ListAllSessions => {
+                        // Walk the full cursor chain and emit one snapshot.
+                        // Errors inside `fetch_all_sessions` already log a
+                        // warning and yield a partial list rather than a
+                        // hard failure; the UI just sees a shorter list.
+                        debug!(
+                            target: "gander::wire",
+                            direction = "send",
+                            method = "session/list",
+                            "ALL_SESSIONS_REQUEST"
+                        );
+                        let all = fetch_all_sessions(&cx).await;
+                        debug!(
+                            target: "gander::wire",
+                            direction = "recv",
+                            method = "session/list",
+                            count = all.len(),
+                            "ALL_SESSIONS_RESPONSE"
+                        );
+                        let _ = evt_tx_clone
+                            .send(AcpEvent::AllSessionsList(all))
                             .await;
                     }
 

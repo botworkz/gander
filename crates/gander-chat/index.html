@@ -283,17 +283,72 @@
       color: #e0e0e0;
     }
 
-    /* Honest banner that this is a placeholder — surfaced in the UI so
-       the limitation is obvious during dev rather than hidden in a
-       code comment.  Will go away once the unbounded list path lands. */
-    .all-sessions-placeholder {
-      padding: 10px 14px;
+    /* Square refresh button at the trailing edge of the all-sessions
+       header.  Visual sibling of `.all-sessions-back` (same chrome)
+       but pinned right with `margin-left: auto` so the title gets
+       the rest of the row. */
+    .all-sessions-refresh {
+      margin-left: auto;
+    }
+
+    /* Subtitle showing total session count.  Leans on the same colour
+       palette as the placeholder banner but lighter weight so it reads
+       as informational, not a warning. */
+    .all-sessions-count {
+      color: #7a7a98;
+      font-size: 0.82rem;
+      flex-shrink: 0;
+      margin-top: -8px;       /* tighten to the header above */
+      margin-bottom: 4px;
+    }
+
+    /* Lifecycle status row (Loading / Failed / empty).  Same outer
+       chrome as the placeholder banner so the page geometry doesn't
+       shift when the loaded list arrives.  Status variants override
+       colour. */
+    .all-sessions-status {
+      padding: 16px 18px;
       background: #1e1e38;
       border: 1px solid #2a2a3e;
       border-radius: 6px;
       color: #a0a0c0;
       font-size: 0.88rem;
       flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .all-sessions-status--loading {
+      color: #c8d4ff;
+    }
+    .all-sessions-status--error {
+      color: #ffb0b0;
+      background: #2a1818;
+      border-color: #4a2a2a;
+    }
+
+    /* Bold "Couldn't load sessions:" prefix; the message itself uses
+       the parent colour. */
+    .all-sessions-status-label {
+      font-weight: 600;
+    }
+
+    /* Inline retry button on the error row. */
+    .all-sessions-retry {
+      margin-left: auto;
+      padding: 4px 10px;
+      background: #4a2a2a;
+      border: 1px solid #6a3a3a;
+      border-radius: 4px;
+      color: #ffd0d0;
+      font-family: inherit;
+      font-size: 0.82rem;
+      cursor: pointer;
+    }
+    .all-sessions-retry:hover {
+      background: #6a3a3a;
+      color: #ffe0e0;
     }
 
     .all-sessions-list {
@@ -1131,6 +1186,20 @@
           _activeSessionId = newId;
           fireEvent({ type: "session_list", sessions: MOCK_SESSIONS.slice(0, 5) });
           fireEvent({ type: "session_active", id: newId, history: [] });
+        } else if (type === "list_all_sessions") {
+          // Mock the host-side `AcpCommand::ListAllSessions` round-trip.
+          // Production walks the cursor on `session/list`; we just echo
+          // back the in-memory MOCK_SESSIONS array (no truncate(5)).
+          // Small artificial delay so the loading state is visible
+          // during dev — fast enough not to be annoying, slow enough
+          // to verify the spinner doesn't flash.
+          console.log("[mock gander] list_all_sessions:", MOCK_SESSIONS.length);
+          setTimeout(function () {
+            fireEvent({
+              type: "all_sessions_list",
+              sessions: MOCK_SESSIONS,
+            });
+          }, 250);
         } else {
           console.log("[mock gander] post:", message);
         }

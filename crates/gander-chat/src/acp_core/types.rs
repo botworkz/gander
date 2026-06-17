@@ -120,7 +120,34 @@ pub struct SessionEntry {
 pub enum ChatPaneView {
     /// The chat conversation (MessageList + InputRow + Footer) — default.
     Chat,
-    /// The full sessions listing (currently a placeholder; eventually
-    /// the host will fetch the unbounded list and we'll render it here).
+    /// The full sessions listing.  The pane fetches the unbounded list
+    /// from the host on demand (via the `list_all_sessions` bridge
+    /// command) when this view is opened, then renders the result.
     AllSessions,
+}
+
+/// Where the unbounded "all sessions" list is in its fetch lifecycle.
+///
+/// Default is `Idle` — no fetch has been requested.  When the user
+/// clicks "View all sessions" the chat UI flips this to `Loading`,
+/// posts `list_all_sessions` to the host, and waits for an
+/// `all_sessions_list` event to flip it to `Loaded(_)`.  An
+/// `all_sessions_error` event flips to `Failed(_)`.
+///
+/// The signal is owned by `App` so the sidebar's "View all" link, the
+/// `AllSessions` page itself, and the bridge event handler can all
+/// observe / mutate the same value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AllSessionsState {
+    /// No fetch has been requested yet, or the user navigated back to
+    /// chat without re-fetching.
+    Idle,
+    /// A fetch is in flight; the host has not yet replied.
+    Loading,
+    /// The host has returned a snapshot.  The Vec may be empty (no
+    /// sessions yet for this profile) — render the page accordingly.
+    Loaded(Vec<SessionEntry>),
+    /// The host returned an error, or the channel closed.  The String
+    /// is shown in-pane.
+    Failed(String),
 }

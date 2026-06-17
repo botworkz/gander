@@ -539,6 +539,14 @@ pub fn create_child_webview(
                             tracing::warn!(%err, "ipc handler: failed to send ready");
                         }
                     }
+                    Some("list_all_sessions") => {
+                        // The chat UI's "View all sessions" page asks for the
+                        // unbounded session list on demand.  Worker walks the
+                        // cursor and replies with `AcpEvent::AllSessionsList`.
+                        if let Err(err) = cmd_tx.try_send(AcpCommand::ListAllSessions) {
+                            tracing::warn!(%err, "ipc handler: failed to send list_all_sessions");
+                        }
+                    }
                     _ => {}
                 },
                 Err(err) => {

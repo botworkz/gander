@@ -88,7 +88,7 @@ pub mod goose_ext;
 pub mod markdown;
 
 use acp_core::components::{AllSessions, Footer, InputRow, MessageList, Sidebar};
-use acp_core::types::{ChatMessage, ChatPaneView, SessionEntry};
+use acp_core::types::{AllSessionsState, ChatMessage, ChatPaneView, SessionEntry};
 use goose_ext::components::Concertina;
 
 // Re-export McpAppIframe so that acp_core sub-modules can import it without
@@ -126,6 +126,15 @@ pub fn App() -> impl IntoView {
     // conversation; the sidebar's "View all sessions" link flips this
     // to AllSessions and selecting a session flips it back to Chat.
     let pane_view: RwSignal<ChatPaneView> = RwSignal::new(ChatPaneView::Chat);
+    // Lifecycle of the unbounded "all sessions" fetch.  Starts in
+    // `Idle`; the AllSessions component flips to `Loading` and posts
+    // `list_all_sessions` when first opened, and the bridge event
+    // handler flips to `Loaded(_)` / `Failed(_)` when the host
+    // replies.  Survives going back to Chat and re-opening the page,
+    // so a user pinging back-and-forth doesn't re-fetch on every
+    // visit; the AllSessions page exposes an explicit refresh
+    // affordance for staleness.
+    let all_sessions: RwSignal<AllSessionsState> = RwSignal::new(AllSessionsState::Idle);
 
     // Register the event callback once for the lifetime of the app.
     // The Closure is leaked intentionally — it must outlive the app.
@@ -146,6 +155,7 @@ pub fn App() -> impl IntoView {
                 footer_cwd,
                 footer_model,
                 footer_tool_count,
+                all_sessions,
             );
             goose_ext::events::handle_goose_ext_bridge_event(&event, messages);
         }) as Box<dyn FnMut(JsValue)>);
@@ -181,9 +191,9 @@ pub fn App() -> impl IntoView {
                         }.into_any(),
                         ChatPaneView::AllSessions => view! {
                             <AllSessions
-                                sessions
                                 active_session_id
                                 view=pane_view
+                                state=all_sessions
                             />
                         }.into_any(),
                     }
