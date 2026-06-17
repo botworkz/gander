@@ -287,9 +287,14 @@ pub fn handle_acp_core_bridge_event(
                 .ok()
                 .and_then(|v| v.as_string());
             active_session_id.set(id);
-            // Clear chat messages when a new session is created (via
-            // `session_new` command). History replay uses `session_load_start`
-            // instead and is handled separately above.
+            // Reset chat state.  This event is fired:
+            //   - on initial connect (no messages yet, no-op)
+            //   - after `session_new` (new empty session)
+            //   - immediately before `session_load_start` on a session switch
+            //     (messages will be re-cleared and `replaying` set by the
+            //     `session_load_start` arm; this just makes the sidebar's
+            //     active highlight flip *now* rather than waiting for replay
+            //     to finish)
             messages.set(Vec::new());
             in_flight.set(None);
             sending.set(false);

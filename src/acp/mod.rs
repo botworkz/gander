@@ -112,11 +112,17 @@ pub enum AcpEvent {
     /// Sent once on connect (after the initial session is established) and
     /// again after a `session_new` command creates a fresh session.
     SessionList(Vec<ListedSession>),
-    /// The active session has been established or switched to a new session.
+    /// The active session has been established or switched.
     ///
-    /// Emitted by `SessionNew` and on initial connect. Not emitted by
-    /// `SessionSelect` — that path uses `SessionLoadStart`/`SessionLoadEnd`
-    /// to replay history.
+    /// Emitted:
+    ///
+    /// * after `RequestSessionInfo` (e.g. the bridge `ready` handshake at
+    ///   chat-UI startup), with the currently-active id;
+    /// * after `SessionNew`, with the freshly-created session's id;
+    /// * after `SessionSelect`, with the loaded id, immediately *before*
+    ///   `SessionLoadStart` so the UI can flip the sidebar's "active
+    ///   session" highlight as soon as the click is acknowledged rather
+    ///   than waiting for history replay to finish.
     SessionActive(String),
 }
 
@@ -454,6 +460,15 @@ async fn run_worker(
                                         tool_calls.lock().await.clear();
                                         // Drop any fetches queued from the prior session.
                                         pending_fetches.lock().await.clear();
+                                        // Notify the UI of the new active session *before*
+                                        // SessionLoadStart so the sidebar highlight flips
+                                        // immediately on click — without this the previous
+                                        // selection stays highlighted throughout history
+                                        // replay, leaving the user unsure which session
+                                        // they're actually looking at.
+                                        let _ = evt_tx_clone
+                                            .send(AcpEvent::SessionActive(active_id.clone()))
+                                            .await;
                                         let _ = evt_tx_clone
                                             .send(AcpEvent::SessionLoadStart)
                                             .await;
