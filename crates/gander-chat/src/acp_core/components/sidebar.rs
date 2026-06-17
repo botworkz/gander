@@ -10,13 +10,13 @@
 //! - clicking the **`+` action** posts `session_new` and force-opens the
 //!   section so the new session lands visibly at the top of the list
 //!
-//! The CSS reuses `.concertina-*` from the goose-side accordion below
-//! so the three sections (Sessions, Extensions, Settings) feel like one
-//! menu even though the Sessions section is owned by `acp_core` and the
-//! other two by `goose_ext`.
+//! The CSS reuses `.concertina-*` from the extension-side accordion
+//! below so the three sections (Sessions, Extensions, Settings) feel
+//! like one menu even though the Sessions section is owned by
+//! `acp_core` and the other two by the extension layer.
 //!
 //! Open state lives in a local `RwSignal` because the section is
-//! independent of the goose-side concertina's single-open-at-a-time
+//! independent of the extension-side concertina's single-open-at-a-time
 //! rule — sessions are the primary navigation surface and the user is
 //! likely to want them visible alongside Extensions or Settings.
 
@@ -31,8 +31,8 @@ use crate::acp_core::types::SessionEntry;
 /// Left-edge session sidebar content.
 ///
 /// Renders the Sessions concertina row plus the session list body when open.
-/// Composed below the goose-side `Concertina` (Extensions / Settings) by
-/// `App()` in `lib.rs`.
+/// Composed alongside the extension-side `Concertina` (Extensions / Settings)
+/// by `App()` in `lib.rs`.
 #[component]
 pub fn Sidebar(
     sessions: RwSignal<Vec<SessionEntry>>,
