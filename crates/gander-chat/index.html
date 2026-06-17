@@ -205,18 +205,41 @@
       flex-direction: column;
       flex: 1;
       min-width: 0;
-      max-width: 860px;
+      /* Fill the available width.  Per-message gutters expressed by the
+         CSS custom properties below carry the "gander on the left, me on
+         the right" presence asymmetry, so the chat pane itself no longer
+         needs an artificial centering cap.  The old `max-width: 860px`
+         left huge dead gutters on wide screens. */
       width: 100%;
-      margin: 0 auto;
+
+      /* Two named gutters shared by the whole pane.  Declared here on
+         the common ancestor so .message-list, .input-row, .input-footer
+         and the tool-card lane all inherit them.
+
+         The asymmetry reflects "gander on the left is implicit, I am
+         only present when I speak" — the user side keeps a wider gutter
+         where gander's persistent presence "lives"; gander's side keeps
+         a tighter gutter where the user briefly visits.  Both clamp() so
+         they breathe on big displays without ballooning on phones. */
+      --gander-presence: clamp(48px, 14vw, 220px);
+      --my-side: clamp(16px, 4vw, 64px);
     }
 
     /* ── message list ────────────────────────────────────────── */
 
     .message-list {
       flex: 1;
+      /* min-height: 0 — without this the column flex item defaults to
+         min-content (= every message stacked at natural height), which
+         pushes the input row and footer off-screen on short windows. */
       min-height: 0;
       overflow-y: auto;
-      padding: 16px;
+      /* No left/right padding here; per-message margin-inline below
+         provides the asymmetric conversational gutters (--gander-presence
+         on the user side, --my-side on gander's side) instead of a
+         single symmetric frame around the whole column.  See the var
+         declarations on the .gander-chat parent for the rationale. */
+      padding: 16px 0;
       display: flex;
       flex-direction: column;
       gap: 10px;
@@ -240,15 +263,39 @@
     .message {
       padding: 10px 14px;
       border-radius: 12px;
-      max-width: 80%;
+      /* Cap the readable line length so a single line of prose doesn't
+         stretch across the full available width on a large display.
+         Tool cards (the wider lane that hosts iframes) override this
+         on `.message--tool` below. */
+      max-width: min(72ch, 80%);
       line-height: 1.55;
       word-break: break-word;
+      /* Flex children default to `flex-shrink: 1`; without this the
+         column flex parent (.message-list) is free to compress bubbles
+         vertically when the window is short, squashing tool cards to
+         a few pixels.  Pin to natural height and let the list scroll. */
       flex-shrink: 0;
     }
+
+    /* ── conversational gutters ───────────────────────────────────
+
+       The user (me) and gander each get their own side of the list,
+       with an asymmetric gutter representing the *other* party's
+       implicit presence.  The values come from --gander-presence /
+       --my-side on .message-list above.
+
+       Why per-message rather than a wrapping column: keeping the
+       gutter on the message itself lets tool cards (which need a
+       wider lane) override their own margin without fighting a
+       parent constraint. */
 
     .message--user {
       background: #2d5be3;
       align-self: flex-end;
+      /* My bubbles hug the right edge; gander's persistent presence
+         lives in the wide left gutter. */
+      margin-left:  var(--gander-presence);
+      margin-right: var(--my-side);
     }
 
     .message--assistant {
@@ -257,6 +304,11 @@
       display: flex;
       align-items: flex-start;
       gap: 8px;
+      /* Gander's bubbles hug the left edge; a tighter gutter on the
+         right keeps content from running into the scrollbar without
+         pretending the user has a persistent visual mass there. */
+      margin-left:  var(--my-side);
+      margin-right: var(--gander-presence);
     }
 
     .message-avatar {
@@ -276,15 +328,19 @@
     }
 
     /* tool call / result: gray, monospace feel.
-       Aligned to where the assistant's text bubble begins (past the avatar
-       gutter) and stretched to the message-list right padding so it has
-       breathing room for tool output and embedded MCP App iframes.
 
-       margin-left = .message-avatar width (32px) + .message--assistant gap (8px). */
+       Aligned to where the assistant's text bubble begins (past the avatar
+       gutter) and stretched out to the user-side gutter on the right so
+       tool output and embedded MCP App iframes have room to breathe.
+
+       Left offset = .message-avatar width (32px) + .message--assistant gap
+       (8px), added on top of the assistant lane's left margin so the card
+       lines up under the bubble that announces it. */
     .message--tool {
       background: #1e2030;
       align-self: stretch;
-      margin-left: 40px;
+      margin-left: calc(var(--my-side) + 40px);
+      margin-right: var(--my-side);
       max-width: none;
       border: 1px solid #2e3050;
       font-size: 0.88em;
@@ -338,8 +394,18 @@
     .input-row {
       display: flex;
       gap: 8px;
-      padding: 12px 16px;
+      /* Mirror the conversational gutters used by .message--user above
+         so the textarea sits in the user's lane.  Falls back to a fixed
+         padding for any future page that uses .input-row outside the
+         normal .message-list parent (so the vars resolve to nothing). */
+      padding-top: 12px;
+      padding-bottom: 12px;
+      padding-left:  var(--my-side, 16px);
+      padding-right: var(--my-side, 16px);
       border-top: 1px solid #333;
+      /* Pin the input row against compression — without this, a tall
+         message list will eat into the input height (the footer already
+         pins itself with `flex-shrink: 0`). */
       flex-shrink: 0;
     }
 
