@@ -6,13 +6,19 @@
 //! place in gander where `_meta.goose.*` and `_goose/unstable/resources/read`
 //! are referenced.
 //!
-//! When a tool call with `rawOutput.resourceUri` and
-//! `_meta.goose.toolCall.extensionName` completes, the handler emits an
-//! [`ExtRequest::ReadResource`] event.  The worker drains the event channel
-//! after each `drain_session_updates` call: `ReadResource` entries are
-//! pushed onto `pending_fetches`; the worker then calls
+//! When a tool call with `rawOutput.resourceUri` completes, the handler
+//! emits an [`ExtRequest::ReadResource`] event.  The worker drains the
+//! event channel after each `drain_session_updates` call: `ReadResource`
+//! entries are pushed onto `pending_fetches`; the worker then calls
 //! [`process_pending_fetches`] which fires the actual RPC and emits
 //! [`ExtEvent::ToolResource`] to the UI channel.
+//!
+//! The extension name attached to the fetch comes from
+//! `_meta.goose.toolCall.extensionName` when present (live tool calls).  On
+//! history replay goose currently omits the meta block, so we fall back to
+//! the host component of the resource URI (see `extension_name_from_uri`,
+//! a `pub(crate)` helper below — kept private so it stays a goose-ext
+//! implementation detail rather than part of the worker's surface).
 //!
 //! ## Per-process resource cache
 //!
@@ -76,11 +82,44 @@ pub fn new_resource_cache() -> ResourceCache {
 // GooseExtHandler
 // ---------------------------------------------------------------------------
 
+/// Extract the extension name from the host component of a panel URI.
+///
+/// Goose's panel URIs follow `scheme://<extension>/<path>` (e.g.
+/// `ui://botworkui/state/abc123`).  This helper returns the `<extension>`
+/// part so the worker can call `_goose/unstable/resources/read` even when
+/// `_meta.goose.toolCall.extensionName` is missing.
+///
+/// Why this matters: on **live** tool calls goose ships
+/// `_meta.goose.toolCall.extensionName` alongside the `ToolCall` create,
+/// so the merged snapshot carries it through to `on_tool_call_completed`.
+/// On **history replay** goose sends a single completed `ToolCall` for
+/// each historical call and (currently) omits the `_meta` block — without
+/// a fallback the resource fetch never fires and the iframe placeholder
+/// stays spinning (gander#101 follow-up).
+///
+/// Returns `None` for URIs without a non-empty host segment.
+pub(crate) fn extension_name_from_uri(uri: &str) -> Option<String> {
+    let after_scheme = uri.split_once("://")?.1;
+    let host = after_scheme
+        .split_once('/')
+        .map(|(h, _)| h)
+        .unwrap_or(after_scheme);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 /// Extension handler for goose-specific ACP extensions.
 ///
-/// Inspects completed tool calls for `rawOutput.resourceUri` and
-/// `_meta.goose.toolCall.extensionName`.  When both are present it emits an
+/// Inspects completed tool calls for `rawOutput.resourceUri` and emits an
 /// [`ExtRequest::ReadResource`] so the worker can fetch the HTML panel.
+///
+/// The extension name comes from `_meta.goose.toolCall.extensionName` when
+/// present (live tool calls); on history replay where that meta block is
+/// usually absent we fall back to the host component of the URI (see
+/// `extension_name_from_uri`, a `pub(crate)` helper above).
 pub struct GooseExtHandler;
 
 #[async_trait::async_trait]
@@ -97,7 +136,7 @@ impl ExtHandler for GooseExtHandler {
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
-        let extension_name = tc
+        let extension_name_from_meta = tc
             .meta
             .as_ref()
             .and_then(|m| m.get("goose"))
@@ -106,22 +145,55 @@ impl ExtHandler for GooseExtHandler {
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
-        if let (Some(uri), Some(ext)) = (resource_uri, extension_name) {
+        let Some(uri) = resource_uri else {
+            return;
+        };
+
+        let extension_name = extension_name_from_meta
+            .clone()
+            .or_else(|| extension_name_from_uri(&uri));
+
+        let Some(ext) = extension_name else {
+            // No meta, and URI has no host we can use as the extension name.
+            // Log so the gap is visible in wire traces rather than silently
+            // dropping the fetch.
+            debug!(
+                target: "gander::wire",
+                tool_call_id = %tc.tool_call_id,
+                resource_uri = %uri,
+                "READ_RESOURCE_SKIPPED_NO_EXTENSION_NAME"
+            );
+            return;
+        };
+
+        if extension_name_from_meta.is_none() {
+            // Surface the fallback at debug level so a future regression in
+            // how goose ships the meta block (or in the URI shape) shows up
+            // in `RUST_LOG=gander::wire=debug` instead of silently working
+            // the wrong way.
             debug!(
                 target: "gander::wire",
                 tool_call_id = %tc.tool_call_id,
                 resource_uri = %uri,
                 extension_name = %ext,
-                "QUEUE_READ_RESOURCE"
+                "READ_RESOURCE_EXTENSION_NAME_FROM_URI_FALLBACK"
             );
-            let _ = evt_tx
-                .send(ExtEvent::Request(ExtRequest::ReadResource {
-                    tool_call_id: tc.tool_call_id.clone(),
-                    uri,
-                    extension_name: ext,
-                }))
-                .await;
         }
+
+        debug!(
+            target: "gander::wire",
+            tool_call_id = %tc.tool_call_id,
+            resource_uri = %uri,
+            extension_name = %ext,
+            "QUEUE_READ_RESOURCE"
+        );
+        let _ = evt_tx
+            .send(ExtEvent::Request(ExtRequest::ReadResource {
+                tool_call_id: tc.tool_call_id.clone(),
+                uri,
+                extension_name: ext,
+            }))
+            .await;
     }
 }
 
@@ -310,19 +382,55 @@ mod tests {
         );
     }
 
+    // goose-ext: on history replay goose omits _meta.goose.toolCall.extensionName,
+    // so we fall back to the host component of the resourceUri.  Without this
+    // the historic panel stays at the "Loading panel…" placeholder forever.
     #[tokio::test]
-    async fn completed_tool_with_resource_uri_but_no_extension_does_not_emit() {
+    async fn completed_tool_with_resource_uri_but_no_extension_falls_back_to_uri_host() {
         let tc = ToolCall::new(ToolCallId::new("tc-no-ext"), "mcp_tool");
         let mut tc = tc;
         let fields = ToolCallUpdateFields::new()
             .status(ToolCallStatus::Completed)
-            .raw_output(serde_json::json!({"resourceUri": "mcp://ext/resource"}));
+            .raw_output(serde_json::json!({"resourceUri": "ui://botworkui/state/abc"}));
+        apply_tool_call_update(&mut tc, fields);
+
+        let events = emitted_events(&tc).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "missing extensionName must fall back to URI host; got {events:?}"
+        );
+        match &events[0] {
+            ExtEvent::Request(ExtRequest::ReadResource {
+                extension_name,
+                uri,
+                ..
+            }) => {
+                assert_eq!(
+                    extension_name, "botworkui",
+                    "extensionName must come from URI host"
+                );
+                assert_eq!(uri, "ui://botworkui/state/abc");
+            }
+            other => panic!("expected ReadResource, got {other:?}"),
+        }
+    }
+
+    /// A resourceUri with no usable host (e.g. opaque URN, missing host)
+    /// must skip the fetch — it isn't safe to invent an extension name.
+    #[tokio::test]
+    async fn completed_tool_with_unusable_resource_uri_does_not_emit() {
+        let tc = ToolCall::new(ToolCallId::new("tc-bad-uri"), "mcp_tool");
+        let mut tc = tc;
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .raw_output(serde_json::json!({"resourceUri": "ui:///no-host/path"}));
         apply_tool_call_update(&mut tc, fields);
 
         let events = emitted_events(&tc).await;
         assert!(
             events.is_empty(),
-            "missing extensionName means no emit; got {events:?}"
+            "URI with empty host must not emit; got {events:?}"
         );
     }
 
@@ -388,6 +496,35 @@ mod tests {
             }
             other => panic!("expected ReadResource, got {other:?}"),
         }
+    }
+
+    // ── extension_name_from_uri ───────────────────────────────────────────
+
+    #[test]
+    fn extension_name_from_uri_returns_host_for_standard_scheme() {
+        assert_eq!(
+            extension_name_from_uri("ui://botworkui/state/abc"),
+            Some("botworkui".to_string())
+        );
+    }
+
+    #[test]
+    fn extension_name_from_uri_returns_host_when_no_path() {
+        // No trailing path component — the host is the whole post-scheme part.
+        assert_eq!(
+            extension_name_from_uri("ui://botworkui"),
+            Some("botworkui".to_string())
+        );
+    }
+
+    #[test]
+    fn extension_name_from_uri_returns_none_for_missing_scheme() {
+        assert_eq!(extension_name_from_uri("botworkui/state"), None);
+    }
+
+    #[test]
+    fn extension_name_from_uri_returns_none_for_empty_host() {
+        assert_eq!(extension_name_from_uri("ui:///state/abc"), None);
     }
 
     // ── extract_html_from_read_resource_response ──────────────────────────

@@ -741,10 +741,14 @@ pub(crate) fn apply_tool_call_update(
 /// keeps the Leptos side dumb: it receives complete state and never needs to
 /// apply deltas itself.
 ///
-/// Returns `Some(merged)` when a `ToolCallUpdate` with `Completed` status is
-/// processed.  Callers pass the snapshot to
+/// Returns `Some(tc)` when a `ToolCall` or `ToolCallUpdate` with `Completed`
+/// status is processed.  Callers pass the snapshot to
 /// [`crate::ext::ExtHandler::on_tool_call_completed`] for extension-specific
 /// handling.
+///
+/// History replay sends the final state as a single `ToolCall` (not the
+/// live `ToolCall` + `ToolCallUpdate` pair), so both arms must signal
+/// completion when `status == Completed`.
 async fn forward_update(
     update: SessionUpdate,
     tx: &mpsc::Sender<AcpEvent>,
@@ -779,10 +783,20 @@ async fn forward_update(
             );
             let mut map = tool_calls.lock().await;
             map.insert(tc.tool_call_id.clone(), tc.clone());
+            // History replay delivers the final completed state as a single
+            // ToolCall (not the live ToolCall + ToolCallUpdate pair), so we
+            // must signal completion here too — otherwise on_tool_call_completed
+            // is never called and MCP App iframes are never re-fetched on
+            // session reload.
+            let completed = if tc.status == ToolCallStatus::Completed {
+                Some(tc.clone())
+            } else {
+                None
+            };
             let event = AcpEvent::ToolCall(Box::new(tc));
             debug!(target: "gander::wire", direction = "emit", event_kind = ?event, "ACP_EVENT_EMIT");
             let _ = tx.send(event).await;
-            None
+            completed
         }
         SessionUpdate::ToolCallUpdate(update) => {
             debug!(
@@ -860,7 +874,8 @@ async fn forward_update(
 mod tests {
     use super::*;
     use agent_client_protocol::schema::{
-        ContentChunk, TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        ContentChunk, TextContent, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+        ToolCallUpdateFields,
     };
 
     /// Build a fresh shared tool-call map for use in tests.
@@ -1028,6 +1043,55 @@ mod tests {
         assert!(
             v.get("raw_output").is_none(),
             "snake_case 'raw_output' must not appear in JSON"
+        );
+    }
+
+    /// A `ToolCall` that arrives already completed (history replay sends the
+    /// final state as a single event rather than ToolCall + ToolCallUpdate)
+    /// must return `Some` so callers invoke `on_tool_call_completed`.
+    #[tokio::test]
+    async fn forward_completed_tool_call_returns_some() {
+        let mut tool = ToolCall::new(ToolCallId::new("tc-hist"), "mcp_tool");
+        apply_tool_call_update(
+            &mut tool,
+            ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+        );
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let map = empty_map();
+        let result = forward_update(SessionUpdate::ToolCall(tool), &tx, &map).await;
+
+        assert!(
+            result.is_some(),
+            "completed ToolCall must return Some for on_tool_call_completed"
+        );
+        assert_eq!(
+            result.unwrap().status,
+            ToolCallStatus::Completed,
+            "returned snapshot must carry status=Completed"
+        );
+        // The AcpEvent must still be emitted regardless of the return value.
+        assert!(
+            rx.try_recv().is_ok(),
+            "AcpEvent::ToolCall must be emitted even when returning Some"
+        );
+    }
+
+    /// A `ToolCall` that is still in-progress (live streaming) must not
+    /// signal `on_tool_call_completed` — only the final update should do that.
+    #[tokio::test]
+    async fn forward_running_tool_call_returns_none() {
+        let tool = ToolCall::new(ToolCallId::new("tc-live"), "mcp_tool");
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let map = empty_map();
+        let result = forward_update(SessionUpdate::ToolCall(tool), &tx, &map).await;
+
+        assert!(result.is_none(), "in-progress ToolCall must return None");
+        // The AcpEvent must still be emitted.
+        assert!(
+            rx.try_recv().is_ok(),
+            "AcpEvent::ToolCall must be emitted for in-progress call too"
         );
     }
 
