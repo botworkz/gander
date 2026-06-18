@@ -10,6 +10,7 @@ pub mod message_view;
 pub mod scroll;
 pub mod sidebar;
 pub mod time_ago;
+pub mod virtual_list;
 
 pub use all_sessions::AllSessions;
 pub use footer::Footer;

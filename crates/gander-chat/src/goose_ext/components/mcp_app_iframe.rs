@@ -4,6 +4,21 @@
 //!
 //! Rendered inside a `ToolCallCard` when the host emits a `tool_resource`
 //! event that carries pre-hydrated HTML for the tool call.
+//!
+//! # Virtualisation (gander#124)
+//!
+//! The component takes a `visible` signal: when `false` (the parent
+//! card is outside the virtualiser's overscan window) we render a
+//! placeholder instead of injecting `srcdoc`.  Each `srcdoc`
+//! injection spins up a fresh WebKit subprocess; off-screen cards
+//! must not pay this cost.
+//!
+//! Cross-mount state retention (i.e. preserving the iframe's
+//! contentDocument across unmount/remount) is **deliberately** out
+//! of scope and tracked in gander#125.  In practice the ±20 overscan
+//! in `virtual_list.rs` means routine scroll-back keeps panels
+//! mounted; only long-distance scrolling away from a panel loses
+//! its state.
 
 use leptos::prelude::*;
 
@@ -90,6 +105,14 @@ fn build_srcdoc(html: &str) -> String {
 /// `allow-same-origin`, `allow-forms`, and `allow-top-navigation` are
 /// deliberately excluded to prevent the iframe content from accessing
 /// cookies/storage, submitting forms, or escaping the sandbox.
+///
+/// # `visible` (gander#124)
+///
+/// When `false`, render the same loading placeholder shape used for
+/// `ui_pending` rather than injecting `srcdoc`.  The placeholder
+/// matches the iframe's `min-height: 200px` so the parent card's
+/// geometry doesn't shift when the card scrolls back into view and
+/// the real iframe replaces the placeholder.
 // goose-ext: rendered when the host emits tool_resource for this call
 #[component]
 pub fn McpAppIframe(
@@ -99,9 +122,31 @@ pub fn McpAppIframe(
     /// `gander.iframe.height` listener can route height updates back to the
     /// right `<iframe>` element.
     tool_call_id: RwSignal<Option<String>>,
+    /// Virtualiser visibility (gander#124).  When `false`, the iframe
+    /// renders a height-preserving placeholder instead of injecting
+    /// `srcdoc`, sidestepping the per-iframe WebKit subprocess cost
+    /// for off-screen cards.
+    visible: RwSignal<bool>,
 ) -> impl IntoView {
     view! {
         {move || {
+            // Off-screen short-circuit: don't inject srcdoc when the
+            // virtualiser has unmounted the parent card region.
+            // Show the same loading placeholder shape used for
+            // ui_pending so the card geometry stays stable.
+            if !visible.get() {
+                return ui_html
+                    .get()
+                    .or_else(|| ui_pending.get().then(String::new))
+                    .map(|_| {
+                        view! {
+                            <div class="tool-call-iframe-pending tool-call-iframe-pending--virtualised">
+                                <span class="tool-call-iframe-pending-label">"Panel offscreen"</span>
+                            </div>
+                        }
+                        .into_any()
+                    });
+            }
             match (ui_pending.get(), ui_html.get()) {
                 (_, Some(html)) => {
                     let srcdoc = build_srcdoc(&html);

@@ -57,6 +57,27 @@ pub struct ChatMessage {
     /// arrived).  Drives a loading placeholder in the iframe slot so the card
     /// layout does not shift when the HTML arrives.
     pub ui_pending: RwSignal<bool>,
+    /// Whether this message is currently inside the virtualiser's mount
+    /// window (gander#124).  Gates the expensive per-message work —
+    /// markdown render, tool I/O JSON parse, iframe `srcdoc` injection.
+    ///
+    /// Defaults to `true` so that constructors used outside the
+    /// virtualised list path (history-replay buffer, unit tests, etc.)
+    /// render fully without needing to know about the virtualiser.
+    /// `<MessageList>` flips this to `false` for messages that scroll
+    /// out of the window + overscan buffer, and back to `true` on the
+    /// way back in.
+    pub visible: RwSignal<bool>,
+    /// Tool-card open/closed state (gander#124).
+    ///
+    /// Lifted out of `ToolCallCard`'s component-local state so it
+    /// survives virtualisation unmount/remount.  Without this, a user
+    /// who expanded a card and then scrolled away far enough to
+    /// unmount it would find the card collapsed again on scroll-back
+    /// — a constant footgun because users routinely scroll past
+    /// expanded cards to read what came after.  Non-tool messages
+    /// ignore this field.
+    pub expanded: RwSignal<bool>,
 }
 
 impl ChatMessage {
@@ -70,6 +91,8 @@ impl ChatMessage {
             tool_call_id: RwSignal::new(None),
             ui_html: RwSignal::new(None),
             ui_pending: RwSignal::new(false),
+            visible: RwSignal::new(true),
+            expanded: RwSignal::new(false),
         }
     }
 
@@ -83,6 +106,8 @@ impl ChatMessage {
             tool_call_id: RwSignal::new(None),
             ui_html: RwSignal::new(None),
             ui_pending: RwSignal::new(false),
+            visible: RwSignal::new(true),
+            expanded: RwSignal::new(false),
         }
     }
 
@@ -97,6 +122,8 @@ impl ChatMessage {
             tool_call_id: RwSignal::new(Some(tool_call_id)),
             ui_html: RwSignal::new(None),
             ui_pending: RwSignal::new(false),
+            visible: RwSignal::new(true),
+            expanded: RwSignal::new(false),
         }
     }
 }

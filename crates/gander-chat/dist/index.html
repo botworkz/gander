@@ -11,8 +11,8 @@
   -->
   
 <script type="module">
-import init, * as bindings from '/gander-chat-e09662686b865b9d.js';
-const wasm = await init({ module_or_path: '/gander-chat-e09662686b865b9d_bg.wasm' });
+import init, * as bindings from '/gander-chat-a037556bd6cc6d4e.js';
+const wasm = await init({ module_or_path: '/gander-chat-a037556bd6cc6d4e_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -533,6 +533,49 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
     .scroll-pill-label {
       line-height: 1;
+    }
+
+    /* ── virtualisation skeleton + spacer (gander#124) ─────────────
+       Off-screen messages keep their outer chrome (so role-class
+       gutters still apply) but replace the markdown body with a
+       transparent placeholder.  No shimmer — animating hundreds of
+       skeletons during a fast scroll is visual noise. */
+    .message-content--skeleton {
+      min-height: 1em;
+      background: linear-gradient(
+        to bottom,
+        rgba(255, 255, 255, 0.02),
+        rgba(255, 255, 255, 0.04)
+      );
+      border-radius: 6px;
+      /* Three estimated lines worth of vertical space so the spacer
+         math (which uses INITIAL_AVERAGE_HEIGHT_PX ≈ 120 px per
+         message minus card chrome) lines up with the painted height
+         to within a few px.  Tuned by eye against the long-session
+         mock fixture. */
+      height: 72px;
+    }
+
+    /* Spacer divs (leading / trailing) replace the unmounted prefix
+       and suffix of the message list.  Inline `style="height:Npx"` is
+       set by the Leptos component; this rule only carries the visual
+       affordance.  Transparent — the spacers are pure geometry. */
+    .message-list-spacer {
+      flex-shrink: 0;
+      background: transparent;
+    }
+
+    /* MCP App iframe placeholder shown when the parent card is outside
+       the virtualiser's overscan window.  Same chrome as the
+       resource-fetch placeholder so the card's geometry doesn't shift
+       when the card scrolls back into view and the real iframe
+       replaces this. */
+    .tool-call-iframe-pending--virtualised .tool-call-iframe-pending-label {
+      /* Override the resource-fetch label's throb — the virtualised
+         placeholder is steady-state, not pending.  Pulsing it would
+         imply something is loading when nothing is. */
+      animation: none;
+      opacity: 0.5;
     }
 
     .empty-state {
@@ -1079,6 +1122,11 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         // behaviour in `trunk serve`.  200 alternating turns is enough to
         // make a flood-from-top render visible without slowing dev down.
         { id: "mock-session-long", label: "Long session (200 turns)", last_active: new Date(Date.now() - 24 * 3600 * 1000).toISOString() },
+        // gander#124: huge-session fixture for exercising
+        // virtualisation in `trunk serve`.  500 alternating text
+        // turns + 30 interleaved tool cards + 10 panels — the shape
+        // a power user actually accumulates over a week.
+        { id: "mock-session-huge", label: "Huge session (500 + 30 cards + 10 panels)", last_active: new Date(Date.now() - 12 * 3600 * 1000).toISOString() },
       ];
 
       function fireEvent(event) {
@@ -1197,6 +1245,43 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             history.push({ role: "user",  text: "Turn " + n + " — what about " + title + "?" });
             history.push({ role: "agent", text: "Reply " + n + " in **" + title + "** with some _markdown_ and a `code span`." });
           }
+        } else if (id === "mock-session-huge") {
+          // gander#124: 500 alternating text turns + 30 interleaved
+          // tool cards + 10 panels — a power-user week.  All
+          // synchronous (delay = 0) so the worst-case mount path
+          // gets exercised on every replay.
+          history = [];
+          var panelEvery = 25;   // 500 / 20 panels = every 25 turns → 20 panel cards
+          var cardEvery  = 16;   // 500 / 30 cards = every ~16 turns
+          var panelsLeft = 10;
+          for (var k = 1; k <= 250; k++) {
+            history.push({ role: "user",  text: "Q" + k + ": tell me about block " + k + " in " + title });
+            history.push({ role: "agent", text: "A" + k + " block — here's some **markdown**, a `code span`, and a list:\n- one\n- two\n- three" });
+            if (k % cardEvery === 0) {
+              history.push({
+                role: "tool_call",
+                call: {
+                  toolCallId: "tc-huge-" + k,
+                  title: (panelsLeft > 0 && k % panelEvery === 0) ? "huge_show_panel_" + k : "huge_list_dir_" + k,
+                  status: "completed",
+                  rawInput:  { idx: k },
+                  rawOutput: (panelsLeft > 0 && k % panelEvery === 0)
+                    ? { resourceUri: "ui://demo/panel-" + k }
+                    : { entries: ["alpha", "beta", "gamma", "delta"] }
+                }
+              });
+              if (panelsLeft > 0 && k % panelEvery === 0) {
+                panelsLeft--;
+                history.push({
+                  role: "tool_resource",
+                  tool_call_id: "tc-huge-" + k,
+                  html: "<!doctype html><body style='font:13px system-ui;background:#0e0e1f;color:#e0e0e0;margin:0;padding:10px'>" +
+                        "<h4 style='margin:0 0 6px 0;color:#5d8bff'>Panel " + k + "</h4>" +
+                        "<p>Steady-state panel for virtualisation soak test.</p></body>"
+                });
+              }
+            }
+          }
         } else {
           history = [
             { role: "user", text: "Tell me about " + title },
@@ -1209,8 +1294,13 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         // Long fixture flushes synchronously (delay=0) to exercise the
         // worst-case render path; short fixtures keep a small stagger so
         // the existing chat-replay demo still feels like a load.
-        var delay = (id === "mock-session-long") ? 0 : 80;
-        var step  = (id === "mock-session-long") ? 0 : 80;
+        // Long and huge fixtures flush synchronously (delay = 0) to
+        // exercise the worst-case mount path; short fixtures keep a
+        // stagger so the existing chat-replay demo still feels like
+        // a load.
+        var sync = (id === "mock-session-long" || id === "mock-session-huge");
+        var delay = sync ? 0 : 80;
+        var step  = sync ? 0 : 80;
         history.forEach(function(item) {
           setTimeout(function() {
             if (item.role === "user") {
@@ -1222,6 +1312,16 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
               fireEvent({ type: "tool_use", name: item.name, input: item.input });
             } else if (item.role === "tool_result") {
               fireEvent({ type: "tool_result", name: item.name, output: item.output });
+            } else if (item.role === "tool_call") {
+              // gander#124: huge fixture emits full ToolCall snapshots
+              // directly (matches production tool_call event shape).
+              fireEvent({ type: "tool_call", call: JSON.stringify(item.call) });
+            } else if (item.role === "tool_resource") {
+              // gander#124: huge fixture also emits the
+              // tool_resource event for panel-bearing cards so the
+              // virtualisation gating of McpAppIframe srcdoc is
+              // exercised end-to-end.
+              fireEvent({ type: "tool_resource", tool_call_id: item.tool_call_id, html: item.html });
             }
           }, delay);
           delay += step;
@@ -1322,7 +1422,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       };
     })();
   </script>
-<link rel="modulepreload" href="/gander-chat-e09662686b865b9d.js" crossorigin="anonymous" integrity="sha384-bIOtDeiSL2TaAAneTgcdawm/fxwhR76Pp/Kzv5DTOmaxqH2jYmsAdHIw3CibbEhX"><link rel="preload" href="/gander-chat-e09662686b865b9d_bg.wasm" crossorigin="anonymous" integrity="sha384-6DX5lj19IF1jAxHN2Jj/sDBdRups4j2Ji/IkBF85BkZBk31cP/H+Nd8U5r/HByBI" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/gander-chat-a037556bd6cc6d4e.js" crossorigin="anonymous" integrity="sha384-EhVKHKqepNm0y21SbWgroVvs1LCrFqEdT5f9WZgXreINqvuWwiP0JB599Sr6O4qn"><link rel="preload" href="/gander-chat-a037556bd6cc6d4e_bg.wasm" crossorigin="anonymous" integrity="sha384-76uKTbZHUQvxZku63y2tM8zaX2eGNm11mH6dKLvhC0CCPj02ZRPJlDWQ0de4naWC" as="fetch" type="application/wasm"></head>
 <body>
   <!--
     Trunk injects the WASM loader at the end of <body>.
