@@ -535,6 +535,28 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       line-height: 1;
     }
 
+    /* ── virtualisation skeleton + spacer (gander#124) ───────────── */
+    .message-content--skeleton {
+      min-height: 1em;
+      background: linear-gradient(
+        to bottom,
+        rgba(255, 255, 255, 0.02),
+        rgba(255, 255, 255, 0.04)
+      );
+      border-radius: 6px;
+      height: 72px;
+    }
+
+    .message-list-spacer {
+      flex-shrink: 0;
+      background: transparent;
+    }
+
+    .tool-call-iframe-pending--virtualised .tool-call-iframe-pending-label {
+      animation: none;
+      opacity: 0.5;
+    }
+
     .empty-state {
       flex: 1;
       display: flex;
