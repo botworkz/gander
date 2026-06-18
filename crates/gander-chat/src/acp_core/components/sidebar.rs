@@ -138,6 +138,22 @@ pub fn Sidebar(
                                                     .unwrap_or(false)
                                             };
                                             let on_click = move |_| {
+                                                // No-op if the user clicked the already-active
+                                                // session — re-issuing session/load would clear
+                                                // the chat pane (SessionLoadStart resets messages
+                                                // and replay_buffer) and replay the same history,
+                                                // which the user reads as "my chat just
+                                                // disappeared".  Cheaper *and* less surprising to
+                                                // just do nothing.
+                                                let already_active = active_session_id
+                                                    .get_untracked()
+                                                    .as_deref()
+                                                    .map(|a| a == id_for_click.as_str())
+                                                    .unwrap_or(false);
+                                                if already_active {
+                                                    return;
+                                                }
+
                                                 // Build the message as a proper JS object to avoid
                                                 // manual JSON escaping and potential injection.
                                                 let obj = js_sys::Object::new();
