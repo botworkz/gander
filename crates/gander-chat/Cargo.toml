@@ -19,11 +19,26 @@ leptos = { version = "0.8", features = ["csr"] }
 # WASM / JS interop
 wasm-bindgen = "0.2"
 js-sys = "0.3"
+# Added in gander#119 (anchor-to-now):
+#   Element, HtmlElement, HtmlDivElement, DomRect — read scroll metrics off
+#                                                    the scrollable viewport
+#   Event, EventTarget                            — `scroll` listener plumbing
+#   ResizeObserver, ResizeObserverEntry           — stay-glued-to-bottom while
+#                                                    tokens stream into a
+#                                                    settled bubble
 web-sys = { version = "0.3", features = [
     "Window",
     "HtmlTextAreaElement",
     "KeyboardEvent",
     "console",
+    "Element",
+    "HtmlElement",
+    "HtmlDivElement",
+    "DomRect",
+    "Event",
+    "EventTarget",
+    "ResizeObserver",
+    "ResizeObserverEntry",
 ] }
 
 # Markdown → HTML (pure Rust, compiles to WASM without changes)

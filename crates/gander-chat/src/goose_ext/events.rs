@@ -8,6 +8,7 @@
 use leptos::prelude::*;
 use wasm_bindgen::JsValue;
 
+use crate::acp_core::events::message_dest;
 use crate::acp_core::types::ChatMessage;
 
 /// Dispatch a raw JS bridge event, handling only goose-ext variants.
@@ -15,8 +16,20 @@ use crate::acp_core::types::ChatMessage;
 /// Currently handles `tool_resource` only.  Unknown events are silently
 /// skipped — the caller is responsible for passing the event to
 /// `crate::acp_core::events::handle_acp_core_bridge_event` as well.
+///
+/// During history replay the `tool_resource` event hydrates a card that
+/// lives in `replay_buffer` rather than `messages`, so the same
+/// destination-picking helper used by the ACP core handler is reused
+/// here.  Without that the panel HTML would be set on a not-yet-mounted
+/// signal whose owning card is still in the buffer; the visible panel
+/// would never appear because `messages` is empty.
 // goose-ext: sets ui_html on the matching tool-call card
-pub fn handle_goose_ext_bridge_event(event: &JsValue, messages: RwSignal<Vec<ChatMessage>>) {
+pub fn handle_goose_ext_bridge_event(
+    event: &JsValue,
+    replaying: RwSignal<bool>,
+    messages: RwSignal<Vec<ChatMessage>>,
+    replay_buffer: RwSignal<Vec<ChatMessage>>,
+) {
     let event_type = js_sys::Reflect::get(event, &JsValue::from_str("type"))
         .ok()
         .and_then(|v| v.as_string());
@@ -34,7 +47,9 @@ pub fn handle_goose_ext_bridge_event(event: &JsValue, messages: RwSignal<Vec<Cha
                 .and_then(|v| v.as_string())
                 .unwrap_or_default();
 
-            if let Some(msg) = messages
+            let dest = message_dest(messages, replay_buffer, replaying);
+
+            if let Some(msg) = dest
                 .get_untracked()
                 .iter()
                 .find(|m| m.tool_call_id.get_untracked().as_deref() == Some(tool_call_id.as_str()))
