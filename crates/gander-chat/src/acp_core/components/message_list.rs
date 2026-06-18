@@ -194,10 +194,15 @@ pub fn MessageList(
                     } else {
                         format!("{n} new messages")
                     };
+                    // The view! macro evaluates `{label}` (which moves) before
+                    // `title=label.clone()` reads it, so cloning at the call
+                    // site triggers borrow-after-move.  Bind the title copy
+                    // up-front and let the span consume the original.
+                    let title_label = label.clone();
                     view! {
                         <button
                             class="scroll-pill"
-                            title=label.clone()
+                            title=title_label
                             on:click=move |_: ev::MouseEvent| snap_and_reset()
                         >
                             <Icon icon=icondata::LuChevronDown width="14px" height="14px" />
