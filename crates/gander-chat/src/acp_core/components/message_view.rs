@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Message rendering: individual bubbles and the tool-call card.
+//!
+//! # Virtualisation (gander#124)
+//!
+//! Every per-message render path that's expensive to mount —
+//! `markdown::render`, `parse_tool_io`, `srcdoc` injection — is gated
+//! on [`ChatMessage::visible`].  When `false` (the message is outside
+//! the virtualiser's overscan window) we render a height-preserving
+//! skeleton instead.  The card chrome (header text, status spine,
+//! gear icon) is always rendered because it's cheap and lets the
+//! user *scan* the transcript even when it's mostly skeletons —
+//! titles read at-a-glance during fast scroll.
 
 use leptos::prelude::*;
 use leptos_icons::Icon;
@@ -74,6 +85,16 @@ fn parse_tool_io(json: &str) -> (Option<String>, Option<String>) {
 ///
 /// Tool messages are rendered as a collapsible card via [`ToolCallCard`].
 /// All other messages render their content via the markdown renderer.
+///
+/// # Virtualisation
+///
+/// When `message.visible` is `false`, render a height-preserving
+/// skeleton `<div>` instead of the real markdown body.  The skeleton
+/// carries the message's role class so spacing / gutters match the
+/// real bubble's geometry — without this, the spacer math in
+/// `virtual_list::visible_window` and the actual painted height
+/// diverge and the user sees the page jiggle as messages scroll in
+/// and out of the window.
 #[component]
 pub fn MessageView(message: ChatMessage) -> impl IntoView {
     match message.role {
@@ -86,13 +107,34 @@ pub fn MessageView(message: ChatMessage) -> impl IntoView {
             };
             // Bubble body shared by both speakers.  Defined once so the
             // user / assistant arms below differ only in avatar order.
+            //
+            // Virtualisation gate: when `visible` is false, render a
+            // skeleton with the same outer chrome but no markdown
+            // body.  This is the load-bearing optimisation for
+            // gander#124 — `crate::markdown::render` is the dominant
+            // per-message cost on long sessions.
             let bubble = view! {
                 <div class="message-bubble">
-                    // Reactive inner HTML: re-evaluates only when `content` changes.
-                    <div
-                        class="message-content"
-                        inner_html=move || crate::markdown::render(&message.content.get())
-                    />
+                    {move || {
+                        if message.visible.get() {
+                            view! {
+                                <div
+                                    class="message-content"
+                                    inner_html=move || crate::markdown::render(&message.content.get())
+                                />
+                            }
+                            .into_any()
+                        } else {
+                            // Skeleton: a transparent placeholder
+                            // sized by the parent flex layout.  No
+                            // shimmer — animating hundreds of
+                            // skeletons during a fast scroll is
+                            // visual noise; we want them to read as
+                            // "this is geometry, not loading".
+                            view! { <div class="message-content message-content--skeleton" /> }
+                                .into_any()
+                        }
+                    }}
                     // Blinking cursor while the host is still streaming tokens.
                     {move || {
                         message
@@ -153,10 +195,25 @@ pub fn MessageView(message: ChatMessage) -> impl IntoView {
 ///
 /// `message.content` holds the full ACP `ToolCall` JSON snapshot; it is
 /// re-evaluated whenever the host emits an update for this tool call id.
+///
+/// # Virtualisation
+///
+/// - Header (gear, title, chevron, status spine) is **always**
+///   rendered — these are scan-cheap and let the user see the
+///   conversation structure at a glance during fast scroll.
+/// - Body (`parse_tool_io`) is gated on `message.visible`.  The JSON
+///   parse + `JSON.stringify` for input/output is the heavy bit.
+/// - `expanded` lives on the message (not the component) so it
+///   survives unmount/remount (gander#124).
+/// - `McpAppIframe` does its own visibility-gating of `srcdoc`.
 #[component]
 pub fn ToolCallCard(message: ChatMessage) -> impl IntoView {
-    // Local signal for the collapsed/expanded state of this card.
-    let expanded: RwSignal<bool> = RwSignal::new(false);
+    // Promoted to `message.expanded` so toggling survives an
+    // unmount/remount on scroll — without this a user who expanded a
+    // card then scrolled far enough away to unmount it would find it
+    // collapsed again on scroll-back.  Same toggle behaviour as
+    // before, just reading from the message-level signal.
+    let expanded = message.expanded;
     let toggle = move |_| expanded.update(|e| *e = !*e);
 
     view! {
@@ -194,10 +251,16 @@ pub fn ToolCallCard(message: ChatMessage) -> impl IntoView {
                     />
                 </span>
             </button>
-            // ── body (shown when expanded) ────────────────────────────
+            // ── body (shown when expanded AND visible) ────────────────
+            //
+            // Both gates needed: `expanded` is the user's intent (do
+            // they want to read the I/O); `visible` is virtualiser
+            // state (are we mounted at all).  Off-screen-but-expanded
+            // cards still skip the parse cost; on scroll back into
+            // view the body re-materialises with the user's expand
+            // state preserved.
             {move || {
-                expanded
-                    .get()
+                (expanded.get() && message.visible.get())
                     .then(|| {
                         let json = message.content.get();
                         let (input_str, output_str) = parse_tool_io(&json);
@@ -226,7 +289,19 @@ pub fn ToolCallCard(message: ChatMessage) -> impl IntoView {
                     })
             }}
             // ── MCP App HTML panel (sandboxed iframe, extension layer) ──────
-            <McpAppIframe ui_html=message.ui_html ui_pending=message.ui_pending tool_call_id=message.tool_call_id />
+            //
+            // `visible` is threaded through so the iframe component
+            // can withhold `srcdoc` injection while off-screen — see
+            // the extension-layer iframe component for the gating
+            // logic.  In-place when visible, placeholder when not.
+            // Iframe-state retention across unmount is tracked
+            // separately in gander#125.
+            <McpAppIframe
+                ui_html=message.ui_html
+                ui_pending=message.ui_pending
+                tool_call_id=message.tool_call_id
+                visible=message.visible
+            />
         </div>
     }
 }
