@@ -33,14 +33,24 @@
 //!
 //! ## History replay
 //!
-//! On session load:
+//! On session load (gander#119: anchor-to-now):
 //!
-//! 1. `session_load_start` → clear message list, set `replaying=true`.
-//! 2. `user_text` → append a completed user bubble.
-//! 3. `agent_text` → create (if needed) and append to in-flight agent bubble.
-//! 4. `tool_use` / `tool_result` → append a tool bubble.
-//! 5. `done` → finalize in-flight agent bubble.
-//! 6. `session_load_end` → clear `replaying`, re-enable input.
+//! 1. `session_load_start` → clear `messages` *and* `replay_buffer`,
+//!    set `replaying=true`.
+//! 2. `user_text` / `agent_text` / `tool_call` / `tool_resource`
+//!    → append/update inside `replay_buffer` (not `messages`) for the
+//!    duration of replay.  See `acp_core::events` module docs for the
+//!    full rationale; in short, we want one keyed `<For>` diff at the
+//!    end rather than one per turn.
+//! 3. `done` → finalize the in-flight agent bubble inside the buffer.
+//! 4. `session_load_end` →
+//!    a) close any lingering in-flight bubble,
+//!    b) atomically swap `replay_buffer` into `messages`
+//!       (one diff, one paint),
+//!    c) clear `replaying`, re-enable input.
+//!    The `MessageList` then snaps the viewport to the bottom on the
+//!    next animation frame so the user lands at "now" rather than at
+//!    the start of history.
 //!
 //! ## Session sidebar
 //!
@@ -96,6 +106,11 @@ pub use goose_ext::components::McpAppIframe;
 #[component]
 pub fn App() -> impl IntoView {
     let messages: RwSignal<Vec<ChatMessage>> = RwSignal::new(Vec::new());
+    // Holding pen for history-replay messages.  Populated while
+    // `replaying == true`; drained into `messages` on `session_load_end`
+    // so the keyed `<For>` performs one diff for the whole transcript
+    // instead of one per turn.  See `acp_core::events` module docs.
+    let replay_buffer: RwSignal<Vec<ChatMessage>> = RwSignal::new(Vec::new());
     let next_id: RwSignal<u32> = RwSignal::new(0);
     let input_text: RwSignal<String> = RwSignal::new(String::new());
     // True while an assistant reply is being streamed (live prompt).
@@ -125,6 +140,7 @@ pub fn App() -> impl IntoView {
                 sending,
                 replaying,
                 messages,
+                replay_buffer,
                 next_id,
                 sessions,
                 active_session_id,
@@ -132,7 +148,12 @@ pub fn App() -> impl IntoView {
                 footer_model,
                 footer_tool_count,
             );
-            goose_ext::events::handle_goose_ext_bridge_event(&event, messages);
+            goose_ext::events::handle_goose_ext_bridge_event(
+                &event,
+                replaying,
+                messages,
+                replay_buffer,
+            );
         }) as Box<dyn FnMut(JsValue)>);
 
         bridge::subscribe(cb.as_ref().unchecked_ref());
@@ -157,7 +178,7 @@ pub fn App() -> impl IntoView {
                 </div>
             </div>
             <div class="gander-chat">
-                <MessageList messages />
+                <MessageList messages replaying />
                 <InputRow input_text sending replaying next_id messages in_flight />
                 <Footer cwd=footer_cwd model=footer_model tool_count=footer_tool_count />
             </div>

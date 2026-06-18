@@ -259,6 +259,20 @@
 
     /* ── message list ────────────────────────────────────────── */
 
+    /* Shell wraps the scrollable viewport so the "↓ N new" pill (a child
+       of the shell, not the viewport) can position relative to the chat
+       pane.  Inside the viewport it would scroll with the content, which
+       is the opposite of what we want.  Adding the shell keeps the
+       viewport itself unchanged for purposes of `overflow-y: auto` and
+       the per-message gutters declared on .gander-chat. */
+    .message-list-shell {
+      flex: 1;
+      min-height: 0;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+    }
+
     .message-list {
       flex: 1;
       /* min-height: 0 — without this the column flex item defaults to
@@ -274,6 +288,43 @@
       display: flex;
       flex-direction: column;
       gap: 10px;
+    }
+
+    /* ── "↓ N new" pill ─────────────────────────────────────────
+       Absolutely positioned over the bottom edge of the message-list
+       shell so it floats above the latest visible turn.  Visible only
+       when `pending_below > 0`.  Click → snap to bottom + reset.
+
+       Uses the user-bubble blue so it reads as "your-and-gander's
+       continuation", not as chrome (the footer/sidebar palette).  See
+       the gander#119 acceptance criteria. */
+    .scroll-pill {
+      position: absolute;
+      bottom: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 2;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px 6px 10px;
+      background: #2d5be3;
+      color: #fff;
+      border: none;
+      border-radius: 999px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+      font-family: inherit;
+      font-size: 0.82rem;
+      font-weight: 500;
+      cursor: pointer;
+    }
+
+    .scroll-pill:hover {
+      background: #3d6bf3;
+    }
+
+    .scroll-pill-label {
+      line-height: 1;
     }
 
     .empty-state {
@@ -807,6 +858,10 @@
         { id: "mock-session-1", label: "Session 1", last_active: new Date(Date.now() - 5 * 60 * 1000).toISOString() },
         { id: "mock-session-2", label: "Session 2", last_active: new Date(Date.now() - 2 * 3600 * 1000).toISOString() },
         { id: "mock-session-3", label: "Session 3", last_active: new Date(Date.now() - 48 * 3600 * 1000).toISOString() },
+        // gander#119: long-session fixture for exercising anchor-to-now
+        // behaviour in `trunk serve`.  200 alternating turns is enough to
+        // make a flood-from-top render visible without slowing dev down.
+        { id: "mock-session-long", label: "Long session (200 turns)", last_active: new Date(Date.now() - 24 * 3600 * 1000).toISOString() },
       ];
 
       function fireEvent(event) {
@@ -913,14 +968,32 @@
         var entry = MOCK_SESSIONS.find(function(s) { return s.id === id; });
         var title = entry ? entry.label : id;
         fireEvent({ type: "session_load_start" });
-        var history = [
-          { role: "user", text: "Tell me about " + title },
-          { role: "agent", text: "Sure! Here is what I know about **" + title + "**." },
-          { role: "tool_use", name: "read_file", input: '{"path": "/project/README.md"}' },
-          { role: "tool_result", name: "read_file", output: "# Project\nThis is the README." },
-          { role: "agent", text: "Done reading. Anything else?" },
-        ];
-        var delay = 80;
+        // gander#119: the "Long session" fixture floods 200 alternating
+        // turns through the bridge with zero inter-event delay so the
+        // anchor-to-now behaviour can be visually verified — without
+        // batching, the WebKit reconciler thrashes for ~3 s and the user
+        // sees the transcript crawling top-down toward "now".
+        var history;
+        if (id === "mock-session-long") {
+          history = [];
+          for (var n = 1; n <= 100; n++) {
+            history.push({ role: "user",  text: "Turn " + n + " — what about " + title + "?" });
+            history.push({ role: "agent", text: "Reply " + n + " in **" + title + "** with some _markdown_ and a `code span`." });
+          }
+        } else {
+          history = [
+            { role: "user", text: "Tell me about " + title },
+            { role: "agent", text: "Sure! Here is what I know about **" + title + "**." },
+            { role: "tool_use", name: "read_file", input: '{"path": "/project/README.md"}' },
+            { role: "tool_result", name: "read_file", output: "# Project\nThis is the README." },
+            { role: "agent", text: "Done reading. Anything else?" },
+          ];
+        }
+        // Long fixture flushes synchronously (delay=0) to exercise the
+        // worst-case render path; short fixtures keep a small stagger so
+        // the existing chat-replay demo still feels like a load.
+        var delay = (id === "mock-session-long") ? 0 : 80;
+        var step  = (id === "mock-session-long") ? 0 : 80;
         history.forEach(function(item) {
           setTimeout(function() {
             if (item.role === "user") {
@@ -934,7 +1007,7 @@
               fireEvent({ type: "tool_result", name: item.name, output: item.output });
             }
           }, delay);
-          delay += 80;
+          delay += step;
         });
         setTimeout(function() {
           fireEvent({ type: "session_load_end" });

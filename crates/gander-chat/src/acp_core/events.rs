@@ -5,6 +5,20 @@
 //! Handles all `handle_bridge_event` match arms that correspond to
 //! standard ACP protocol events.  The extension-specific `tool_resource`
 //! variant is handled in the extension events module.
+//!
+//! # Replay buffering (gander#119)
+//!
+//! During history replay (`replaying.get_untracked() == true`) every
+//! message append routes through `replay_buffer` instead of `messages`.
+//! On `session_load_end` the buffer is swapped wholesale into `messages`
+//! in a single update so the keyed `<For>` performs one diff for the
+//! whole transcript rather than one per turn.  Without this, opening a
+//! session with hundreds of turns thrashes the reconciler for several
+//! seconds and the user sees text crawling top-down toward "now".
+//!
+//! The `in_flight` tracking, tool-call splicing for panel-bearing cards
+//! (gander#107), and every other piece of bookkeeping operate on the
+//! current destination — they don't care which `Vec` it is.
 
 use js_sys;
 use leptos::prelude::*;
@@ -19,6 +33,28 @@ pub(crate) fn take_id(next_id: RwSignal<u32>) -> u32 {
     id
 }
 
+/// Pick the message destination signal for the current phase.
+///
+/// During history replay (`replaying == true`) writes are accumulated in
+/// `replay_buffer` so the final swap-into-`messages` is a single keyed
+/// diff (see module docs).  Otherwise writes go straight to `messages`
+/// because we want live tokens to land on screen immediately.
+///
+/// Returns a `Copy` `RwSignal`, so it can be moved into any closure that
+/// follows without borrowing concerns.
+#[inline]
+pub(crate) fn message_dest(
+    messages: RwSignal<Vec<ChatMessage>>,
+    replay_buffer: RwSignal<Vec<ChatMessage>>,
+    replaying: RwSignal<bool>,
+) -> RwSignal<Vec<ChatMessage>> {
+    if replaying.get_untracked() {
+        replay_buffer
+    } else {
+        messages
+    }
+}
+
 /// Dispatch a raw JS bridge event to the appropriate signal update.
 ///
 /// Handles only the pure-ACP event variants.  Unknown events and the
@@ -31,6 +67,7 @@ pub fn handle_acp_core_bridge_event(
     sending: RwSignal<bool>,
     replaying: RwSignal<bool>,
     messages: RwSignal<Vec<ChatMessage>>,
+    replay_buffer: RwSignal<Vec<ChatMessage>>,
     next_id: RwSignal<u32>,
     sessions: RwSignal<Vec<SessionEntry>>,
     active_session_id: RwSignal<Option<String>>,
@@ -50,12 +87,14 @@ pub fn handle_acp_core_bridge_event(
                 .and_then(|v| v.as_string())
                 .unwrap_or_default();
 
+            let dest = message_dest(messages, replay_buffer, replaying);
+
             // Re-use the existing in-flight bubble or start a new one.
             let msg = match in_flight.get_untracked() {
                 Some(m) => m,
                 None => {
                     let m = ChatMessage::new_assistant(take_id(next_id));
-                    messages.update(|v| v.push(m));
+                    dest.update(|v| v.push(m));
                     in_flight.set(Some(m));
                     m
                 }
@@ -77,8 +116,9 @@ pub fn handle_acp_core_bridge_event(
                 in_flight.set(None);
             }
 
+            let dest = message_dest(messages, replay_buffer, replaying);
             let m = ChatMessage::new_user(take_id(next_id), &text);
-            messages.update(|v| v.push(m));
+            dest.update(|v| v.push(m));
         }
 
         // ── tool call (merged snapshot) ────────────────────────────────────
@@ -133,9 +173,11 @@ pub fn handle_acp_core_bridge_event(
                 in_flight.set(None);
             }
 
+            let dest = message_dest(messages, replay_buffer, replaying);
+
             // Find an existing card for this tool call id (status update
             // path) or signal we need to create a new one.
-            let existing = messages
+            let existing = dest
                 .get_untracked()
                 .iter()
                 .find(|m| m.tool_call_id.get_untracked().as_deref() == Some(tool_call_id.as_str()))
@@ -194,7 +236,7 @@ pub fn handle_acp_core_bridge_event(
                 None
             };
 
-            messages.update(|v| {
+            dest.update(|v| {
                 if let Some(bubble) = bubble_to_reorder {
                     if let Some(idx) = v.iter().position(|m| m.id == bubble.id) {
                         v.remove(idx);
@@ -211,7 +253,13 @@ pub fn handle_acp_core_bridge_event(
 
         // ── session load start: clear UI, enter replay mode ────────────────
         Some("session_load_start") => {
+            // Clear both destinations.  `messages` is what the user is
+            // currently looking at; `replay_buffer` is where the incoming
+            // flood will accumulate.  Keeping both empty here means the
+            // single `messages.set(buffer)` on `session_load_end` is the
+            // only `<For>` diff during the whole replay.
             messages.set(Vec::new());
+            replay_buffer.set(Vec::new());
             in_flight.set(None);
             sending.set(false);
             replaying.set(true);
@@ -224,6 +272,12 @@ pub fn handle_acp_core_bridge_event(
                 msg.streaming.set(false);
                 in_flight.set(None);
             }
+            // Single atomic swap: drains the buffer into messages in one
+            // update so the keyed <For> performs exactly one diff for the
+            // whole transcript.  std::mem::take avoids the temporary clone
+            // we'd pay for with get_untracked() + set().
+            let drained: Vec<ChatMessage> = replay_buffer.try_update(std::mem::take).unwrap_or_default();
+            messages.set(drained);
             replaying.set(false);
         }
 
@@ -296,6 +350,7 @@ pub fn handle_acp_core_bridge_event(
             //     active highlight flip *now* rather than waiting for replay
             //     to finish)
             messages.set(Vec::new());
+            replay_buffer.set(Vec::new());
             in_flight.set(None);
             sending.set(false);
         }
