@@ -7,6 +7,7 @@ pub mod footer;
 pub mod input_row;
 pub mod message_list;
 pub mod message_view;
+pub mod scroll;
 pub mod sidebar;
 pub mod time_ago;
 
