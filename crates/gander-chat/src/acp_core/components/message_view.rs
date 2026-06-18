@@ -292,9 +292,10 @@ pub fn ToolCallCard(message: ChatMessage) -> impl IntoView {
             //
             // `visible` is threaded through so the iframe component
             // can withhold `srcdoc` injection while off-screen — see
-            // `goose_ext::components::mcp_app_iframe`.  In-place when
-            // visible, placeholder when not.  Iframe-state retention
-            // across unmount is tracked separately in gander#125.
+            // the extension-layer iframe component for the gating
+            // logic.  In-place when visible, placeholder when not.
+            // Iframe-state retention across unmount is tracked
+            // separately in gander#125.
             <McpAppIframe
                 ui_html=message.ui_html
                 ui_pending=message.ui_pending
