@@ -467,6 +467,20 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
     /* ── message list ────────────────────────────────────────── */
 
+    /* Shell wraps the scrollable viewport so the "↓ N new" pill (a child
+       of the shell, not the viewport) can position relative to the chat
+       pane.  Inside the viewport it would scroll with the content, which
+       is the opposite of what we want.  Adding the shell keeps the
+       viewport itself unchanged for purposes of `overflow-y: auto` and
+       the per-message gutters declared on .gander-chat. */
+    .message-list-shell {
+      flex: 1;
+      min-height: 0;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+    }
+
     .message-list {
       flex: 1;
       /* min-height: 0 — without this the column flex item defaults to
@@ -482,6 +496,43 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       display: flex;
       flex-direction: column;
       gap: 10px;
+    }
+
+    /* ── "↓ N new" pill ─────────────────────────────────────────
+       Absolutely positioned over the bottom edge of the message-list
+       shell so it floats above the latest visible turn.  Visible only
+       when `pending_below > 0`.  Click → snap to bottom + reset.
+
+       Uses the user-bubble blue so it reads as "your-and-gander's
+       continuation", not as chrome (the footer/sidebar palette).  See
+       the gander#119 acceptance criteria. */
+    .scroll-pill {
+      position: absolute;
+      bottom: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 2;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px 6px 10px;
+      background: #2d5be3;
+      color: #fff;
+      border: none;
+      border-radius: 999px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+      font-family: inherit;
+      font-size: 0.82rem;
+      font-weight: 500;
+      cursor: pointer;
+    }
+
+    .scroll-pill:hover {
+      background: #3d6bf3;
+    }
+
+    .scroll-pill-label {
+      line-height: 1;
     }
 
     .empty-state {
