@@ -403,8 +403,14 @@ async fn run_worker(
             // List existing sessions (silently falls back to empty on error).
             let listed = fetch_top_sessions(&cx).await;
 
-            // Resume the most-recent session, or create a fresh one.
+            // Resume the most-recent session, or create a fresh one.  Track
+            // whether we actually resumed (vs. created fresh) so that the
+            // post-bootstrap RequestSessionInfo can replay the history that
+            // session/load has already queued on the SDK side.  Without this
+            // the user opens gander, sees the most-recent session highlighted
+            // in the sidebar, and stares at an empty chat pane (gander#TBD).
             let mut active_id: String;
+            let mut bootstrap_resumed = false;
             let mut current_session = if let Some(first) = listed.first() {
                 let sid = SessionId::new(first.id.clone());
                 match cx
@@ -414,6 +420,7 @@ async fn run_worker(
                 {
                     Ok(_) => {
                         active_id = first.id.clone();
+                        bootstrap_resumed = true;
                         cx.attach_session(NewSessionResponse::new(sid), vec![])?
                     }
                     Err(err) => {
@@ -437,6 +444,19 @@ async fn run_worker(
             // Cache session metadata for reuse on RequestSessionInfo.
             let cwd_str = cwd.to_string_lossy().into_owned();
             let mut cached_listed = listed;
+
+            // When bootstrap resumed an existing session via session/load, the
+            // agent has queued history notifications in the SDK's per-session
+            // buffer.  We can't drain them yet — the chat UI isn't subscribed
+            // to the JS bridge at this point in the lifecycle, so any events
+            // we emit would land in window.gander._publish before any
+            // subscribers are registered and be silently dropped.
+            //
+            // Defer the replay to the next RequestSessionInfo (fired by the
+            // UI's `ready` handshake, by definition once the bridge is wired
+            // up).  This flag is set true only when we resumed a session, so
+            // a fresh-session bootstrap (no history) doesn't trip it.
+            let mut pending_bootstrap_replay = bootstrap_resumed;
 
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
@@ -640,6 +660,61 @@ async fn run_worker(
                                 tool_count: None,
                             })
                             .await;
+
+                        // If bootstrap resumed an existing session, replay
+                        // its history *now* — the UI is wired up by
+                        // definition (RequestSessionInfo is the response to
+                        // the bridge `ready` handshake) so emitted events
+                        // will actually reach the chat pane.  Wrap in the
+                        // standard SessionLoadStart/SessionLoadEnd envelope
+                        // so the UI's batched-replay path kicks in and the
+                        // transcript paints in one diff.
+                        if pending_bootstrap_replay {
+                            pending_bootstrap_replay = false;
+                            let _ = evt_tx_clone
+                                .send(AcpEvent::SessionLoadStart)
+                                .await;
+                            drain_history_replay(
+                                &mut current_session,
+                                &evt_tx_clone,
+                                &tool_calls,
+                                &ext_handler,
+                                &handler_evt_tx,
+                            )
+                            .await;
+                            // Mirror SessionSelect: route any queued ext
+                            // requests to pending_fetches so MCP App
+                            // iframes hydrate, then fire the fetches.
+                            while let Ok(evt) = handler_evt_rx.try_recv() {
+                                match evt {
+                                    ExtEvent::Request(ExtRequest::ReadResource {
+                                        tool_call_id,
+                                        uri,
+                                        extension_name,
+                                    }) => {
+                                        pending_fetches.lock().await.push((
+                                            tool_call_id,
+                                            uri,
+                                            extension_name,
+                                        ));
+                                    }
+                                    other => {
+                                        let _ = ext_ui_tx_clone.send(other).await;
+                                    }
+                                }
+                            }
+                            process_pending_fetches(
+                                &cx,
+                                &ext_ui_tx_clone,
+                                &pending_fetches,
+                                &resource_cache,
+                                active_id.clone(),
+                            )
+                            .await;
+                            let _ = evt_tx_clone
+                                .send(AcpEvent::SessionLoadEnd)
+                                .await;
+                        }
                     }
 
                     AcpCommand::ListAllSessions => {
