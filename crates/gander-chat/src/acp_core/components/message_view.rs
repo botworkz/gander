@@ -161,7 +161,7 @@ pub fn MessageView(message: ChatMessage) -> impl IntoView {
                     <div class=role_class>
                         <img
                             class="message-avatar"
-                            src="/assets/gander.png"
+                            src="/assets/gander.svg"
                             alt="gander"
                         />
                         {bubble}
