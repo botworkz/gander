@@ -1,43 +1,50 @@
 # Gander SVG trace candidates
 
-Five candidate SVG traces of `gander.png` for visual comparison **before
-choosing one to replace the PNG asset.** All produced with the new
-`mcp-svg-trace` server (botworkz/mcp-extra#195 + #196) which wraps the
-pure-Rust [`vtracer`](https://github.com/visioncortex/vtracer) crate.
+Candidate vector traces of `gander.png`. **Review only** — pick one,
+then a follow-up PR will:
 
-Workflow:
-1. `magick_convert` to resize / quantise the source PNG.
-2. `svg_trace` to vectorise into Bézier paths.
+* Replace `gander.png` with the chosen SVG.
+* Update the two `<img src="/assets/gander.png">` references in
+  `crates/gander-chat/src/acp_core/components/{message_list,message_view}.rs`.
+* Delete this directory.
 
-The source `gander.png` is 769×769, 31 460 unique colours, with full
-alpha. Tracing the raw source produces ~200 path elements with chunky
-quantised gradients; quantising down to 3 colours first (your stated
-intent — "looks like an svg already and has 3 colours") collapses the
-trace to ~15 paths and a much smaller file.
+## Sharp-line candidates (round 2)
+
+You said the source is "super simple … 3 colours" and the first round
+lost the sharpness. Source pre-quantised to 4–6 colours with `magick
+-colors N +dither` before tracing, with vtracer's `corner_threshold` /
+`length_threshold` / `filter_speckle` dropped so it tracks the original
+ink edges instead of smoothing them away.
 
 | File | Source step | Trace step | Paths | Size |
 |---|---|---|---|---|
-| `gander-quantised-3.svg` | 512 px + `magick -colors 3 +dither` | `svg_trace filter_speckle=8 layer_difference=32` | 15 | 18 KB |
-| `gander-quantised-3-768.svg` | 768 px + `magick -colors 3 +dither` | `svg_trace filter_speckle=6 layer_difference=48` | 17 | 26 KB |
-| `gander-poster-256.svg` | 256 px (full colour) | `svg_trace preset=poster` | 200 | 65 KB |
-| `gander-photo-512.svg` | 512 px (full colour) | `svg_trace preset=photo` | 86 | 86 KB |
-| `gander-tuned-512.svg` | 512 px (full colour) | `svg_trace filter_speckle=6 color_precision=7 layer_difference=24` | 211 | 112 KB |
+| `gander-q4-polygon.svg` | 769 px + `magick -colors 4 +dither` | `svg_trace mode=polygon corner_threshold=5 length_threshold=1 filter_speckle=1` | 26 | **5.7 KB** |
+| `gander-q4-spline-fine.svg` | 769 px + `magick -colors 4 +dither` | `svg_trace mode=spline corner_threshold=5 length_threshold=1 filter_speckle=1` | 26 | 17 KB |
+| `gander-q4-sharp.svg` | 769 px + `magick -colors 4 +dither` | `svg_trace corner_threshold=25 length_threshold=2 filter_speckle=2` | 26 | 19 KB |
+| `gander-q5-fine.svg` | 769 px + `magick -colors 5 +dither` | `svg_trace corner_threshold=20 length_threshold=2` | 34 | 30 KB |
+| `gander-q6-769-sharp.svg` | 769 px + `magick -colors 6 +dither` | `svg_trace corner_threshold=60 length_threshold=4` | 34 | 21 KB |
+| `gander-q6-769-cutout.svg` | 769 px + `magick -colors 6 +dither` | `svg_trace hierarchical=cutout corner_threshold=30 length_threshold=2` | 30 | 44 KB |
+| `gander-1536-q4-spline.svg` | upsample 1536 px + `magick -colors 4 +dither` | `svg_trace corner_threshold=10 length_threshold=2` | 46 | 69 KB |
 
-My recommendation:
+Recommendation: **`gander-q4-polygon.svg`** (5.7 KB, polygon mode
+preserves straight edges and sharp corners exactly; this is what you
+want when the source is line-art-shaped). Open it next to the PNG in
+the **Files changed** tab and judge by eye — the polygon mode trades
+smooth-curve approximation for edge fidelity, which is the right trade
+for an icon with crisp ink.
 
-* If the gander is genuinely 3-colour and you want a clean icon-like
-  SVG, **`gander-quantised-3-768.svg`** — 17 paths, 26 KB, traces from
-  the higher-res quantised intermediate so the path geometry has more
-  detail than the 512 px version. Smallest file that still looks like
-  the original silhouette + ink.
-* `gander-quantised-3.svg` is the same idea at 512 px source — slightly
-  jaggier, but 18 KB.
-* The poster / photo / tuned variants are kept for comparison only;
-  they're each bigger than the original PNG and the chunky-bezier look
-  on smooth regions reads as "wrong" rather than "vector".
+If polygon mode looks too faceted on the duck's beak / eye outline,
+`gander-q4-spline-fine.svg` is the same trace at the same colour-count
+but in spline mode — still smooth, but with the tight corner/length
+thresholds so the splines actually hug the original outline instead of
+rounding it off.
 
-Once you pick one, drop a follow-up PR replacing `gander.png` with the
-chosen SVG and pointing the two `<img src="/assets/gander.png">` sites
-(`crates/gander-chat/src/acp_core/components/{message_list,message_view}.rs`)
-at the new path. This directory should be deleted in that same PR — it
-exists only to load the candidates onto a branch for visual review.
+## First-round candidates (kept for comparison)
+
+| File | Paths | Size |
+|---|---|---|
+| `gander-quantised-3.svg` | 15 | 18 KB |
+| `gander-quantised-3-768.svg` | 17 | 26 KB |
+| `gander-poster-256.svg` | 200 | 65 KB |
+| `gander-photo-512.svg` | 86 | 86 KB |
+| `gander-tuned-512.svg` | 211 | 112 KB |
