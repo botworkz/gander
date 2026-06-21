@@ -245,7 +245,7 @@ pub fn MessageList(
                             view! {
                                 <div class="empty-state">
                                     <img
-                                        src="/assets/gander.png"
+                                        src="/assets/gander.svg"
                                         alt="gander"
                                         class="empty-state-logo"
                                     />
