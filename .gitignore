@@ -1,4 +1,4 @@
-/target
+**/target/
 vendor/
 vendor.tar
 # Trunk (WASM bundler) build output — keep dist/index.html as a placeholder
