@@ -9,6 +9,27 @@ members = [
 default-members = [".", "xtask"]
 resolver = "2"
 
+# Workspace-wide lint policy. Inherited by member crates via
+# `[lints] workspace = true`. The set is intentionally tiny:
+#
+# * `unsafe_code = "forbid"` — we don't write `unsafe` outside of
+#   tests, full stop. `forbid` (vs `deny`) means a downstream
+#   `#![allow(unsafe_code)]` in a child module cannot re-enable it;
+#   a future PR that needs an `unsafe` block has to first change the
+#   policy here in a stand-alone commit, which gets reviewed on its
+#   own merits.
+#
+# Mirrors the same policy on `botworkz/botwork`,
+# `botworkz/botwork-extra`, `botworkz/mcp`, and `botworkz/mcp-extra`.
+#
+# `crates/gander-chat` deliberately does NOT inherit this — its
+# `#[wasm_bindgen(start)]` expansion injects `unsafe extern "C"`
+# shims that `forbid` flags from the call-site crate, and `forbid`
+# cannot be downgraded by `#[allow]`. See that crate's Cargo.toml
+# for the rationale.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [package]
 name = "gander"
 version = "0.0.1"
@@ -71,6 +92,13 @@ features = [
 agent-client-protocol = "0.14.0"
 geesed = { git = "https://github.com/phlax/geese", branch = "main" }
 tempfile = "3.10"
+# `temp-env` is the safe scope-guarded env mutator the unit + integration
+# tests use instead of the Rust 2024 `unsafe { std::env::set_var }`
+# shape. The `async_closure` feature is needed for tokio-test bodies;
+# see `tests/session_load_drain.rs`. `temp-env`'s `Drop` impl restores
+# the previous env state even on panic, so we don't need the manual
+# `ENV_LOCK` + restore bookkeeping the tests used to carry.
+temp-env = { version = "0.3", features = ["async_closure"] }
 
 # wry + WebKitGTK for the per-tab embedded webview (Linux only).
 # On Linux this brings in webkit2gtk (WebKitGTK 4.1), gtk, gdkx11, and soup3.
@@ -87,6 +115,9 @@ raw-window-handle = "0.6"
 # slotmap is a transitive dep via libcosmic/segmented-button; listed explicitly
 # so webview.rs can use slotmap::Key to convert Entity to a stable u64 tab_id.
 slotmap = "1"
+
+[lints]
+workspace = true
 
 # Uncomment to test a locally-cloned libcosmic
 # [patch.'https://github.com/pop-os/libcosmic']
