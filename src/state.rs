@@ -161,14 +161,18 @@ mod tests {
 
     #[test]
     fn from_env_respects_override() {
+        // `temp_env::with_var` sets the env var for the closure body
+        // and restores the previous value on drop (even on panic),
+        // wrapping the underlying `unsafe { env::set_var }` so this
+        // test can stay inside the workspace `unsafe_code = "forbid"`
+        // lint. The crate-level mutex inside `temp-env` also gives
+        // safer cross-test serialisation than the previous bare
+        // `set_var` / `remove_var` pair did.
         let dir = tempdir().unwrap();
         let path = dir.path().join("override.toml");
-        // SAFETY: tests are single-threaded for env access via `cargo test`'s
-        // default test harness *per test process*; this test owns the variable
-        // for its duration. We restore it on exit.
-        unsafe { env::set_var("GANDER_STATE", &path) };
-        let storage = Storage::from_env().unwrap();
-        assert_eq!(storage.path(), path);
-        unsafe { env::remove_var("GANDER_STATE") };
+        temp_env::with_var("GANDER_STATE", Some(&path), || {
+            let storage = Storage::from_env().unwrap();
+            assert_eq!(storage.path(), path);
+        });
     }
 }

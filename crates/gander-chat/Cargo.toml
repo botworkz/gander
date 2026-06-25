@@ -49,3 +49,13 @@ console_error_panic_hook = "0.1"
 leptos_icons = "0.7.1"
 icondata = "0.7.0"
 icondata_core = "0.1.0"
+
+# NOTE: this crate intentionally does NOT inherit the workspace
+# `[lints]` block (which sets `unsafe_code = "forbid"` for the rest
+# of the workspace). `#[wasm_bindgen(start)]` and the leptos view!
+# macros expand into code that the `unsafe_code` lint flags from the
+# call-site crate; `forbid` is unconditional and cannot be downgraded
+# by a downstream `#[allow]`, so opting out at the manifest level is
+# the only knob we have. Hand-written `unsafe { }` blocks here are
+# still expected to be caught in review — `grep -rn 'unsafe' src/`
+# returns nothing today.

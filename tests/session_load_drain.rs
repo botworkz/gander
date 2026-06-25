@@ -42,11 +42,6 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-/// Guards concurrent mutation of `XDG_RUNTIME_DIR` across tokio tests.
-/// Each test must hold this lock for the duration of any `set_var` /
-/// `remove_var` calls so that parallel tests don't trample each other.
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 // The initial session ID is defined in `tests/fixtures/mock_acp_agent.rs`
 // as `SESSION_NEW_ID` ("…0001").  The test uses a *different* ID below so
 // that there is no pre-registered ACP session handler when `session/load`
@@ -169,13 +164,19 @@ async fn history_drain_completes_with_expected_events() {
     let (_shutdown_tx, _task) = spawn_daemon(root.path(), goose_bin).await;
     create_profile(root.path(), "test").await;
 
-    // Hold the env lock for the rest of the test so XDG_RUNTIME_DIR is stable.
-    let _env_guard = ENV_LOCK.lock().await;
-    let original_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-    // SAFETY: ENV_LOCK is held, so no other thread is reading or writing
-    // XDG_RUNTIME_DIR concurrently.
-    unsafe { std::env::set_var("XDG_RUNTIME_DIR", root.path()) };
-
+    // `temp_env::async_with_vars` sets `XDG_RUNTIME_DIR` for the
+    // closure body and restores it on drop (even on panic), wrapping
+    // the underlying `unsafe { env::set_var }` so this test stays
+    // inside the workspace `unsafe_code = "forbid"` lint. `temp-env`
+    // also carries its own crate-level mutex for cross-test
+    // serialisation, which replaces the hand-rolled `ENV_LOCK` +
+    // `original_xdg` restore dance we used to have here — and unlike
+    // the manual restore, the temp-env teardown also runs if the
+    // test body panics.
+    let root_path = root.path().to_path_buf();
+    temp_env::async_with_vars(
+        [("XDG_RUNTIME_DIR", Some(root_path.as_path()))],
+        async {
     let mut conn = AcpConnection::connect(
         Box::new(GeesedTransport::new("test")),
         Box::new(GooseExtHandler),
@@ -211,13 +212,6 @@ async fn history_drain_completes_with_expected_events() {
     })
     .await
     .expect("timed out before SessionLoadEnd — drain_history_replay did not complete");
-
-    // Restore XDG_RUNTIME_DIR.
-    // SAFETY: ENV_LOCK is still held.
-    match original_xdg {
-        Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
-        None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
-    }
 
     // --- Assertions ---------------------------------------------------------
 
@@ -318,4 +312,7 @@ async fn history_drain_completes_with_expected_events() {
             "history event at index {idx} is outside [{start_pos}, {end_pos}]"
         );
     }
+        },
+    )
+    .await;
 }
